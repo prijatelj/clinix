@@ -15,7 +15,7 @@
 
 use clap::{Parser, Subcommand};
 
-use crate::env::{self, EnvArgs};
+use crate::env::{EnvArgs, ShellOptions};
 use crate::error::Result;
 use crate::sys::SysArgs;
 
@@ -60,7 +60,7 @@ impl Cli {
     /// (`None` = cwd project, `Shell(..)` = bare names) both resolve to
     /// `env shell`, keeping a single launcher implementation.
     pub fn dispatch(self) -> Result<()> {
-        let opts = env::ShellOpts {
+        let opts = ShellOptions {
             ordered: self.ordered,
             runtime: self.runtime,
         };

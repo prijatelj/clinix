@@ -1,5 +1,5 @@
 //! The package specification and helper utilities.
-use create::error::Result;
+use crate::error::Result;
 
 /// A package with an optional pinned version, parsed from `name[=version]`.
 #[derive(Debug, Clone)]

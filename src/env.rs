@@ -130,7 +130,7 @@ impl RunCmd for Cmd {
 
 /// The arguments for every command.
 #[derive(Args, Debug)]
-pub struct EnvCmd {
+pub struct EnvArgs {
 	#[command(subcommand)]
 	pub cmd: Cmd,
 }

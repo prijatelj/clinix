@@ -6,7 +6,7 @@
 
 use clap::{Args, Subcommand};
 
-use crate::error::{Result, nyi};
+use crate::error::{Result, unimplemented};
 
 #[derive(Args, Debug)]
 pub struct SysArgs {
@@ -30,10 +30,10 @@ pub enum SysCmd {
 
 pub fn dispatch(args: SysArgs) -> Result<()> {
     match args.cmd {
-        SysCmd::Init => Err(nyi("sys init", "plan phase 8: scaffold system.nix")),
-        SysCmd::Switch => Err(nyi("sys switch", "plan phase 8")),
-        SysCmd::Rollback => Err(nyi("sys rollback", "plan phase 8")),
-        SysCmd::Update => Err(nyi("sys update", "plan phase 8")),
-        SysCmd::Info => Err(nyi("sys info", "plan phase 8")),
+        SysCmd::Init => Err(unimplemented("sys init", "plan phase 8: scaffold system.nix")),
+        SysCmd::Switch => Err(unimplemented("sys switch", "plan phase 8")),
+        SysCmd::Rollback => Err(unimplemented("sys rollback", "plan phase 8")),
+        SysCmd::Update => Err(unimplemented("sys update", "plan phase 8")),
+        SysCmd::Info => Err(unimplemented("sys info", "plan phase 8")),
     }
 }
