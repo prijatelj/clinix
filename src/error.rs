@@ -9,7 +9,7 @@ pub type Result<T> = std::result::Result<T, ClinixError>;
 #[derive(thiserror::Error, Debug)]
 pub enum ClinixError {
     #[error("`{command}` is not yet implemented ({note})")]
-    NotYetImplemented {
+    Unimplemented {
         command: String,
         note: &'static str,
     },
@@ -29,7 +29,7 @@ pub enum ClinixError {
 
 /// Construct a [`ClinixError::NotYetImplemented`] for `command`, tagged with a
 /// short tracking `note` (e.g. the plan phase that will implement it).
-pub fn nyi(command: impl Into<String>, note: &'static str) -> ClinixError {
+pub fn unimplemented(command: impl Into<String>, note: &'static str) -> ClinixError {
     ClinixError::NotYetImplemented {
         command: command.into(),
         note,

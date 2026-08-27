@@ -8,12 +8,10 @@
 mod cli;
 mod env;
 mod error;
+mod pkg;
 mod sys;
 
 use std::process::ExitCode;
-
-use clap::Parser;
-
 use crate::cli::Cli;
 
 fn main() -> ExitCode {

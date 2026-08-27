@@ -11,373 +11,283 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
-use crate::error::{Result, nyi};
+use crate::error::{Result, unimplemented};
+use crate::pkg::Pkg;
 
-// ---------------------------------------------------------------------------
-// Resolved environment
-// ---------------------------------------------------------------------------
-
-/// How a name was resolved to its root directory.
+/// An environment type resolved to its root directory
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnvKind {
-    /// A named, reusable, composable env under the clinix state dir.
-    Registry,
-    /// A project directory (given by path, or the cwd when no name is given).
-    Project,
+pub enum Kind {
+	/// A named, reusable, composable env under the clinix state dir.
+	Registry,
+	/// A project directory (given by path, or the cwd when no name is given).
+	Project,
+}
+
+/// Shared execution context: state dir, verbosity, resolved options, etc.
+pub struct Context {
+	pub options: ShellOptions,
+}
+
+pub trait RunCmd {
+	fn run(self, context: &Context) -> Result<()>;
 }
 
 /// A resolved environment: a root dir plus how we found it.
 #[derive(Debug, Clone)]
 pub struct Env {
-    /// `None` for an anonymous cwd project; otherwise the resolved name.
-    pub name: Option<String>,
-    /// Directory containing `shell.nix` / `flake.nix` / `flake.lock`.
-    pub root: PathBuf,
-    pub kind: EnvKind,
+	/// `None` for an anonymous cwd project; otherwise the resolved name.
+	pub name: Option<String>,
+	/// Directory containing `shell.nix` / `flake.nix` / `flake.lock`.
+	pub root: PathBuf,
+	pub kind: Kind,
 }
 
 /// The one per-source-divergent seam (plan §resolve). Phase 1 is shallow and
 /// pure — no nix eval, no lock read:
-/// - `Some(name)` registered → [`EnvKind::Registry`] at `state/envs/<name>`;
-/// - `Some(name)` that is a path → [`EnvKind::Project`] at that path;
+/// - `Some(name)` registered → [`Kind::Registry`] at `state/envs/<name>`;
+/// - `Some(name)` that is a path → [`Kind::Project`] at that path;
 /// - `None` → the cwd project.
 pub fn resolve(name: Option<&str>) -> Result<Env> {
-    let _ = name;
-    Err(nyi("env resolve", "plan phase 5: state registry + cwd detection"))
+	let _ = name;
+	Err(unimplemented("env resolve", "plan phase 5: state registry + cwd detection"))
 }
-
-// ---------------------------------------------------------------------------
-// Package spec (`name` or `name=version`)
-// ---------------------------------------------------------------------------
-
-/// A package with an optional pinned version, parsed from `name[=version]`.
-#[derive(Debug, Clone)]
-pub struct Pkg {
-    pub name: String,
-    pub version: Option<String>,
-}
-
-impl std::str::FromStr for Pkg {
-    type Err = crate::error::ClinixError;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        if s.is_empty() {
-            return Err(crate::error::ClinixError::InvalidPackage(s.to_string()));
-        }
-        match s.split_once('=') {
-            Some((name, ver)) if !name.is_empty() && !ver.is_empty() => Ok(Pkg {
-                name: name.to_string(),
-                version: Some(ver.to_string()),
-            }),
-            Some(_) => Err(crate::error::ClinixError::InvalidPackage(s.to_string())),
-            None => Ok(Pkg {
-                name: s.to_string(),
-                version: None,
-            }),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Options shared with the bare-name sugar
-// ---------------------------------------------------------------------------
 
 /// Composition options read from the global flags (so the `external_subcommand`
-/// sugar can still set them). See [`crate::cli`].
+/// bare-name sugar can still set them). See [`crate::cli`].
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ShellOpts {
-    /// Preserve the given order instead of sorting names lexically.
-    pub ordered: bool,
-    /// In a project, compose only the runtime env (skip dev tools).
-    pub runtime: bool,
-}
-
-// ---------------------------------------------------------------------------
-// Command tree
-// ---------------------------------------------------------------------------
-
-#[derive(Args, Debug)]
-pub struct EnvArgs {
-    #[command(subcommand)]
-    pub cmd: EnvCmd,
+pub struct ShellOptions {
+	/// Preserve the given order instead of sorting names lexically.
+	pub ordered: bool,
+	/// In a project, compose only the runtime env (skip dev tools).
+	pub runtime: bool,
 }
 
 /// The unified verb set. Every verb takes an env name (or several, for the
-/// compositional ones: `shell`, `run`, `share`).
+/// compositional ones: `shell`, `run`, `shared`).
 #[derive(Subcommand, Debug)]
-pub enum EnvCmd {
-    /// Scaffold a new env, or adopt existing state (shell.nix / flake / uv / cargo).
-    Init(InitArgs),
-    /// Enter an interactive shell for the composed env(s).
-    Shell(ShellArgs),
-    /// Run a command inside the composed env(s), non-interactively.
-    Run(RunArgs),
-    /// Add packages to an env's `shell.nix`.
-    Add(PkgArgs),
-    /// Remove packages from an env's `shell.nix`.
-    Remove(PkgArgs),
-    /// Pin package versions in `flake.lock` (`--all` = closure freeze).
-    Pin(PinArgs),
-    /// Unpin packages back to baseline tracking (`--all` = unfreeze).
-    Unpin(PinArgs),
-    /// Update unpinned packages to the latest the baseline provides.
-    Update(UpdateArgs),
-    /// Rename a registered env.
-    Rename(RenameArgs),
-    /// List registered envs.
-    List,
-    /// Import an env from another format (shell.nix / flake / .deb / OCI / …).
-    Import(ImportArgs),
-    /// Export an env to another format.
-    Export(ExportArgs),
-    /// Summarize a single env (packages, pins, diagnostics).
-    Info(TargetArgs),
-    /// Dependency/closure report for an env.
-    Deps(TargetArgs),
-    /// N-way shared-package comparison across several envs.
-    Share(NamesArgs),
-    /// Environment/PATH audit (the former `envcheck`).
-    Check(OptTargetArgs),
-    /// Release an env's GC root so its store paths can be collected.
-    Clean(TargetArgs),
+pub enum Cmd {
+	/// Scaffold a new env, or adopt existing state (shell.nix / flake / uv / cargo).
+	Init(Init),
+	/// Enter an interactive shell for the composed env(s).
+	Shell(Shell),
+	/// Run a command inside the composed env(s), non-interactively.
+	Run(Run),
+	/// Add packages to an env's `shell.nix`.
+	Add(Pkgs),
+	/// Remove packages from an env's `shell.nix`.
+	Remove(Pkgs),
+	/// Pin package versions in `flake.lock` (`--all` = closure freeze).
+	Pin(Pin),
+	/// Unpin packages back to baseline tracking (`--all` = unfreeze).
+	Unpin(Pin),
+	/// Update unpinned packages to the latest the baseline provides.
+	Update(Update),
+	/// Rename a registered env.
+	Rename(Rename),
+	/// List registered envs.
+	List,
+	/// Import an env from another format (shell.nix / flake / .deb / OCI / …).
+	Import(Import),
+	/// Export an env to another format.
+	Export(Export),
+	/// Summarize a single env (packages, pins, diagnostics).
+	Info(Target),
+	/// Dependency/closure report for an env.
+	Deps(Target),
+	/// N-way shared-package comparison across several envs.
+	Shared(Targets),
+	/// Environment/PATH audit (the former `envcheck`).
+	Check(OptionalTarget),
+	/// Release an env's GC root so its store paths can be collected.
+	Clean(Target),
+}
+impl RunCmd for Cmd {
+	fn run(self, context: &Context) -> Result<()> {
+		use Cmd::*;
+		match self {
+			// impl their own RunCmd
+			Init(a) 	=> a.run(context),
+			Shell(a)	=> a.run(context),
+			Run(a)		=> a.run(context),
+			Update(a)	=> a.run(context),
+			Rename(a)	=> a.run(context),
+			Import(a)	=> a.run(context),
+			Export(a)	=> a.run(context),
+			// Generic / shared arg shapes.
+			Add(a) 		=> Err(unimplemented("env add", "plan phase 5: rnix-parser splice")),
+			Remove(a)	=> Err(unimplemented("env remove", "plan phase 5: rnix-parser splice")),
+			Pin(a) 		=> Err(unimplemented("env pin", "plan phase 3/4: flake.lock version pin")),
+			Unpin(a)	=> Err(unimplemented("env unpin", "plan phase 3/4: flake.lock unpin")),
+			List			=> Err(unimplemented("env list", "plan phase 5: enumerate registry")),
+			Info(a)		=> Err(unimplemented("env info", "plan phase 6: single-env summary")),
+			Deps(a)		=> Err(unimplemented("env deps", "plan phase 6: closure report")),
+			Shared(a)	=> Err(unimplemented("env shared", "plan phase 6: N-way shared-set comparison")),
+			Check(a)	=> Err(unimplemented("env check", "plan phase 6: env/PATH audit (envcheck)")),
+			Clean(a)	=> Err(unimplemented("env clean", "plan phase 5: remove GC root")),
+		}
+	}
+}
+
+/// The arguments for every command.
+#[derive(Args, Debug)]
+pub struct EnvCmd {
+	#[command(subcommand)]
+	pub cmd: Cmd,
 }
 
 #[derive(Args, Debug)]
-pub struct InitArgs {
-    /// Name of the env to create.
-    pub name: String,
-    /// Optional directory to initialize (defaults to the state registry for a
-    /// named tool env, or cwd for a project).
-    pub path: Option<PathBuf>,
-    /// Seed packages (`-p ripgrep -p nodejs=20.11`); folds through `add`.
-    #[arg(short = 'p', long = "pkg")]
-    pub packages: Vec<Pkg>,
-    /// Adopt an existing spec (`pyproject.toml`, `Cargo.toml`, `shell.nix`, …).
-    #[arg(long = "from")]
-    pub from: Option<PathBuf>,
+pub struct Init {
+	/// Name of the env to create.
+	pub name: String,
+	/// Optional directory to initialize (defaults to the state registry for a
+	/// named tool env, or cwd for a project).
+	pub path: Option<PathBuf>,
+	/// Seed packages (`-p ripgrep -p nodejs=20.11`); folds through `add`.
+	#[arg(short = 'p', long = "pkg")]
+	pub packages: Vec<Pkg>,
+	/// Adopt an existing spec (`pyproject.toml`, `Cargo.toml`, `shell.nix`, …).
+	#[arg(long = "from")]
+	pub from: Option<PathBuf>,
+}
+impl RunCmd for Init {
+	fn run(self, context: &Context) -> Result<()> {
+		Err(unimplemented("env init", "plan phase 3/5: scaffold + state-detect (ADR-2)"))
+	}
 }
 
 #[derive(Args, Debug)]
-pub struct ShellArgs {
-    /// Env names to compose. Empty = the cwd project.
-    pub names: Vec<String>,
-    /// Add a dev env to the union (repeatable; project mode).
-    #[arg(short = 'w', long = "with")]
-    pub with: Vec<String>,
-    /// Enter a pure shell (`nix-shell --pure`).
-    #[arg(long)]
-    pub pure: bool,
+pub struct Shell {
+	/// Env names to compose. Empty = the cwd project.
+	pub names: Vec<String>,
+	/// Add a dev env to the union (repeatable; project mode).
+	#[arg(short = 'w', long = "with")]
+	pub with: Vec<String>,
+	/// Enter a pure shell (`nix-shell --pure`).
+	#[arg(long)]
+	pub pure: bool,
+}
+impl RunCmd for Shell {
+	/// The launcher. Reached by `env shell`, the bare-name sugar, and the no-arg
+	/// cwd case. `names` empty ⇒ the cwd project; otherwise compose the named envs
+	/// (with `base` prepended, lexically sorted unless `opts.ordered`).
+	fn run(self, context: &Context) -> Result<()> {
+		Err(unimplemented("env shell", "plan phase 5: compose-dev/compose + GC-rooted enter"))
+	}
+}
+
+// TODO enable the creation of a new named env from a stack of existing named envs.
+
+#[derive(Args, Debug)]
+pub struct Run {
+	/// Env names to compose. Empty = the cwd project.
+	pub names: Vec<String>,
+	/// The command (and its args) to run inside the env; after `--`.
+	#[arg(last = true, required = true)]
+	pub command: Vec<String>,
+}
+impl RunCmd for Run {
+	fn run(self, context: &Context) -> Result<()> {
+		Err(unimplemented("env run", "plan phase 5: nix-shell --run"))
+	}
+}
+
+/// A set of packages for a target environment
+#[derive(Args, Debug)]
+pub struct Pkgs {
+	/// Target env name.
+	pub name: String,
+	/// Packages to add/remove (`name` or `name=version`).
+	#[arg(required = true)]
+	pub packages: Vec<Pkg>,
 }
 
 #[derive(Args, Debug)]
-pub struct RunArgs {
-    /// Env names to compose. Empty = the cwd project.
-    pub names: Vec<String>,
-    /// The command (and its args) to run inside the env; after `--`.
-    #[arg(last = true, required = true)]
-    pub command: Vec<String>,
+pub struct Pin {
+	/// Target env name.
+	pub name: String,
+	/// Packages to pin/unpin. Empty with `--all` operates on the whole closure.
+	pub packages: Vec<Pkg>,
+	/// Freeze/unfreeze every package (closure-equivalent full pin).
+	#[arg(long)]
+	pub all: bool,
 }
 
 #[derive(Args, Debug)]
-pub struct PkgArgs {
-    /// Target env name.
-    pub name: String,
-    /// Packages to add/remove (`name` or `name=version`).
-    #[arg(required = true)]
-    pub packages: Vec<Pkg>,
+pub struct Update {
+	/// Target env name.
+	pub name: String,
+	/// Packages to update; empty = all unpinned packages.
+	pub packages: Vec<String>,
+}
+impl RunCmd for Update {
+	fn run(self, context: &Context) -> Result<()> {
+		Err(unimplemented("env update", "plan phase 3: flake.lock update"))
+	}
 }
 
 #[derive(Args, Debug)]
-pub struct PinArgs {
-    /// Target env name.
-    pub name: String,
-    /// Packages to pin/unpin. Empty with `--all` operates on the whole closure.
-    pub packages: Vec<Pkg>,
-    /// Freeze/unfreeze every package (closure-equivalent full pin).
-    #[arg(long)]
-    pub all: bool,
+pub struct Rename {
+	pub old: String,
+	pub new: String,
+}
+impl RunCmd for Rename {
+	fn run(self, context: &Context) -> Result<()> {
+    Err(unimplemented("env rename", "plan phase 5: registry relabel"))
+	}
 }
 
 #[derive(Args, Debug)]
-pub struct UpdateArgs {
-    /// Target env name.
-    pub name: String,
-    /// Packages to update; empty = all unpinned packages.
-    pub packages: Vec<String>,
+pub struct Import {
+	/// Name for the imported env.
+	pub name: String, // TODO could be optional if provided by source?
+	/// Source file or reference to import from.
+	pub source: PathBuf,
+}
+impl RunCmd for Import {
+	fn run(self, context: &Context) -> Result<()> {
+    Err(unimplemented("env import", "plan phase 7: import doctor (ADR-2/6)"))
+	}
 }
 
 #[derive(Args, Debug)]
-pub struct RenameArgs {
-    pub old: String,
-    pub new: String,
+pub struct Export {
+	/// Target env name.
+	pub name: String,
+	#[command(subcommand)]
+	pub target: ExportTarget,
 }
-
-#[derive(Args, Debug)]
-pub struct ImportArgs {
-    /// Name for the imported env.
-    pub name: String,
-    /// Source file or reference to import from.
-    pub source: PathBuf,
-}
-
-#[derive(Args, Debug)]
-pub struct ExportArgs {
-    /// Target env name.
-    pub name: String,
-    #[command(subcommand)]
-    pub target: ExportTarget,
+impl RunCmd for Export {
+	fn run(self, context: &Context) -> Result<()> {
+		Err(unimplemented("env export", "plan phase 7: docker/closure extension (ADR-6)"))
+	}
 }
 
 #[derive(Subcommand, Debug)]
 pub enum ExportTarget {
-    /// Emit a reproducible OCI image (or a Dockerfile).
-    Docker {
-        /// Output path (defaults to a Dockerfile in the cwd).
-        out: Option<PathBuf>,
-    },
-    /// Export the Nix closure to a directory.
-    Closure { out_dir: PathBuf },
+	/// Emit a reproducible OCI image (or a Dockerfile).
+	Docker {
+		/// Output path (defaults to a Dockerfile in the cwd).
+		out: Option<PathBuf>,
+	},
+	/// Export the Nix closure to a directory.
+	Closure { out_dir: PathBuf },
 }
 
 /// A single required env name.
 #[derive(Args, Debug)]
-pub struct TargetArgs {
-    pub name: String,
+pub struct Target {
+	pub name: String,
 }
 
 /// A single optional env name (defaults to the cwd project).
 #[derive(Args, Debug)]
-pub struct OptTargetArgs {
-    pub name: Option<String>,
+pub struct OptionalTarget {
+	pub name: Option<String>,
 }
 
 /// One or more env names.
 #[derive(Args, Debug)]
-pub struct NamesArgs {
-    #[arg(required = true)]
-    pub names: Vec<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Dispatch
-// ---------------------------------------------------------------------------
-
-/// Route an `env` subcommand. `opts` carries the global composition flags so
-/// `shell`/`run` see the same `-o`/`-r` as the bare-name sugar.
-pub fn dispatch(args: EnvArgs, opts: ShellOpts) -> Result<()> {
-    match args.cmd {
-        EnvCmd::Init(a) => init(a),
-        EnvCmd::Shell(a) => {
-            // Fold the explicit `env shell` form through the same launcher as
-            // the sugar; `--with`/`--pure` are not expressible in sugar form.
-            let _ = (&a.with, a.pure);
-            shell(a.names, opts)
-        }
-        EnvCmd::Run(a) => run(a, opts),
-        EnvCmd::Add(a) => add(a),
-        EnvCmd::Remove(a) => remove(a),
-        EnvCmd::Pin(a) => pin(a),
-        EnvCmd::Unpin(a) => unpin(a),
-        EnvCmd::Update(a) => update(a),
-        EnvCmd::Rename(a) => rename(a),
-        EnvCmd::List => list(),
-        EnvCmd::Import(a) => import(a),
-        EnvCmd::Export(a) => export(a),
-        EnvCmd::Info(a) => info(a),
-        EnvCmd::Deps(a) => deps(a),
-        EnvCmd::Share(a) => share(a),
-        EnvCmd::Check(a) => check(a),
-        EnvCmd::Clean(a) => clean(a),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Verb handlers (all NotYetImplemented; signatures are the real contract)
-// ---------------------------------------------------------------------------
-
-/// The launcher. Reached by `env shell`, the bare-name sugar, and the no-arg
-/// cwd case. `names` empty ⇒ the cwd project; otherwise compose the named envs
-/// (with `base` prepended, lexically sorted unless `opts.ordered`).
-pub fn shell(names: Vec<String>, opts: ShellOpts) -> Result<()> {
-    let _ = (names, opts);
-    Err(nyi("env shell", "plan phase 5: compose-dev/compose + GC-rooted enter"))
-}
-
-fn run(a: RunArgs, opts: ShellOpts) -> Result<()> {
-    let _ = (a, opts);
-    Err(nyi("env run", "plan phase 5: nix-shell --run"))
-}
-
-fn init(a: InitArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env init", "plan phase 3/5: scaffold + state-detect (ADR-2)"))
-}
-
-fn add(a: PkgArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env add", "plan phase 5: rnix-parser splice"))
-}
-
-fn remove(a: PkgArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env remove", "plan phase 5: rnix-parser splice"))
-}
-
-fn pin(a: PinArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env pin", "plan phase 3/4: flake.lock version pin"))
-}
-
-fn unpin(a: PinArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env unpin", "plan phase 3/4: flake.lock unpin"))
-}
-
-fn update(a: UpdateArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env update", "plan phase 3: flake.lock update"))
-}
-
-fn rename(a: RenameArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env rename", "plan phase 5: registry relabel"))
-}
-
-fn list() -> Result<()> {
-    Err(nyi("env list", "plan phase 5: enumerate registry"))
-}
-
-fn import(a: ImportArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env import", "plan phase 7: import doctor (ADR-2/6)"))
-}
-
-fn export(a: ExportArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env export", "plan phase 7: docker/closure extension (ADR-6)"))
-}
-
-fn info(a: TargetArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env info", "plan phase 6: single-env summary"))
-}
-
-fn deps(a: TargetArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env deps", "plan phase 6: closure report"))
-}
-
-fn share(a: NamesArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env share", "plan phase 6: N-way shared-set comparison"))
-}
-
-fn check(a: OptTargetArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env check", "plan phase 6: env/PATH audit (envcheck)"))
-}
-
-fn clean(a: TargetArgs) -> Result<()> {
-    let _ = a;
-    Err(nyi("env clean", "plan phase 5: remove GC root"))
+pub struct Targets {
+	#[arg(required = true)]
+	pub names: Vec<String>,
 }
