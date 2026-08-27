@@ -1,5 +1,5 @@
 //! Typed errors for clinix. Every unimplemented leaf returns
-//! [`ClinixError::NotYetImplemented`] so `--help` and the command tree stay
+//! [`ClinixError::Unimplemented`] so `--help` and the command tree stay
 //! honest while the crate is built up incrementally.
 
 /// Crate-wide result alias. The CLI boundary in `main.rs` maps this to an
@@ -30,7 +30,7 @@ pub enum ClinixError {
 /// Construct a [`ClinixError::NotYetImplemented`] for `command`, tagged with a
 /// short tracking `note` (e.g. the plan phase that will implement it).
 pub fn unimplemented(command: impl Into<String>, note: &'static str) -> ClinixError {
-    ClinixError::NotYetImplemented {
+    ClinixError::Unimplemented {
         command: command.into(),
         note,
     }
