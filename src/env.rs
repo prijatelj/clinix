@@ -23,6 +23,16 @@ pub enum Kind {
 	Project,
 }
 
+/// Composition options read from the global flags (so the `external_subcommand`
+/// bare-name sugar can still set them). See [`crate::cli`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShellOptions {
+	/// Preserve the given order instead of sorting names lexically.
+	pub ordered: bool,
+	/// In a project, compose only the runtime env (skip dev tools).
+	pub runtime: bool,
+}
+
 /// Shared execution context: state dir, verbosity, resolved options, etc.
 pub struct Context {
 	pub options: ShellOptions,
@@ -44,30 +54,23 @@ pub struct Env {
 
 /// The one per-source-divergent seam (plan §resolve). Phase 1 is shallow and
 /// pure — no nix eval, no lock read:
+/// - `Some(".")` or `None` → the cwd project ([`Kind::Project`]);
 /// - `Some(name)` registered → [`Kind::Registry`] at `state/envs/<name>`;
-/// - `Some(name)` that is a path → [`Kind::Project`] at that path;
-/// - `None` → the cwd project.
+/// - `Some(name)` that is a path → [`Kind::Project`] at that path.
 pub fn resolve(name: Option<&str>) -> Result<Env> {
 	let _ = name;
 	Err(unimplemented("env resolve", "plan phase 5: state registry + cwd detection"))
-}
-
-/// Composition options read from the global flags (so the `external_subcommand`
-/// bare-name sugar can still set them). See [`crate::cli`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ShellOptions {
-	/// Preserve the given order instead of sorting names lexically.
-	pub ordered: bool,
-	/// In a project, compose only the runtime env (skip dev tools).
-	pub runtime: bool,
 }
 
 /// The unified verb set. Every verb takes an env name (or several, for the
 /// compositional ones: `shell`, `run`, `shared`).
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-	/// Scaffold a new env, or adopt existing state (shell.nix / flake / uv / cargo).
+	/// Scaffold a new **project** env in a directory, or adopt existing state
+	/// (shell.nix / flake / uv / cargo).
 	Init(Init),
+	/// Create a new **registry** env by merging existing envs (`--from A B C`).
+	New(New),
 	/// Enter an interactive shell for the composed env(s).
 	Shell(Shell),
 	/// Run a command inside the composed env(s), non-interactively.
@@ -107,6 +110,7 @@ impl RunCmd for Cmd {
 		match self {
 			// impl their own RunCmd
 			Init(a) 	=> a.run(context),
+			New(a)		=> a.run(context),
 			Shell(a)	=> a.run(context),
 			Run(a)		=> a.run(context),
 			Update(a)	=> a.run(context),
@@ -157,29 +161,47 @@ impl RunCmd for Init {
 
 #[derive(Args, Debug)]
 pub struct Shell {
-	/// Env names to compose. Empty = the cwd project.
+	/// Envs to compose, as a stack. Empty ⇒ `[.]` (the cwd project). The token
+	/// `.` denotes the cwd project and may appear anywhere in the stack (usually
+	/// first); every other name resolves via [`resolve`].
 	pub names: Vec<String>,
-	/// Add a dev env to the union (repeatable; project mode).
-	#[arg(short = 'w', long = "with")]
-	pub with: Vec<String>,
 	/// Enter a pure shell (`nix-shell --pure`).
 	#[arg(long)]
 	pub pure: bool,
 }
 impl RunCmd for Shell {
 	/// The launcher. Reached by `env shell`, the bare-name sugar, and the no-arg
-	/// cwd case. `names` empty ⇒ the cwd project; otherwise compose the named envs
-	/// (with `base` prepended, lexically sorted unless `opts.ordered`).
+	/// cwd case. Empty `names` ⇒ `[.]`; the `.` token composes the cwd project as
+	/// an ordinary node anywhere in the stack. `base` is prepended, and the stack
+	/// is lexically sorted unless `options.ordered`.
 	fn run(self, context: &Context) -> Result<()> {
 		Err(unimplemented("env shell", "plan phase 5: compose-dev/compose + GC-rooted enter"))
 	}
 }
 
-// TODO enable the creation of a new named env from a stack of existing named envs.
+/// Create a new **registry** env by merging existing envs. Distinct from
+/// [`Init`], which scaffolds a **project** env in a directory: `new` writes a
+/// reusable, named env into the state registry. The `--from` order is the merge
+/// (stack) order. Sources are registry names; the cwd-project token `.` is not
+/// valid here, since a registry env must be portable.
+#[derive(Args, Debug)]
+pub struct New {
+	/// Name of the new registry env.
+	pub name: String,
+	/// Existing registry envs to merge, in stack order (`--from A B C`).
+	#[arg(long = "from", num_args = 1.., required = true)]
+	pub from: Vec<String>,
+}
+impl RunCmd for New {
+	fn run(self, context: &Context) -> Result<()> {
+		Err(unimplemented("env new", "plan phase 5: merge envs → registry item"))
+	}
+}
 
 #[derive(Args, Debug)]
 pub struct Run {
-	/// Env names to compose. Empty = the cwd project.
+	/// Envs to compose, as a stack — same rules as [`Shell`] (`.` = cwd project,
+	/// empty ⇒ `[.]`).
 	pub names: Vec<String>,
 	/// The command (and its args) to run inside the env; after `--`.
 	#[arg(last = true, required = true)]
@@ -232,7 +254,7 @@ pub struct Rename {
 }
 impl RunCmd for Rename {
 	fn run(self, context: &Context) -> Result<()> {
-    Err(unimplemented("env rename", "plan phase 5: registry relabel"))
+		Err(unimplemented("env rename", "plan phase 5: registry relabel"))
 	}
 }
 
@@ -245,7 +267,7 @@ pub struct Import {
 }
 impl RunCmd for Import {
 	fn run(self, context: &Context) -> Result<()> {
-    Err(unimplemented("env import", "plan phase 7: import doctor (ADR-2/6)"))
+		Err(unimplemented("env import", "plan phase 7: import doctor (ADR-2/6)"))
 	}
 }
 

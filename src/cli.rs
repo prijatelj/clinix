@@ -15,7 +15,7 @@
 
 use clap::{Parser, Subcommand};
 
-use crate::env::{EnvArgs, ShellOptions};
+use crate::env::{Context, EnvArgs, Shell, ShellOptions, RunCmd};
 use crate::error::Result;
 use crate::sys::SysArgs;
 
@@ -24,51 +24,53 @@ use crate::sys::SysArgs;
 #[command(name = "clinix", version, propagate_version = true)]
 #[command(about = "Manage Nix environments (env) and a NixOS system (sys).")]
 pub struct Cli {
-    /// Increase verbosity (repeatable: `-v`, `-vv`).
-    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
-    pub verbose: u8,
+	/// Increase verbosity (repeatable: `-v`, `-vv`).
+	#[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
+	pub verbose: u8,
 
-    /// Preserve the given order when composing envs instead of sorting them
-    /// lexically. Applies to `env shell`/`run` and the bare-name sugar.
-    #[arg(short = 'o', long, global = true)]
-    pub ordered: bool,
+	/// Preserve the given order when composing envs instead of sorting them
+	/// lexically. Applies to `env shell`/`run` and the bare-name sugar.
+	#[arg(short = 'o', long, global = true)]
+	pub ordered: bool,
 
-    /// In a project, compose only the runtime env (skip the dev tools).
-    #[arg(short = 'r', long, global = true)]
-    pub runtime: bool,
+	/// In a project, compose only the runtime env (skip the dev tools).
+	#[arg(short = 'r', long, global = true)]
+	pub runtime: bool,
 
-    #[command(subcommand)]
-    pub command: Option<Command>,
+	#[command(subcommand)]
+	pub command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Manage the NixOS system configuration (`system.nix`).
-    Sys(SysArgs),
+	/// Manage the NixOS system configuration (`system.nix`).
+	Sys(SysArgs),
 
-    /// Manage a Nix environment: init, shell, run, packages, pins, interop, info.
-    Env(EnvArgs),
+	/// Manage a Nix environment: init, shell, run, packages, pins, interop, info.
+	Env(EnvArgs),
 
-    /// Bare name list → `env shell <names…>` (see module docs). The first token
-    /// is the "subcommand name" clap could not match, so it is folded back in.
-    #[command(external_subcommand)]
-    Shell(Vec<String>),
+	/// Bare name list → `env shell <names…>` (see module docs). The first token
+	/// is the "subcommand name" clap could not match, so it is folded back in.
+	#[command(external_subcommand)]
+	Shell(Vec<String>),
 }
 
 impl Cli {
-    /// Route the parsed command to its handler. The two name-first entry points
-    /// (`None` = cwd project, `Shell(..)` = bare names) both resolve to
-    /// `env shell`, keeping a single launcher implementation.
-    pub fn dispatch(self) -> Result<()> {
-        let opts = ShellOptions {
-            ordered: self.ordered,
-            runtime: self.runtime,
-        };
-        match self.command {
-            Some(Command::Sys(args)) => crate::sys::dispatch(args),
-            Some(Command::Env(args)) => env::dispatch(args, opts),
-            Some(Command::Shell(names)) => env::shell(names, opts),
-            None => env::shell(Vec::new(), opts),
-        }
-    }
+	/// Route the parsed command to its handler. The two name-first entry points
+	/// (`None` = cwd project, `Shell(..)` = bare names) both resolve to
+	/// `env shell`, keeping a single launcher implementation.
+	pub fn dispatch(self) -> Result<()> {
+		let context = Context {
+			options: ShellOptions {
+				ordered: self.ordered,
+				runtime: self.runtime,
+			}
+		};
+		match self.command {
+			Some(Command::Sys(args)) => crate::sys::dispatch(args),
+			Some(Command::Env(c)) => c.cmd.run(&context),
+			Some(Command::Shell(names)) => Shell { names, pure: false }.run(&context),
+			None => Shell { names: vec![], pure: false }.run(&context),
+		}
+	}
 }
