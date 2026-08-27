@@ -1,16 +1,37 @@
+//! Typed errors for clinix. Every unimplemented leaf returns
+//! [`ClinixError::NotYetImplemented`] so `--help` and the command tree stay
+//! honest while the crate is built up incrementally.
+
+/// Crate-wide result alias. The CLI boundary in `main.rs` maps this to an
+/// [`std::process::ExitCode`]; `anyhow` is reserved for the outermost boundary.
+pub type Result<T> = std::result::Result<T, ClinixError>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ClinixError {
-    #[error("`{command}` is not implemented yet ({tracking_note})")]
-    NotImplemented { command: String, tracking_note: &'static str },
+    #[error("`{command}` is not yet implemented ({note})")]
+    NotYetImplemented {
+        command: String,
+        note: &'static str,
+    },
 
-		#[error("invalid environment id `{0}` — expected `scope:name` (scope ∈ sys|user|dev|run)")]
-    InvalidEnvId(String),
+    /// A name that is neither a registered env nor a path to a project dir.
+    #[error("environment `{0}` is not registered and is not a project directory")]
+    UnknownEnv(String),
+
+    /// `init` could not decide what to scaffold from the existing directory
+    /// state. `detail` names exactly what is undetermined (user-facing).
+    #[error("cannot initialize `{path}`: {detail}")]
+    AmbiguousInit { path: String, detail: String },
 
     #[error("invalid package spec `{0}` — expected `name` or `name=version`")]
     InvalidPackage(String),
 }
 
-pub fn NotImplemented(command: &str, tracking_note: &'static str) -> ClinixError {
-	NotImplemented("Not yet implemented.")
+/// Construct a [`ClinixError::NotYetImplemented`] for `command`, tagged with a
+/// short tracking `note` (e.g. the plan phase that will implement it).
+pub fn nyi(command: impl Into<String>, note: &'static str) -> ClinixError {
+    ClinixError::NotYetImplemented {
+        command: command.into(),
+        note,
+    }
 }

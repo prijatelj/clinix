@@ -1,81 +1,74 @@
-/// Nix focused structs and impl, e.g. packages, environments, etc.
-use clinix::env::args::*;
+//! Top-level command tree and dispatch.
+//!
+//! Grammar (decided 2026-08-27):
+//! - Canonical, verb-first: `clinix env <verb> [names…] [args]`.
+//! - System: `clinix sys <verb> …`.
+//! - Sugar (the common case): a bare name list `clinix <names…>` is captured by
+//!   clap's `external_subcommand` and routed to `env shell <names…>`. This form
+//!   is *terminal* — no verb may follow the names — which is why it is
+//!   unambiguous despite the variadic name list.
+//! - `clinix` with no args enters the current directory's project shell.
+//!
+//! Global flags (`-o`, `-r`, `-v`) are declared once here and read by whichever
+//! command needs them, so the sugar form can still pass the common options that
+//! `external_subcommand` cannot itself parse.
 
-/// The parent commands
-mod cmd {
-	pub enum SysCmd {
-		#[command(flatten)]
-		Env(EnvCmd),
-		SetDefault(args::Name),
-	}
+use clap::{Parser, Subcommand};
 
-	pub enum UserCmd {
-			#[command(flatten)] Env(EnvCmd),
-			SetDefault(args::Name),
-			Link(args::Link),
-			Adopt(args::Adopt),
-			Unlink(args::Link),
-			Status, // TODO Need to create this
-	}
+use crate::env::{self, EnvArgs};
+use crate::error::Result;
+use crate::sys::SysArgs;
 
-	pub enum InfoCmd {
-		Deps(args::Deps),
-		Env(args::EnvAudit),
-		Share(args::Share),
-	}
-
-}
-
-mod scopes {
-	// reuse as-is
-	pub struct args::Run { #[command(subcommand)] pub cmd: EnvCmd }        
-
-	// reuse + launcher
-	#[command(args_conflicts_with_subcommands = true)]
-	pub struct args::Dev {                                                 
-		// None ⇒ launcher
-		#[command(subcommand)]
-		pub cmd: Option<EnvCmd>,                  
-		pub names: Vec<String>,
-		#[arg(short='r', long)]
-		runtime: bool,
-		#[arg(short='w', long="with")]
-		with: Vec<String>,
-		#[arg(long)]
-		list: bool,
-		#[arg(long)]
-		pure: bool,
-		#[arg(long)]
-		run: Option<String>,
-		#[arg(short='c', long)]
-		cache: bool,
-	}
-
-	pub struct args::Sys {
-		#[command(subcommand)]
-		pub cmd: SysCmd,
-	}
-
-	pub struct args::User {
-		#[command(subcommand)]
-		pub cmd: UserCmd,
-	}
-
-	pub struct args::Info { #[command(subcommand)] pub cmd: InfoCmd }
-}
-
-pub enum Command {
-	Sys(args::Sys),
-	User(args::User),
-	Dev(args::Dev),
-	Run(args::Run),
-	Info(args::Info),
-}
-
-// name="clinix", version, propagate_version
-#[derive(Parser)]                       
+/// `clinix [global flags] [command | names…]`
+#[derive(Parser, Debug)]
+#[command(name = "clinix", version, propagate_version = true)]
+#[command(about = "Manage Nix environments (env) and a NixOS system (sys).")]
 pub struct Cli {
-		// -v; -V is version (clap default)
-    #[arg(short='v', long, global=true, action=Count)] verbose: u8,
-    #[command(subcommand)] pub command: Command,
+    /// Increase verbosity (repeatable: `-v`, `-vv`).
+    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Preserve the given order when composing envs instead of sorting them
+    /// lexically. Applies to `env shell`/`run` and the bare-name sugar.
+    #[arg(short = 'o', long, global = true)]
+    pub ordered: bool,
+
+    /// In a project, compose only the runtime env (skip the dev tools).
+    #[arg(short = 'r', long, global = true)]
+    pub runtime: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Manage the NixOS system configuration (`system.nix`).
+    Sys(SysArgs),
+
+    /// Manage a Nix environment: init, shell, run, packages, pins, interop, info.
+    Env(EnvArgs),
+
+    /// Bare name list → `env shell <names…>` (see module docs). The first token
+    /// is the "subcommand name" clap could not match, so it is folded back in.
+    #[command(external_subcommand)]
+    Shell(Vec<String>),
+}
+
+impl Cli {
+    /// Route the parsed command to its handler. The two name-first entry points
+    /// (`None` = cwd project, `Shell(..)` = bare names) both resolve to
+    /// `env shell`, keeping a single launcher implementation.
+    pub fn dispatch(self) -> Result<()> {
+        let opts = env::ShellOpts {
+            ordered: self.ordered,
+            runtime: self.runtime,
+        };
+        match self.command {
+            Some(Command::Sys(args)) => crate::sys::dispatch(args),
+            Some(Command::Env(args)) => env::dispatch(args, opts),
+            Some(Command::Shell(names)) => env::shell(names, opts),
+            None => env::shell(Vec::new(), opts),
+        }
+    }
 }
