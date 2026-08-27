@@ -1,0 +1,16 @@
+[package]
+name = "clinix"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+description = "CLI tool to manage Nix environments (env) and a NixOS system (sys). Pins package versions with a `flake.lock` used by `shell.nix` or `flake.nix`."
+readme = "README.md"
+authors = [ "Derek Prijatelj <derek.s.prijatelj@gmail.com>" ]
+keywords = ["nix", "NixOS", "flakes", "flake", "cli"]
+categories = [ "command-line-utilities" ]
+repository = "https://github.com/prijatelj/clinix"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
