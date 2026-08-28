@@ -1,28 +1,13 @@
-//! clinix — a single CLI over Nix environments.
-//!
-//! Two top-level subcommands: [`sys`](crate::sys) manages a NixOS system
-//! (`system.nix`), and [`env`](crate::env) manages every non-system
-//! environment (the former dev/user/run scopes, unified). A bare name list —
-//! `clinix python rust` — is sugar for `clinix env shell python rust`.
-
-mod cli;
-mod env;
-mod error;
-mod model;
-mod nix;
-mod pkg;
-mod project;
-mod sys;
+//! clinix binary entry point — a thin wrapper over the `clinix` library crate.
 
 use std::process::ExitCode;
 
 use clap::Parser;
 
-use crate::cli::Cli;
+use clinix::cli::Cli;
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match cli.dispatch() {
+    match Cli::parse().dispatch() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("clinix: error: {e}");
