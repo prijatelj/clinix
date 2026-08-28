@@ -8,7 +8,10 @@
 mod cli;
 mod env;
 mod error;
+mod model;
+mod nix;
 mod pkg;
+mod project;
 mod sys;
 
 use std::process::ExitCode;

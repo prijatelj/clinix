@@ -25,9 +25,37 @@ pub enum ClinixError {
 
     #[error("invalid package spec `{0}` — expected `name` or `name=version`")]
     InvalidPackage(String),
+
+    /// A malformed git revision (not 40/64-char lowercase hex).
+    #[error("invalid git revision `{0}` — expected 40- or 64-char lowercase hex")]
+    InvalidRev(String),
+
+    /// A malformed nix content hash.
+    #[error("invalid narHash `{0}` — expected `<algo>-<base64>` or `<algo>:<base32>`")]
+    InvalidNarHash(String),
+
+    /// `flake.lock` (or another JSON document) failed to parse/serialize.
+    #[error("failed to parse flake.lock: {0}")]
+    Lock(#[from] serde_json::Error),
+
+    /// A filesystem operation failed.
+    #[error("i/o error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// A `nix*`/`git` CLI invocation exited nonzero (the shell-out boundary).
+    #[error("command failed ({status}): {cmd}\n{stderr}")]
+    Nix {
+        cmd: String,
+        status: String,
+        stderr: String,
+    },
+
+    /// A ref could not be resolved to a revision (command succeeded, no match).
+    #[error("could not resolve: {0}")]
+    Resolve(String),
 }
 
-/// Construct a [`ClinixError::NotYetImplemented`] for `command`, tagged with a
+/// Construct a [`ClinixError::Unimplemented`] for `command`, tagged with a
 /// short tracking `note` (e.g. the plan phase that will implement it).
 pub fn unimplemented(command: impl Into<String>, note: &'static str) -> ClinixError {
     ClinixError::Unimplemented {
