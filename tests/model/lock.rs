@@ -1,6 +1,6 @@
 //! `flake.lock` model: byte-identical round-trip + classification (public API).
 
-use clinix::model::lock::{FlakeLock, InputRef, LockedKind};
+use clinix::model::lock::{FlakeLock, InputRef, LockedKind, Source};
 
 // Real locks from this repo's fixture corpus (byte-for-byte). SIMPLE is a single
 // github input; FOLLOWS exercises the string-vs-array `inputs` polymorphism and
@@ -50,6 +50,24 @@ fn parses_input_ref_polymorphism() {
 			"nixpkgs".to_string()
 		]))
 	);
+}
+
+#[test]
+fn github_source_constructors_have_expected_shape() {
+	let locked = Source::github_locked("NixOS", "nixpkgs", "abc123", "sha256-x");
+	assert_eq!(locked.source_type(), Some("github"));
+	assert_eq!(locked.owner(), Some("NixOS"));
+	assert_eq!(locked.repo(), Some("nixpkgs"));
+	assert_eq!(locked.rev(), Some("abc123"));
+	assert_eq!(locked.nar_hash(), Some("sha256-x"));
+
+	let tracked = Source::github_ref("NixOS", "nixpkgs", "nixos-26.05");
+	assert_eq!(tracked.git_ref(), Some("nixos-26.05"));
+	assert_eq!(tracked.rev(), None);
+
+	let frozen = Source::github_rev("NixOS", "nixpkgs", "abc123");
+	assert_eq!(frozen.rev(), Some("abc123"));
+	assert_eq!(frozen.git_ref(), None);
 }
 
 #[test]

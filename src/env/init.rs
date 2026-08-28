@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use serde_json::Value;
 
 use crate::env::{Context, Pkg, RunCmd};
 use crate::error::{ClinixError, Result, unimplemented};
@@ -160,37 +159,25 @@ fn build_nixpkgs_lock(nixpkgs_ref: &str) -> Result<FlakeLock> {
 	const OWNER: &str = "NixOS";
 	const REPO: &str = "nixpkgs";
 
+	// A 40-hex ref is a frozen rev (hash it directly); anything else is a tracked
+	// branch/tag (resolve it first). `resolve_github`/`Source::github_*` are the
+	// same helpers `update` uses.
 	let frozen = is_rev(nixpkgs_ref);
-	let rev = if frozen {
-		nixpkgs_ref.to_string()
+	let (rev, nar_hash) = if frozen {
+		let nar_hash = crate::nix::github_tarball_narhash(OWNER, REPO, nixpkgs_ref)?;
+		(nixpkgs_ref.to_string(), nar_hash)
 	} else {
-		crate::nix::resolve_github_ref(OWNER, REPO, nixpkgs_ref)?
-			.as_str()
-			.to_string()
-	};
-	let narhash = crate::nix::github_tarball_narhash(OWNER, REPO, &rev)?;
-
-	let locked = github_source(&[
-		("narHash", narhash.as_str()),
-		("owner", OWNER),
-		("repo", REPO),
-		("rev", &rev),
-		("type", "github"),
-	]);
-	let original = if frozen {
-		github_source(&[("owner", OWNER), ("repo", REPO), ("rev", &rev), ("type", "github")])
-	} else {
-		github_source(&[
-			("owner", OWNER),
-			("ref", nixpkgs_ref),
-			("repo", REPO),
-			("type", "github"),
-		])
+		let (rev, nar_hash) = crate::nix::resolve_github(OWNER, REPO, nixpkgs_ref)?;
+		(rev.as_str().to_string(), nar_hash)
 	};
 
 	let nixpkgs_node = Node {
-		locked: Some(locked),
-		original: Some(original),
+		locked: Some(Source::github_locked(OWNER, REPO, &rev, nar_hash.as_str())),
+		original: Some(if frozen {
+			Source::github_rev(OWNER, REPO, &rev)
+		} else {
+			Source::github_ref(OWNER, REPO, nixpkgs_ref)
+		}),
 		..Node::default()
 	};
 	let mut root_inputs = BTreeMap::new();
@@ -209,16 +196,6 @@ fn build_nixpkgs_lock(nixpkgs_ref: &str) -> Result<FlakeLock> {
 		root: "root".to_string(),
 		version: 7,
 	})
-}
-
-/// Build a `Source` from ordered `(key, value)` string pairs.
-fn github_source(pairs: &[(&str, &str)]) -> Source {
-	Source(
-		pairs
-			.iter()
-			.map(|(k, v)| (k.to_string(), Value::from(*v)))
-			.collect(),
-	)
 }
 
 /// A 40-char lowercase-hex string — the shape Nix records as `original.rev`

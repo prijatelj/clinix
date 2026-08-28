@@ -15,7 +15,8 @@
 //! `pin` runs via `nix … eval`; that lone `nix-command` use will be flagged when
 //! it lands. The github path used by `init` is fully classic.)
 
-use std::process::{Command, Output};
+use std::path::Path;
+use std::process::{Command, ExitStatus, Output};
 
 use crate::error::{ClinixError, Result};
 use crate::model::newtypes::{NarHash, Rev};
@@ -102,4 +103,40 @@ fn to_sri(base32: &str) -> Result<NarHash> {
     let mut cmd = Command::new("nix-hash");
     cmd.args(["--to-sri", "--type", "sha256", base32]);
     stdout_string(&run(cmd)?).trim().parse()
+}
+
+/// Fully resolve a tracked github ref to `(rev, narHash)` — `git ls-remote` then
+/// prefetch. Shared by `init` (initial lock) and `update` (re-lock).
+pub fn resolve_github(owner: &str, repo: &str, git_ref: &str) -> Result<(Rev, NarHash)> {
+    let rev = resolve_github_ref(owner, repo, git_ref)?;
+    let nar_hash = github_tarball_narhash(owner, repo, rev.as_str())?;
+    Ok((rev, nar_hash))
+}
+
+/// GC-root a nix file's derivation and return its `.drv` store path:
+/// `nix-instantiate <file> --add-root <root> --indirect`. Rooting is why a shell
+/// entered through clinix survives `nix-collect-garbage` (plain `nix-shell` does
+/// not root; keep the outputs too with `keep-outputs = true` in nix.conf).
+pub fn instantiate_rooted(nix_file: &Path, root: &Path) -> Result<String> {
+    if let Some(parent) = root.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut cmd = Command::new("nix-instantiate");
+    cmd.arg(nix_file).arg("--add-root").arg(root).arg("--indirect");
+    Ok(stdout_string(&run(cmd)?).trim().to_string())
+}
+
+/// Enter `nix-shell <drv>`, inheriting stdio: interactive, unless `command` is
+/// given (then `--run <command>`); `--pure` for a pure shell. Returns the child
+/// exit status (this is the one nix invocation that does not capture output).
+pub fn nix_shell(drv: &str, pure: bool, command: Option<&str>) -> Result<ExitStatus> {
+    let mut cmd = Command::new("nix-shell");
+    cmd.arg(drv);
+    if pure {
+        cmd.arg("--pure");
+    }
+    if let Some(c) = command {
+        cmd.arg("--run").arg(c);
+    }
+    Ok(cmd.status()?)
 }

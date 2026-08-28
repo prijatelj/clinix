@@ -143,6 +143,43 @@ impl Source {
     pub fn git_ref(&self) -> Option<&str> {
         self.get_str("ref")
     }
+
+    fn from_pairs(pairs: &[(&str, &str)]) -> Source {
+        Source(pairs.iter().map(|(k, v)| (k.to_string(), Value::from(*v))).collect())
+    }
+
+    /// A `github` **locked** source: `{narHash, owner, repo, rev, type}` — the
+    /// shape `pin`/clinix write (deliberately no `lastModified`). Shared by
+    /// `init` (build) and `update` (re-lock).
+    pub fn github_locked(owner: &str, repo: &str, rev: &str, nar_hash: &str) -> Source {
+        Source::from_pairs(&[
+            ("narHash", nar_hash),
+            ("owner", owner),
+            ("repo", repo),
+            ("rev", rev),
+            ("type", "github"),
+        ])
+    }
+
+    /// A `github` **original** tracking a branch/tag: `{owner, ref, repo, type}`.
+    pub fn github_ref(owner: &str, repo: &str, git_ref: &str) -> Source {
+        Source::from_pairs(&[
+            ("owner", owner),
+            ("ref", git_ref),
+            ("repo", repo),
+            ("type", "github"),
+        ])
+    }
+
+    /// A `github` **original** frozen at a rev: `{owner, repo, rev, type}`.
+    pub fn github_rev(owner: &str, repo: &str, rev: &str) -> Source {
+        Source::from_pairs(&[
+            ("owner", owner),
+            ("repo", repo),
+            ("rev", rev),
+            ("type", "github"),
+        ])
+    }
 }
 
 /// The recognized source `type`s. `github` and `tarball` are the v0.1 pin paths

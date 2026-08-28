@@ -4,6 +4,7 @@
 //! own sibling submodule; this file dispatches to them.
 
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 
 use clap::{Args, Subcommand};
 
@@ -112,6 +113,39 @@ fn state_dir() -> PathBuf {
 /// Where registry envs live: `state/envs/<name>` (plan §state layout).
 fn registry_dir() -> PathBuf {
 	state_dir().join("envs")
+}
+
+/// The GC-root path for an env: `state/roots/proj-<slug>` (slug = root path with
+/// `/`→`_`). One indirect root per env root dir; re-entering after `update`
+/// overwrites it, unrooting the previous revision.
+fn root_path(env: &Env) -> PathBuf {
+	let slug = env.root.to_string_lossy().replace('/', "_");
+	state_dir()
+		.join("roots")
+		.join(format!("proj-{}", slug.trim_start_matches('_')))
+}
+
+/// Shared launcher for `shell`/`run`: resolve a **single** env, GC-root its
+/// `shell.nix` ([`crate::nix::instantiate_rooted`]), and enter it via classic
+/// `nix-shell` — interactive, or `--run <command>` for `run`. Multi-env
+/// composition/union over a name stack, and the eval cache, are phase 5.
+pub(crate) fn launch(names: &[String], pure: bool, command: Option<&str>) -> Result<ExitStatus> {
+	if names.len() > 1 {
+		return Err(unimplemented(
+			"env shell/run with multiple envs",
+			"plan phase 5: compose/union of a name stack",
+		));
+	}
+	let env = resolve(names.first().map(String::as_str))?;
+	let shell_nix = env.root.join("shell.nix");
+	if !shell_nix.is_file() {
+		return Err(ClinixError::Resolve(format!(
+			"no shell.nix at {} (run: clinix env init)",
+			env.root.display()
+		)));
+	}
+	let drv = crate::nix::instantiate_rooted(&shell_nix, &root_path(&env))?;
+	crate::nix::nix_shell(&drv, pure, command)
 }
 
 /// The unified verb set. Every verb takes an env name (or several, for the

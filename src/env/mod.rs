@@ -28,6 +28,7 @@ pub use env::{
 	Cmd, Context, Env, EnvArgs, Kind, OptionalTarget, Rename, RunCmd, ShellOptions, Target,
 	Targets, resolve,
 };
+pub(crate) use env::launch;
 pub use export::{Export, ExportTarget};
 pub use import::Import;
 pub use init::Init;
