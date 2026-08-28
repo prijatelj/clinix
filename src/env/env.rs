@@ -12,6 +12,7 @@ use crate::error::{ClinixError, Result, unimplemented};
 
 use super::export::Export;
 use super::import::Import;
+use super::info::Info;
 use super::init::Init;
 use super::new::New;
 use super::pkgs::{self, Pin, Pkgs, Update};
@@ -179,8 +180,8 @@ pub enum Cmd {
 	Import(Import),
 	/// Export an env to another format.
 	Export(Export),
-	/// Summarize a single env (packages, pins, diagnostics).
-	Info(Target),
+	/// Summarize a single env (nixpkgs pin + resolved package versions).
+	Info(Info),
 	/// Dependency/closure report for an env.
 	Deps(Target),
 	/// N-way shared-package comparison across several envs.
@@ -212,7 +213,7 @@ impl RunCmd for Cmd {
 			Pin(a) => pkgs::pin(a, context),
 			Unpin(a) => pkgs::unpin(a, context),
 			List => info::list(context),
-			Info(a) => info::info(a, context),
+			Info(a) => a.run(context),
 			Deps(a) => info::deps(a, context),
 			Shared(a) => info::shared(a, context),
 			Check(a) => info::check(a, context),

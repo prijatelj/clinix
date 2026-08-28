@@ -18,6 +18,8 @@
 use std::path::Path;
 use std::process::{Command, ExitStatus, Output};
 
+use serde_json::Value;
+
 use crate::error::{ClinixError, Result};
 use crate::model::newtypes::{NarHash, Rev};
 
@@ -139,4 +141,14 @@ pub fn nix_shell(drv: &str, pure: bool, command: Option<&str>) -> Result<ExitSta
         cmd.arg("--run").arg(c);
     }
     Ok(cmd.status()?)
+}
+
+/// Evaluate a nix expression to JSON with **classic** `nix-instantiate --eval
+/// --strict --json` (not the experimental `nix eval`). `--strict` forces deep
+/// evaluation so lists/attrsets serialize instead of printing thunks. Used by
+/// `info` to read resolved package versions from the pinned nixpkgs (ADR-1).
+pub fn eval_json(expr: &str) -> Result<Value> {
+    let mut cmd = Command::new("nix-instantiate");
+    cmd.args(["--eval", "--strict", "--json", "--expr", expr]);
+    Ok(serde_json::from_slice(&run(cmd)?.stdout)?)
 }
