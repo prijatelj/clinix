@@ -79,7 +79,16 @@ impl RunCmd for Update {
 			));
 		}
 
-		let mut project = Project::load(resolve(Some(&self.name))?)?;
+		let env = resolve(Some(&self.name))?;
+		// A single-file env keeps its lock embedded in shell.nix; writing a
+		// flake.lock here would create a second, drifting source of truth.
+		if !env.root.join("flake.lock").exists() {
+			return Err(unimplemented(
+				"env update on a single-file env",
+				"the lock is embedded in shell.nix; re-embedding on update is a later slice",
+			));
+		}
+		let mut project = Project::load(env)?;
 
 		// The root's direct inputs are the update set (matches `pin`; `follows`
 		// edges have no node of their own).

@@ -36,6 +36,10 @@ pub struct Init {
 	/// Off by default — `shell.nix` + `flake.lock` is the primary pair.
 	#[arg(long = "flake")]
 	pub flake: bool,
+	/// Embed the lock inside `shell.nix` (one self-contained file; no separate
+	/// `flake.lock`). Vanilla `nix-shell` only — mutually exclusive with `--flake`.
+	#[arg(long = "single-file", conflicts_with = "flake")]
+	pub single_file: bool,
 	/// Adopt an existing spec (`pyproject.toml`, `Cargo.toml`, `shell.nix`, …).
 	#[arg(long = "from")]
 	pub from: Option<PathBuf>,
@@ -73,7 +77,9 @@ impl RunCmd for Init {
 		let flake_lock = root.join("flake.lock");
 		let flake_nix = root.join("flake.nix");
 		ensure_absent(&shell_nix, &root)?;
-		ensure_absent(&flake_lock, &root)?;
+		if !self.single_file {
+			ensure_absent(&flake_lock, &root)?;
+		}
 		if self.flake {
 			ensure_absent(&flake_nix, &root)?;
 		}
@@ -81,8 +87,17 @@ impl RunCmd for Init {
 		// Resolve nixpkgs and build the lock (network); nothing written on error.
 		let lock = build_nixpkgs_lock(&self.nixpkgs)?;
 
-		std::fs::write(&shell_nix, render_shell_nix(&self.packages))?;
-		std::fs::write(&flake_lock, lock.to_json())?;
+		if self.single_file {
+			// One self-contained file: the lock is embedded in shell.nix, no
+			// flake.lock (like `--flake` adds a file, this removes one).
+			std::fs::write(
+				&shell_nix,
+				render_shell_nix(&self.packages, Some(&lock.to_json())),
+			)?;
+		} else {
+			std::fs::write(&shell_nix, render_shell_nix(&self.packages, None))?;
+			std::fs::write(&flake_lock, lock.to_json())?;
+		}
 		if self.flake {
 			std::fs::write(&flake_nix, render_flake_nix(&self.nixpkgs))?;
 		}
@@ -92,6 +107,9 @@ impl RunCmd for Init {
 			root.display(),
 			self.nixpkgs
 		);
+		if self.single_file {
+			println!("clinix: single self-contained shell.nix (lock embedded; no flake.lock)");
+		}
 		if self.flake {
 			println!("clinix: wrote flake.nix wrapping shell.nix (flake users: `nix develop`)");
 		}
@@ -108,20 +126,39 @@ const FLAKE_NIX_TEMPLATE: &str = include_str!("../../templates/project/flake.nix
 const PACKAGES_PLACEHOLDER: &str = "    # project dependencies go here";
 
 /// Fill the `packages` list with the seed package names (or leave the
-/// placeholder comment when there are none). init *creates* the file from a
+/// placeholder comment when there are none), and — for `--single-file` — embed
+/// the lock in place of the `./flake.lock` read. init *creates* the file from a
 /// known template, so this string splice is sufficient — span-preserving
 /// `rnix-parser` editing (phase 5, `add`) is only needed for existing,
 /// hand-edited files.
-fn render_shell_nix(packages: &[Pkg]) -> String {
-	if packages.is_empty() {
-		return SHELL_NIX_TEMPLATE.to_string();
+fn render_shell_nix(packages: &[Pkg], embedded_lock: Option<&str>) -> String {
+	let mut shell = if packages.is_empty() {
+		SHELL_NIX_TEMPLATE.to_string()
+	} else {
+		let list = packages
+			.iter()
+			.map(|p| format!("    {}", p.name))
+			.collect::<Vec<_>>()
+			.join("\n");
+		SHELL_NIX_TEMPLATE.replacen(PACKAGES_PLACEHOLDER, &list, 1)
+	};
+	if let Some(lock_json) = embedded_lock {
+		shell = shell.replacen(
+			"builtins.readFile ./flake.lock",
+			&embed_lock_source(lock_json),
+			1,
+		);
 	}
-	let list = packages
-		.iter()
-		.map(|p| format!("    {}", p.name))
-		.collect::<Vec<_>>()
-		.join("\n");
-	SHELL_NIX_TEMPLATE.replacen(PACKAGES_PLACEHOLDER, &list, 1)
+	shell
+}
+
+/// The single-file lock source: the `flake.lock` JSON as a nix `''…''`
+/// here-string (identical bytes), escaping the two sequences nix interprets
+/// (`''` and `${`). Replaces `builtins.readFile ./flake.lock` so the env needs no
+/// separate `flake.lock`; [`crate::env::project`] reverses this to read it back.
+fn embed_lock_source(lock_json: &str) -> String {
+	let escaped = lock_json.replace("''", "'''").replace("${", "''${");
+	format!("''\n{escaped}''")
 }
 
 /// Retarget the `flake.nix` template's nixpkgs URL to the chosen ref (the
@@ -224,7 +261,7 @@ mod tests {
 
 	#[test]
 	fn render_shell_nix_splices_packages() {
-		let shell = render_shell_nix(&[pkg("ripgrep"), pkg("nodejs")]);
+		let shell = render_shell_nix(&[pkg("ripgrep"), pkg("nodejs")], None);
 		assert!(
 			shell.contains("    ripgrep\n    nodejs"),
 			"packages spliced"
@@ -237,7 +274,17 @@ mod tests {
 
 	#[test]
 	fn render_shell_nix_empty_keeps_placeholder() {
-		assert!(render_shell_nix(&[]).contains("# project dependencies go here"));
+		assert!(render_shell_nix(&[], None).contains("# project dependencies go here"));
+	}
+
+	#[test]
+	fn render_shell_nix_single_file_embeds_lock() {
+		let lock = r#"{ "nodes": {}, "root": "root", "version": 7 }"#;
+		let shell = render_shell_nix(&[], Some(lock));
+		// The lock is embedded as a here-string; the file read is gone.
+		assert!(!shell.contains("readFile ./flake.lock"), "file read removed");
+		assert!(shell.contains("builtins.fromJSON (''"), "embedded here-string");
+		assert!(shell.contains(r#""version": 7"#), "lock JSON present");
 	}
 
 	#[test]
