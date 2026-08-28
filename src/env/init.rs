@@ -282,8 +282,14 @@ mod tests {
 		let lock = r#"{ "nodes": {}, "root": "root", "version": 7 }"#;
 		let shell = render_shell_nix(&[], Some(lock));
 		// The lock is embedded as a here-string; the file read is gone.
-		assert!(!shell.contains("readFile ./flake.lock"), "file read removed");
-		assert!(shell.contains("builtins.fromJSON (''"), "embedded here-string");
+		assert!(
+			!shell.contains("readFile ./flake.lock"),
+			"file read removed"
+		);
+		assert!(
+			shell.contains("builtins.fromJSON (''"),
+			"embedded here-string"
+		);
 		assert!(shell.contains(r#""version": 7"#), "lock JSON present");
 	}
 

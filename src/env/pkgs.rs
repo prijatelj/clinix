@@ -45,6 +45,10 @@ pub struct Pkgs {
 	/// Packages to add/remove (`name` or `name=version`).
 	#[arg(required = true)]
 	pub packages: Vec<Pkg>,
+	/// After the edit, sort the `packages` list lexically (a reformatting pass;
+	/// in-list comments are not preserved).
+	#[arg(long)]
+	pub sort: bool,
 }
 
 /// Package pin/unpin selection (shared by `pin`/`unpin`).
@@ -232,17 +236,101 @@ mod tests {
 	}
 }
 
-/// Add packages to an env's `shell.nix` (rnix-parser splice).
-pub fn add(_args: Pkgs, _context: &Context) -> Result<()> {
-	Err(unimplemented("env add", "plan phase 5: rnix-parser splice"))
+/// Add packages to an env's `shell.nix` `packages` list (offline `rnix` splice;
+/// versions stay implicit in the pinned rev — use `pin` for `pkg=ver`).
+pub fn add(args: Pkgs, _context: &Context) -> Result<()> {
+	let (shell_nix, names) = prepare(&args)?;
+	let src = std::fs::read_to_string(&shell_nix)?;
+	let edit = super::nix_edit::add_packages(&src, &names)?;
+	finish(
+		&shell_nix,
+		&src,
+		edit,
+		args.sort,
+		"added",
+		"already present",
+	)
 }
 
-/// Remove packages from an env's `shell.nix` (rnix-parser splice).
-pub fn remove(_args: Pkgs, _context: &Context) -> Result<()> {
-	Err(unimplemented(
-		"env remove",
-		"plan phase 5: rnix-parser splice",
-	))
+/// Remove packages from an env's `shell.nix` `packages` list (offline splice).
+pub fn remove(args: Pkgs, _context: &Context) -> Result<()> {
+	let (shell_nix, names) = prepare(&args)?;
+	let src = std::fs::read_to_string(&shell_nix)?;
+	let edit = super::nix_edit::remove_packages(&src, &names)?;
+	finish(&shell_nix, &src, edit, args.sort, "removed", "not present")
+}
+
+/// Apply the optional `--sort` reformat, write atomically only if the file
+/// actually changed, and print the grouped report.
+fn finish(
+	shell_nix: &std::path::Path,
+	original: &str,
+	edit: super::nix_edit::Edit,
+	sort: bool,
+	changed_label: &str,
+	skipped_label: &str,
+) -> Result<()> {
+	let source = if sort {
+		super::nix_edit::sort_packages(&edit.source)?
+	} else {
+		edit.source.clone()
+	};
+	if source != original {
+		write_atomic(shell_nix, &source)?;
+	}
+	report(changed_label, skipped_label, &edit);
+	Ok(())
+}
+
+/// Resolve the env, require its `shell.nix`, reject versioned specs (versions are
+/// `pin`'s job), and return `(shell.nix path, bare package names)`.
+fn prepare(args: &Pkgs) -> Result<(std::path::PathBuf, Vec<String>)> {
+	if args.packages.iter().any(|p| p.version.is_some()) {
+		return Err(unimplemented(
+			"env add/remove with a versioned package",
+			"names only; use `pin <env> <pkg>=<ver>` for versions (phase 4)",
+		));
+	}
+	let env = resolve(Some(&args.name))?;
+	let shell_nix = env.root.join("shell.nix");
+	if !shell_nix.is_file() {
+		return Err(ClinixError::ShellNix(format!(
+			"no shell.nix at {} (run: clinix env init)",
+			env.root.display()
+		)));
+	}
+	let names = args.packages.iter().map(|p| p.name.clone()).collect();
+	Ok((shell_nix, names))
+}
+
+/// Write atomically (same-dir temp + rename) so a partial write can't corrupt a
+/// hand-edited `shell.nix`.
+fn write_atomic(path: &std::path::Path, content: &str) -> Result<()> {
+	let name = path.file_name().unwrap().to_string_lossy();
+	let tmp = path.with_file_name(format!(".{name}.clinix-tmp"));
+	std::fs::write(&tmp, content)?;
+	std::fs::rename(&tmp, path)?;
+	Ok(())
+}
+
+/// Grouped, tab-indented report:
+/// `added:\n\tripgrep\n\nalready present:\n\tjq`.
+fn report(changed_label: &str, skipped_label: &str, edit: &super::nix_edit::Edit) {
+	if !edit.changed.is_empty() {
+		println!("{changed_label}:");
+		for name in &edit.changed {
+			println!("\t{name}");
+		}
+	}
+	if !edit.skipped.is_empty() {
+		if !edit.changed.is_empty() {
+			println!();
+		}
+		println!("{skipped_label}:");
+		for name in &edit.skipped {
+			println!("\t{name}");
+		}
+	}
 }
 
 /// Pin package versions in `flake.lock` (`--all` = closure freeze).

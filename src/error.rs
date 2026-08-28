@@ -50,6 +50,10 @@ pub enum ClinixError {
 	/// A ref could not be resolved to a revision (command succeeded, no match).
 	#[error("could not resolve: {0}")]
 	Resolve(String),
+
+	/// Editing a `shell.nix` failed (parse error, or no `packages` list found).
+	#[error("shell.nix: {0}")]
+	ShellNix(String),
 }
 
 /// Construct a [`ClinixError::Unimplemented`] for `command`, tagged with a

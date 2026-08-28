@@ -117,3 +117,76 @@ fn deps_without_a_shell_nix_errors_clearly() {
 		.failure()
 		.stderr(predicate::str::contains("no shell.nix"));
 }
+
+// ---- add / remove (offline `shell.nix` edits — no nix needed) ----------------
+
+const SHELL_NIX: &str = "\
+pkgs.mkShell {
+  packages = with pkgs; [
+    ripgrep
+  ];
+}
+";
+
+#[test]
+fn add_appends_and_is_idempotent() {
+	let p = Project::new();
+	std::fs::write(p.file("shell.nix"), SHELL_NIX).unwrap();
+	p.clinix(&["env", "add", ".", "jq", "nodejs"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("added:").and(predicate::str::contains("nodejs")));
+	let shell = std::fs::read_to_string(p.file("shell.nix")).unwrap();
+	assert!(shell.contains("ripgrep") && shell.contains("jq") && shell.contains("nodejs"));
+
+	p.clinix(&["env", "add", ".", "jq"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("already present"));
+}
+
+#[test]
+fn remove_deletes_and_reports_absent() {
+	let p = Project::new();
+	std::fs::write(p.file("shell.nix"), SHELL_NIX).unwrap();
+	p.clinix(&["env", "remove", ".", "ripgrep", "bogus"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("removed:").and(predicate::str::contains("not present")));
+	assert!(
+		!std::fs::read_to_string(p.file("shell.nix"))
+			.unwrap()
+			.contains("ripgrep")
+	);
+}
+
+#[test]
+fn add_versioned_package_is_rejected() {
+	let p = Project::new();
+	std::fs::write(p.file("shell.nix"), SHELL_NIX).unwrap();
+	p.clinix(&["env", "add", ".", "ripgrep=1.2.3"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("versioned package"));
+}
+
+#[test]
+fn add_without_a_shell_nix_errors() {
+	Project::new()
+		.clinix(&["env", "add", ".", "jq"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("no shell.nix"));
+}
+
+#[test]
+fn add_with_sort_orders_the_list() {
+	let p = Project::new();
+	std::fs::write(p.file("shell.nix"), SHELL_NIX).unwrap(); // has ripgrep
+	p.clinix(&["env", "add", ".", "jq", "--sort"])
+		.assert()
+		.success();
+	// jq sorts before ripgrep.
+	let shell = std::fs::read_to_string(p.file("shell.nix")).unwrap();
+	assert!(shell.contains("    jq\n    ripgrep\n  ];"), "{shell}");
+}

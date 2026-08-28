@@ -19,6 +19,7 @@ mod import;
 mod info;
 mod init;
 mod new;
+mod nix_edit;
 mod pkgs;
 pub mod project;
 mod run;

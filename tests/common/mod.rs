@@ -62,9 +62,14 @@ impl Default for Project {
 /// True when the classic nix toolchain an L4 test needs is on PATH; L4 tests
 /// skip (rather than fail) when it isn't.
 pub fn have_nix() -> bool {
-	["nix-shell", "nix-instantiate", "nix-store", "nix-prefetch-url"]
-		.iter()
-		.all(|bin| on_path(bin))
+	[
+		"nix-shell",
+		"nix-instantiate",
+		"nix-store",
+		"nix-prefetch-url",
+	]
+	.iter()
+	.all(|bin| on_path(bin))
 }
 
 fn on_path(bin: &str) -> bool {
