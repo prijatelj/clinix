@@ -9,6 +9,7 @@
 //! integration tests in `tests/` can exercise the public API.
 
 pub mod cli;
+pub mod disk;
 pub mod env;
 pub mod error;
 pub mod model;

@@ -7,11 +7,11 @@ use clap::Parser;
 use clinix::cli::Cli;
 
 fn main() -> ExitCode {
-    match Cli::parse().dispatch() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("clinix: error: {e}");
-            ExitCode::FAILURE
-        }
-    }
+	match Cli::parse().dispatch() {
+		Ok(()) => ExitCode::SUCCESS,
+		Err(e) => {
+			eprintln!("clinix: error: {e}");
+			ExitCode::FAILURE
+		}
+	}
 }

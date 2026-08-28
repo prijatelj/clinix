@@ -31,7 +31,7 @@ pub use env::{
 pub(crate) use env::launch;
 pub use export::{Export, ExportTarget};
 pub use import::Import;
-pub use info::Info;
+pub use info::{Deps, Info};
 pub use init::Init;
 pub use new::New;
 pub use pkgs::{Pin, Pkg, Pkgs, Update};

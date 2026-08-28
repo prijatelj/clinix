@@ -12,7 +12,7 @@ use crate::error::{ClinixError, Result, unimplemented};
 
 use super::export::Export;
 use super::import::Import;
-use super::info::Info;
+use super::info::{Deps, Info};
 use super::init::Init;
 use super::new::New;
 use super::pkgs::{self, Pin, Pkgs, Update};
@@ -158,10 +158,9 @@ pub enum Cmd {
 	Init(Init),
 	/// Create a new **registry** env by merging existing envs (`--from A B C`).
 	New(New),
-	/// Enter an interactive shell for the composed env(s).
-	Shell(Shell),
-	/// Run a command inside the composed env(s), non-interactively.
-	Run(Run),
+	/// Rename a registered env.
+	Rename(Rename),
+
 	/// Add packages to an env's `shell.nix`.
 	Add(Pkgs),
 	/// Remove packages from an env's `shell.nix`.
@@ -172,18 +171,23 @@ pub enum Cmd {
 	Unpin(Pin),
 	/// Update unpinned packages to the latest the baseline provides.
 	Update(Update),
-	/// Rename a registered env.
-	Rename(Rename),
-	/// List registered envs.
-	List,
+
+	/// Enter an interactive shell for the composed env(s).
+	Shell(Shell),
+	/// Run a command inside the composed env(s), non-interactively.
+	Run(Run),
+
 	/// Import an env from another format (shell.nix / flake / .deb / OCI / …).
 	Import(Import),
 	/// Export an env to another format.
 	Export(Export),
+
+	/// List registered envs.
+	List,
 	/// Summarize a single env (nixpkgs pin + resolved package versions).
 	Info(Info),
 	/// Dependency/closure report for an env.
-	Deps(Target),
+	Deps(Deps),
 	/// N-way shared-package comparison across several envs.
 	Shared(Targets),
 	/// Environment/PATH audit (the former `envcheck`).
@@ -201,20 +205,25 @@ impl RunCmd for Cmd {
 			// Dedicated struct + `RunCmd` impl in the submodule.
 			Init(a) => a.run(context),
 			New(a) => a.run(context),
-			Shell(a) => a.run(context),
-			Run(a) => a.run(context),
-			Update(a) => a.run(context),
 			Rename(a) => a.run(context),
-			Import(a) => a.run(context),
-			Export(a) => a.run(context),
-			// Shared arg shape → free fn in the submodule.
+
+			// Package management
 			Add(a) => pkgs::add(a, context),
 			Remove(a) => pkgs::remove(a, context),
 			Pin(a) => pkgs::pin(a, context),
 			Unpin(a) => pkgs::unpin(a, context),
+			Update(a) => a.run(context),
+
+			Shell(a) => a.run(context),
+			Run(a) => a.run(context),
+
+			Import(a) => a.run(context),
+			Export(a) => a.run(context),
+
+			// Diagnostic information
 			List => info::list(context),
 			Info(a) => a.run(context),
-			Deps(a) => info::deps(a, context),
+			Deps(a) => a.run(context),
 			Shared(a) => info::shared(a, context),
 			Check(a) => info::check(a, context),
 			Clean(a) => clean::clean(a, context),

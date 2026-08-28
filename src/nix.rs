@@ -152,3 +152,33 @@ pub fn eval_json(expr: &str) -> Result<Value> {
     cmd.args(["--eval", "--strict", "--json", "--expr", expr]);
     Ok(serde_json::from_slice(&run(cmd)?.stdout)?)
 }
+
+/// Instantiate a nix file to its `.drv` store path (no GC root):
+/// `nix-instantiate <file>`. Used by `deps` to analyze an env's derivation.
+pub fn instantiate(nix_file: &Path) -> Result<String> {
+    let mut cmd = Command::new("nix-instantiate");
+    cmd.arg(nix_file);
+    Ok(stdout_string(&run(cmd)?).trim().to_string())
+}
+
+/// The closure of a derivation — every store path reachable, including built
+/// outputs: `nix-store --query --requisites --include-outputs <drv>`.
+pub fn closure(drv: &str) -> Result<Vec<String>> {
+    let mut cmd = Command::new("nix-store");
+    cmd.args(["--query", "--requisites", "--include-outputs", drv]);
+    Ok(stdout_string(&run(cmd)?)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+/// GC roots referencing a derivation: `nix-store --query --roots <drv>`.
+pub fn gc_roots(drv: &str) -> Result<Vec<String>> {
+    let mut cmd = Command::new("nix-store");
+    cmd.args(["--query", "--roots", drv]);
+    Ok(stdout_string(&run(cmd)?)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+

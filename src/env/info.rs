@@ -5,8 +5,8 @@
 use clap::Args;
 
 use crate::env::project::Project;
-use crate::env::{Context, Kind, OptionalTarget, RunCmd, Target, Targets, resolve};
-use crate::error::{Result, unimplemented};
+use crate::env::{Context, Kind, OptionalTarget, RunCmd, Targets, resolve};
+use crate::error::{ClinixError, Result, unimplemented};
 
 /// Summarize an env: its nixpkgs pin and every package's **resolved version**.
 /// Versions are computed on demand from the pinned nixpkgs via classic
@@ -65,12 +65,19 @@ fn nixpkgs_pin(project: &Project) -> Option<(String, String)> {
 	Some((track, rev))
 }
 
-fn print_table(project: &Project, packages: &[ResolvedPkg]) {
-	let kind = match project.env.kind {
+fn kind_str(kind: Kind) -> &'static str {
+	match kind {
 		Kind::Project => "project",
 		Kind::Registry => "registry",
-	};
-	println!("env: {} ({kind})", project.env.root.display());
+	}
+}
+
+fn print_table(project: &Project, packages: &[ResolvedPkg]) {
+	println!(
+		"env: {} ({})",
+		project.env.root.display(),
+		kind_str(project.env.kind)
+	);
 	if let Some((track, rev)) = nixpkgs_pin(project) {
 		println!("nixpkgs: {track} @ {:.9}", rev);
 	}
@@ -101,9 +108,92 @@ pub fn list(_context: &Context) -> Result<()> {
 	Err(unimplemented("env list", "plan phase 5: enumerate registry"))
 }
 
-/// Dependency/closure report for an env.
-pub fn deps(_target: Target, _context: &Context) -> Result<()> {
-	Err(unimplemented("env deps", "plan phase 6: closure report"))
+/// Where an env's dependencies live on disk: its derivation, each package's store
+/// path, the full closure (count, and `--size` for on-disk bytes), and the GC
+/// roots holding it. All classic (`nix-instantiate`, `nix-store -qR`, `du`).
+#[derive(Args, Debug)]
+pub struct Deps {
+	/// Env to analyze (name, path, or `.`); defaults to the cwd project.
+	pub name: Option<String>,
+	/// Also measure the closure's on-disk size (slower — stats every path).
+	#[arg(long)]
+	pub size: bool,
+}
+impl RunCmd for Deps {
+	fn run(self, _context: &Context) -> Result<()> {
+		let env = resolve(self.name.as_deref())?;
+		let shell_nix = env.root.join("shell.nix");
+		if !shell_nix.is_file() {
+			return Err(ClinixError::Resolve(format!(
+				"no shell.nix at {} (run: clinix env init)",
+				env.root.display()
+			)));
+		}
+		let drv = crate::nix::instantiate(&shell_nix)?;
+		println!("env: {} ({})", env.root.display(), kind_str(env.kind));
+		println!("derivation: {drv}");
+
+		let packages = dep_packages(&shell_nix)?;
+		println!("\npackages ({}):", packages.len());
+		for p in &packages {
+			println!("  {}\n    {}", p.name, p.path);
+		}
+
+		let closure = crate::nix::closure(&drv)?;
+		print!("\nclosure: {} store paths", closure.len());
+		if self.size {
+			println!(" — {}", human_bytes(crate::disk::total_bytes(&closure)));
+		} else {
+			println!("  (pass --size to measure on disk)");
+		}
+
+		let roots = crate::nix::gc_roots(&drv)?;
+		println!("\ngc roots:");
+		if roots.is_empty() {
+			println!("  none — nix-collect-garbage will delete this env");
+			println!(
+				"  root it: clinix env shell {}",
+				self.name.as_deref().unwrap_or(".")
+			);
+		} else {
+			for r in &roots {
+				println!("  {r}");
+			}
+		}
+		Ok(())
+	}
+}
+
+#[derive(serde::Deserialize)]
+struct DepPkg {
+	name: String,
+	path: String,
+}
+
+/// Each package's `{name, store-path}` — `toString` on a derivation yields its
+/// chosen output path without building it (per the `deps` prototype).
+fn dep_packages(shell_nix: &std::path::Path) -> Result<Vec<DepPkg>> {
+	let expr = format!(
+		"let s = import {} {{}}; ins = (s.nativeBuildInputs or []) ++ (s.buildInputs or []); \
+		 in map (p: {{ name = p.name or \"?\"; path = toString p; }}) ins",
+		shell_nix.display()
+	);
+	Ok(serde_json::from_value(crate::nix::eval_json(&expr)?)?)
+}
+
+fn human_bytes(bytes: u64) -> String {
+	const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+	let mut value = bytes as f64;
+	let mut unit = 0;
+	while value >= 1024.0 && unit < UNITS.len() - 1 {
+		value /= 1024.0;
+		unit += 1;
+	}
+	if unit == 0 {
+		format!("{bytes} B")
+	} else {
+		format!("{value:.1} {}", UNITS[unit])
+	}
 }
 
 /// N-way shared-package comparison across several envs.

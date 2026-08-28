@@ -8,58 +8,58 @@ pub type Result<T> = std::result::Result<T, ClinixError>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ClinixError {
-    #[error("`{command}` is not yet implemented ({note})")]
-    Unimplemented {
-        command: String,
-        note: &'static str,
-    },
+	#[error("`{command}` is not yet implemented ({note})")]
+	Unimplemented {
+		command: String,
+		note: &'static str,
+	},
 
-    /// A name that is neither a registered env nor a path to a project dir.
-    #[error("environment `{0}` is not registered and is not a project directory")]
-    UnknownEnv(String),
+	/// A name that is neither a registered env nor a path to a project dir.
+	#[error("environment `{0}` is not registered and is not a project directory")]
+	UnknownEnv(String),
 
-    /// `init` could not decide what to scaffold from the existing directory
-    /// state. `detail` names exactly what is undetermined (user-facing).
-    #[error("cannot initialize `{path}`: {detail}")]
-    AmbiguousInit { path: String, detail: String },
+	/// `init` could not decide what to scaffold from the existing directory
+	/// state. `detail` names exactly what is undetermined (user-facing).
+	#[error("cannot initialize `{path}`: {detail}")]
+	AmbiguousInit { path: String, detail: String },
 
-    #[error("invalid package spec `{0}` — expected `name` or `name=version`")]
-    InvalidPackage(String),
+	#[error("invalid package spec `{0}` — expected `name` or `name=version`")]
+	InvalidPackage(String),
 
-    /// A malformed git revision (not 40/64-char lowercase hex).
-    #[error("invalid git revision `{0}` — expected 40- or 64-char lowercase hex")]
-    InvalidRev(String),
+	/// A malformed git revision (not 40/64-char lowercase hex).
+	#[error("invalid git revision `{0}` — expected 40- or 64-char lowercase hex")]
+	InvalidRev(String),
 
-    /// A malformed nix content hash.
-    #[error("invalid narHash `{0}` — expected `<algo>-<base64>` or `<algo>:<base32>`")]
-    InvalidNarHash(String),
+	/// A malformed nix content hash.
+	#[error("invalid narHash `{0}` — expected `<algo>-<base64>` or `<algo>:<base32>`")]
+	InvalidNarHash(String),
 
-    /// `flake.lock` (or another JSON document) failed to parse/serialize.
-    #[error("failed to parse flake.lock: {0}")]
-    Lock(#[from] serde_json::Error),
+	/// `flake.lock` (or another JSON document) failed to parse/serialize.
+	#[error("failed to parse flake.lock: {0}")]
+	Lock(#[from] serde_json::Error),
 
-    /// A filesystem operation failed.
-    #[error("i/o error: {0}")]
-    Io(#[from] std::io::Error),
+	/// A filesystem operation failed.
+	#[error("i/o error: {0}")]
+	Io(#[from] std::io::Error),
 
-    /// A `nix*`/`git` CLI invocation exited nonzero (the shell-out boundary).
-    #[error("command failed ({status}): {cmd}\n{stderr}")]
-    Nix {
-        cmd: String,
-        status: String,
-        stderr: String,
-    },
+	/// A `nix*`/`git` CLI invocation exited nonzero (the shell-out boundary).
+	#[error("command failed ({status}): {cmd}\n{stderr}")]
+	Nix {
+		cmd: String,
+		status: String,
+		stderr: String,
+	},
 
-    /// A ref could not be resolved to a revision (command succeeded, no match).
-    #[error("could not resolve: {0}")]
-    Resolve(String),
+	/// A ref could not be resolved to a revision (command succeeded, no match).
+	#[error("could not resolve: {0}")]
+	Resolve(String),
 }
 
 /// Construct a [`ClinixError::Unimplemented`] for `command`, tagged with a
 /// short tracking `note` (e.g. the plan phase that will implement it).
 pub fn unimplemented(command: impl Into<String>, note: &'static str) -> ClinixError {
-    ClinixError::Unimplemented {
-        command: command.into(),
-        note,
-    }
+	ClinixError::Unimplemented {
+		command: command.into(),
+		note,
+	}
 }
