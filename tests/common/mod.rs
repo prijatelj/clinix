@@ -79,3 +79,14 @@ fn on_path(bin: &str) -> bool {
 		.output()
 		.is_ok_and(|o| o.status.success())
 }
+
+/// Run a command inside a scaffolded env via vanilla `nix-shell` (the thesis:
+/// `shell.nix` + `flake.lock` runs under plain nix, no flakes). L4 only.
+pub fn nix_shell_run(shell_nix: &Path, command: &str) -> std::process::Output {
+	Command::new("nix-shell")
+		.arg(shell_nix)
+		.arg("--run")
+		.arg(command)
+		.output()
+		.expect("nix-shell should spawn")
+}

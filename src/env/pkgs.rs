@@ -5,9 +5,9 @@
 use clap::Args;
 
 use crate::env::project::Project;
-use crate::env::{Context, RunCmd, resolve};
+use crate::env::{Context, Env, RunCmd, resolve};
 use crate::error::{ClinixError, Result, unimplemented};
-use crate::model::lock::{InputRef, Source};
+use crate::model::lock::{FlakeLock, InputRef, Source};
 
 /// A package with an optional pinned version, parsed from `name[=version]`.
 #[derive(Debug, Clone)]
@@ -58,9 +58,15 @@ pub struct Pin {
 	pub name: String,
 	/// Packages to pin/unpin. Empty with `--all` operates on the whole closure.
 	pub packages: Vec<Pkg>,
-	/// Freeze/unfreeze every package (closure-equivalent full pin).
+	/// Freeze/unfreeze the whole env: pin every input at its current rev
+	/// (closure-equivalent full pin), or (`unpin`) resume tracking.
 	#[arg(long)]
 	pub all: bool,
+	/// For `unpin --all`: the branch/tag to track again. Required for now
+	/// (clinix does not yet remember the pre-freeze ref — that arrives with
+	/// `clinixEnv`).
+	#[arg(long)]
+	pub branch: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -234,6 +240,62 @@ mod tests {
 		assert_ne!(new_rev, stale, "nixos-26.05 should have advanced");
 		assert_eq!(new_rev.len(), 40);
 	}
+
+	/// A one-input lock: nixpkgs tracking `nixos-26.05` at a fixed rev.
+	fn tracked_lock() -> FlakeLock {
+		let mut nodes = BTreeMap::new();
+		nodes.insert(
+			"nixpkgs".to_string(),
+			Node {
+				locked: Some(Source::github_locked("NixOS", "nixpkgs", "abc123", "sha256-x")),
+				original: Some(Source::github_ref("NixOS", "nixpkgs", "nixos-26.05")),
+				..Node::default()
+			},
+		);
+		let mut root_inputs = BTreeMap::new();
+		root_inputs.insert(
+			"nixpkgs".to_string(),
+			InputRef::Direct("nixpkgs".to_string()),
+		);
+		nodes.insert(
+			"root".to_string(),
+			Node {
+				inputs: root_inputs,
+				..Node::default()
+			},
+		);
+		FlakeLock {
+			nodes,
+			root: "root".to_string(),
+			version: 7,
+		}
+	}
+
+	#[test]
+	fn freeze_then_unfreeze_roundtrips_standardly() {
+		let mut lock = tracked_lock();
+
+		let froze = freeze(&mut lock);
+		assert_eq!(froze.len(), 1);
+		let orig = lock.nodes["nixpkgs"].original.as_ref().unwrap();
+		assert_eq!(orig.rev(), Some("abc123")); // pinned to the locked rev
+		assert_eq!(orig.git_ref(), None); // standard: ref dropped
+
+		assert!(freeze(&mut lock).is_empty(), "already frozen");
+
+		let unfroze = unfreeze(&mut lock, "nixos-26.05");
+		assert_eq!(unfroze.len(), 1);
+		let orig = lock.nodes["nixpkgs"].original.as_ref().unwrap();
+		assert_eq!(orig.git_ref(), Some("nixos-26.05"));
+		assert_eq!(orig.rev(), None);
+	}
+
+	#[test]
+	fn swap_once_requires_exactly_one_occurrence() {
+		assert_eq!(swap_once("a b", "a", "X").as_deref(), Some("X b"));
+		assert_eq!(swap_once("a b a", "a", "X"), None); // twice
+		assert_eq!(swap_once("b", "a", "X"), None); // zero
+	}
 }
 
 /// Add packages to an env's `shell.nix` `packages` list (offline `rnix` splice;
@@ -333,18 +395,234 @@ fn report(changed_label: &str, skipped_label: &str, edit: &super::nix_edit::Edit
 	}
 }
 
-/// Pin package versions in `flake.lock` (`--all` = closure freeze).
-pub fn pin(_args: Pin, _context: &Context) -> Result<()> {
-	Err(unimplemented(
-		"env pin",
-		"plan phase 3/4: flake.lock version pin",
-	))
+/// Freeze the whole env: pin every tracked input at its current rev (`--all`).
+/// Ports `pin freeze` — a standard `flake.lock` edit (`original`: drop `ref`, add
+/// `rev`), plus the `flake.nix` URL swap for `--flake` envs. Offline (copies
+/// `locked.rev`; no resolve). Per-package pinning (`pin <pkg>[=<ver>]`) is phase 4.
+pub fn pin(args: Pin, _context: &Context) -> Result<()> {
+	require_scope(&args, "env pin")?;
+	let mut project = Project::load(resolve(Some(&args.name))?)?;
+	let flake_lock = require_flake_lock(&project.env, "env pin")?;
+
+	let changes = freeze(&mut project.lock);
+	if changes.is_empty() {
+		println!("clinix: nothing to freeze (all inputs already pinned)");
+		return Ok(());
+	}
+	// For a `--flake` env, keep `flake.nix` consistent (else `nix flake` re-locks).
+	let kept = reconcile_flake_nix(&mut project.lock, &project.env, &changes, Freeze)?;
+	if kept.is_empty() {
+		return Ok(());
+	}
+	std::fs::write(&flake_lock, project.lock.to_json())?;
+	println!("frozen:");
+	for c in &kept {
+		println!("\t{} @ {:.9}", c.name, c.to);
+	}
+	Ok(())
 }
 
-/// Unpin packages back to baseline tracking (`--all` = unfreeze).
-pub fn unpin(_args: Pin, _context: &Context) -> Result<()> {
-	Err(unimplemented(
-		"env unpin",
-		"plan phase 3/4: flake.lock unpin",
-	))
+/// Unfreeze the whole env: resume tracking `--branch <ref>` (`unpin --all`).
+/// Ports `pin unfreeze -b`. Requires `--branch` for now (no remembered ref yet).
+pub fn unpin(args: Pin, _context: &Context) -> Result<()> {
+	require_scope(&args, "env unpin")?;
+	let Some(branch) = args.branch.as_deref() else {
+		return Err(ClinixError::Resolve(
+			"unpin needs `--branch <ref>` (clinix does not yet remember the pre-freeze branch; \
+			 that arrives with clinixEnv)"
+				.into(),
+		));
+	};
+	let mut project = Project::load(resolve(Some(&args.name))?)?;
+	let flake_lock = require_flake_lock(&project.env, "env unpin")?;
+
+	let changes = unfreeze(&mut project.lock, branch);
+	if changes.is_empty() {
+		println!("clinix: nothing to unfreeze (no frozen inputs)");
+		return Ok(());
+	}
+	let kept = reconcile_flake_nix(&mut project.lock, &project.env, &changes, Unfreeze)?;
+	if kept.is_empty() {
+		return Ok(());
+	}
+	std::fs::write(&flake_lock, project.lock.to_json())?;
+	println!("tracking {branch}:");
+	for c in &kept {
+		println!("\t{}", c.name);
+	}
+	Ok(())
+}
+
+/// Require `--all` (per-package pinning is phase 4).
+fn require_scope(args: &Pin, verb: &str) -> Result<()> {
+	if !args.packages.is_empty() {
+		return Err(unimplemented(
+			verb,
+			"per-package pinning is phase 4 (version index); use `--all` to freeze the whole env",
+		));
+	}
+	if !args.all {
+		return Err(ClinixError::Resolve(format!(
+			"{verb}: give `--all` to freeze/unfreeze the whole env (per-package is phase 4)"
+		)));
+	}
+	Ok(())
+}
+
+/// The env's `flake.lock` path, or a guarded error for a single-file env (its
+/// lock is embedded in `shell.nix`; editing a `flake.lock` here would drift).
+fn require_flake_lock(env: &Env, verb: &str) -> Result<std::path::PathBuf> {
+	let path = env.root.join("flake.lock");
+	if path.exists() {
+		Ok(path)
+	} else {
+		Err(unimplemented(
+			verb,
+			"single-file env: the lock is embedded in shell.nix; re-embedding is a later slice",
+		))
+	}
+}
+
+/// A frozen/unfrozen input, for `flake.nix` reconciliation and reporting.
+/// `from`/`to` are the URL ref/rev being swapped (freeze: ref→rev; unfreeze:
+/// rev→branch).
+#[derive(Clone)]
+struct Change {
+	name: String,
+	owner: String,
+	repo: String,
+	from: String,
+	to: String,
+}
+
+/// **Pure.** Freeze every tracked github input (`original.ref`, no `rev`) at its
+/// `locked.rev`: rewrite `original` to `{owner, repo, rev, type}` (standard —
+/// drops the ref). Returns the changes.
+fn freeze(lock: &mut FlakeLock) -> Vec<Change> {
+	let mut changes = Vec::new();
+	for name in input_names(lock) {
+		let node = &lock.nodes[&name];
+		let (Some(original), Some(locked)) = (&node.original, &node.locked) else {
+			continue;
+		};
+		if original.source_type() != Some("github") || original.rev().is_some() {
+			continue; // not github, or already frozen
+		}
+		let (Some(owner), Some(repo), Some(git_ref), Some(rev)) = (
+			original.owner(),
+			original.repo(),
+			original.git_ref(),
+			locked.rev(),
+		) else {
+			continue;
+		};
+		let change = Change {
+			name: name.clone(),
+			owner: owner.into(),
+			repo: repo.into(),
+			from: git_ref.into(),
+			to: rev.into(),
+		};
+		lock.nodes.get_mut(&name).unwrap().original =
+			Some(Source::github_rev(&change.owner, &change.repo, &change.to));
+		changes.push(change);
+	}
+	changes
+}
+
+/// **Pure.** Unfreeze every frozen github input (`original.rev`, no `ref`) back
+/// to tracking `branch`: rewrite `original` to `{owner, ref, repo, type}`.
+fn unfreeze(lock: &mut FlakeLock, branch: &str) -> Vec<Change> {
+	let mut changes = Vec::new();
+	for name in input_names(lock) {
+		let node = &lock.nodes[&name];
+		let Some(original) = &node.original else {
+			continue;
+		};
+		if original.source_type() != Some("github") || original.git_ref().is_some() {
+			continue; // not github, or not frozen (still tracks a ref)
+		}
+		let (Some(owner), Some(repo), Some(rev)) =
+			(original.owner(), original.repo(), original.rev())
+		else {
+			continue;
+		};
+		let change = Change {
+			name: name.clone(),
+			owner: owner.into(),
+			repo: repo.into(),
+			from: rev.into(),
+			to: branch.into(),
+		};
+		lock.nodes.get_mut(&name).unwrap().original =
+			Some(Source::github_ref(&change.owner, &change.repo, branch));
+		changes.push(change);
+	}
+	changes
+}
+
+fn input_names(lock: &FlakeLock) -> Vec<String> {
+	lock.nodes
+		.keys()
+		.filter(|n| **n != lock.root)
+		.cloned()
+		.collect()
+}
+
+#[derive(Clone, Copy)]
+enum FlakeOp {
+	Freeze,
+	Unfreeze,
+}
+use FlakeOp::{Freeze, Unfreeze};
+
+/// For a `--flake` env, swap each input's `github:owner/repo/<from>` →
+/// `.../<to>` in `flake.nix` (exactly once, like `pin`'s `rewrite_url`). An input
+/// whose URL can't be updated is **reverted** in the lock and warned about, so
+/// `flake.lock` and `flake.nix` stay consistent. Returns the changes actually
+/// kept. A default env (no `flake.nix`) keeps everything.
+fn reconcile_flake_nix(
+	lock: &mut FlakeLock,
+	env: &Env,
+	changes: &[Change],
+	op: FlakeOp,
+) -> Result<Vec<Change>> {
+	let flake_path = env.root.join("flake.nix");
+	let Ok(mut flake_src) = std::fs::read_to_string(&flake_path) else {
+		return Ok(changes.to_vec()); // default env: nothing to reconcile
+	};
+
+	let mut kept = Vec::new();
+	for c in changes {
+		let url = |r: &str| format!("github:{}/{}/{}", c.owner, c.repo, r);
+		let (old, new) = (url(&c.from), url(&c.to));
+		match swap_once(&flake_src, &old, &new) {
+			Some(swapped) => {
+				flake_src = swapped;
+				kept.push(c.clone());
+			}
+			None => {
+				// Revert the lock edit so the two stay consistent; tell the user.
+				let reverted = match op {
+					Freeze => Source::github_ref(&c.owner, &c.repo, &c.from),
+					Unfreeze => Source::github_rev(&c.owner, &c.repo, &c.from),
+				};
+				lock.nodes.get_mut(&c.name).unwrap().original = Some(reverted);
+				eprintln!(
+					"clinix: warning: `{old}` not found exactly once in flake.nix; \
+					 left `{}` unchanged — set its input url to `{new}` and re-run",
+					c.name
+				);
+			}
+		}
+	}
+	if !kept.is_empty() {
+		std::fs::write(&flake_path, flake_src)?;
+	}
+	Ok(kept)
+}
+
+/// Replace `old` with `new` iff `old` occurs exactly once (else `None`).
+fn swap_once(src: &str, old: &str, new: &str) -> Option<String> {
+	(src.matches(old).count() == 1).then(|| src.replacen(old, new, 1))
 }

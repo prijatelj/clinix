@@ -190,3 +190,55 @@ fn add_with_sort_orders_the_list() {
 	let shell = std::fs::read_to_string(p.file("shell.nix")).unwrap();
 	assert!(shell.contains("    jq\n    ripgrep\n  ];"), "{shell}");
 }
+
+// ---- pin / unpin (offline flake.lock freeze/unfreeze) ------------------------
+
+const FLAKE_LOCK: &str = r#"{
+  "nodes": {
+    "nixpkgs": {
+      "locked": { "narHash": "sha256-x", "owner": "NixOS", "repo": "nixpkgs", "rev": "abc123", "type": "github" },
+      "original": { "owner": "NixOS", "ref": "nixos-26.05", "repo": "nixpkgs", "type": "github" }
+    },
+    "root": { "inputs": { "nixpkgs": "nixpkgs" } }
+  },
+  "root": "root",
+  "version": 7
+}
+"#;
+
+#[test]
+fn pin_all_freezes_to_a_standard_rev() {
+	let p = Project::new();
+	std::fs::write(p.file("flake.lock"), FLAKE_LOCK).unwrap();
+	p.clinix(&["env", "pin", ".", "--all"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("frozen"));
+	let lock = std::fs::read_to_string(p.file("flake.lock")).unwrap();
+	// original is pinned to the rev and the branch ref is dropped (nix-standard).
+	assert!(lock.contains("\"rev\": \"abc123\""));
+	assert!(!lock.contains("nixos-26.05"), "{lock}");
+}
+
+#[test]
+fn unpin_all_without_branch_is_a_clear_error() {
+	Project::new()
+		.clinix(&["env", "unpin", ".", "--all"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("--branch"));
+}
+
+#[test]
+fn pin_requires_all_and_defers_per_package() {
+	Project::new()
+		.clinix(&["env", "pin", "."]) // neither --all nor packages
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("--all"));
+	Project::new()
+		.clinix(&["env", "pin", ".", "ripgrep"]) // per-package
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("phase 4"));
+}
