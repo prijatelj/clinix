@@ -112,15 +112,28 @@ impl RunCmd for Update {
 			};
 			let owner = required(original.owner(), &name, "owner")?;
 			let repo = required(original.repo(), &name, "repo")?;
-			let old_rev = node.locked.as_ref().and_then(|l| l.rev()).map(str::to_string);
+			let old_rev = node
+				.locked
+				.as_ref()
+				.and_then(|l| l.rev())
+				.map(str::to_string);
 
 			let (rev, nar_hash) = crate::nix::resolve_github(&owner, &repo, &git_ref)?;
 			if old_rev.as_deref() == Some(rev.as_str()) {
 				println!("{name}: unchanged");
 				continue;
 			}
-			project.lock.nodes.get_mut(&name).expect("target exists").locked =
-				Some(Source::github_locked(&owner, &repo, rev.as_str(), nar_hash.as_str()));
+			project
+				.lock
+				.nodes
+				.get_mut(&name)
+				.expect("target exists")
+				.locked = Some(Source::github_locked(
+				&owner,
+				&repo,
+				rev.as_str(),
+				nar_hash.as_str(),
+			));
 			println!(
 				"{name}: {} -> {}",
 				old_rev.as_deref().unwrap_or("none"),
@@ -172,7 +185,10 @@ mod tests {
 			},
 		);
 		let mut root_inputs = BTreeMap::new();
-		root_inputs.insert("nixpkgs".to_string(), InputRef::Direct("nixpkgs".to_string()));
+		root_inputs.insert(
+			"nixpkgs".to_string(),
+			InputRef::Direct("nixpkgs".to_string()),
+		);
 		nodes.insert(
 			"root".to_string(),
 			Node {
@@ -198,10 +214,9 @@ mod tests {
 		})
 		.unwrap();
 
-		let out = FlakeLock::from_json(
-			&std::fs::read_to_string(dir.path().join("flake.lock")).unwrap(),
-		)
-		.unwrap();
+		let out =
+			FlakeLock::from_json(&std::fs::read_to_string(dir.path().join("flake.lock")).unwrap())
+				.unwrap();
 		let new_rev = out.nodes["nixpkgs"].locked.as_ref().unwrap().rev().unwrap();
 		assert_ne!(new_rev, stale, "nixos-26.05 should have advanced");
 		assert_eq!(new_rev.len(), 40);
@@ -215,15 +230,24 @@ pub fn add(_args: Pkgs, _context: &Context) -> Result<()> {
 
 /// Remove packages from an env's `shell.nix` (rnix-parser splice).
 pub fn remove(_args: Pkgs, _context: &Context) -> Result<()> {
-	Err(unimplemented("env remove", "plan phase 5: rnix-parser splice"))
+	Err(unimplemented(
+		"env remove",
+		"plan phase 5: rnix-parser splice",
+	))
 }
 
 /// Pin package versions in `flake.lock` (`--all` = closure freeze).
 pub fn pin(_args: Pin, _context: &Context) -> Result<()> {
-	Err(unimplemented("env pin", "plan phase 3/4: flake.lock version pin"))
+	Err(unimplemented(
+		"env pin",
+		"plan phase 3/4: flake.lock version pin",
+	))
 }
 
 /// Unpin packages back to baseline tracking (`--all` = unfreeze).
 pub fn unpin(_args: Pin, _context: &Context) -> Result<()> {
-	Err(unimplemented("env unpin", "plan phase 3/4: flake.lock unpin"))
+	Err(unimplemented(
+		"env unpin",
+		"plan phase 3/4: flake.lock unpin",
+	))
 }

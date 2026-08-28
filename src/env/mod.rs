@@ -24,11 +24,11 @@ pub mod project;
 mod run;
 mod shell;
 
+pub(crate) use env::launch;
 pub use env::{
 	Cmd, Context, Env, EnvArgs, Kind, OptionalTarget, Rename, RunCmd, ShellOptions, Target,
 	Targets, resolve,
 };
-pub(crate) use env::launch;
 pub use export::{Export, ExportTarget};
 pub use import::Import;
 pub use info::{Deps, Info};

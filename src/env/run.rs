@@ -47,7 +47,10 @@ mod tests {
 
 	#[test]
 	fn shell_join_quotes_each_arg() {
-		assert_eq!(shell_join(&["cargo".into(), "build".into()]), "'cargo' 'build'");
+		assert_eq!(
+			shell_join(&["cargo".into(), "build".into()]),
+			"'cargo' 'build'"
+		);
 		// A single quote inside an arg is escaped, not left to break the string.
 		assert_eq!(shell_join(&["it's".into()]), r"'it'\''s'");
 	}

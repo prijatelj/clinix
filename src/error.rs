@@ -9,10 +9,7 @@ pub type Result<T> = std::result::Result<T, ClinixError>;
 #[derive(thiserror::Error, Debug)]
 pub enum ClinixError {
 	#[error("`{command}` is not yet implemented ({note})")]
-	Unimplemented {
-		command: String,
-		note: &'static str,
-	},
+	Unimplemented { command: String, note: &'static str },
 
 	/// A name that is neither a registered env nor a path to a project dir.
 	#[error("environment `{0}` is not registered and is not a project directory")]

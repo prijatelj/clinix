@@ -247,7 +247,10 @@ pub struct Rename {
 }
 impl RunCmd for Rename {
 	fn run(self, _context: &Context) -> Result<()> {
-		Err(unimplemented("env rename", "plan phase 5: registry relabel"))
+		Err(unimplemented(
+			"env rename",
+			"plan phase 5: registry relabel",
+		))
 	}
 }
 

@@ -20,6 +20,9 @@ pub struct New {
 }
 impl RunCmd for New {
 	fn run(self, _context: &Context) -> Result<()> {
-		Err(unimplemented("env new", "plan phase 5: merge envs → registry item"))
+		Err(unimplemented(
+			"env new",
+			"plan phase 5: merge envs → registry item",
+		))
 	}
 }

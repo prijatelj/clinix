@@ -15,32 +15,32 @@ use crate::error::ClinixError;
 pub struct Rev(String);
 
 impl Rev {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
 }
 
 fn is_lower_hex(s: &str) -> bool {
-    s.bytes()
-        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+	s.bytes()
+		.all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl FromStr for Rev {
-    type Err = ClinixError;
+	type Err = ClinixError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if matches!(s.len(), 40 | 64) && is_lower_hex(s) {
-            Ok(Rev(s.to_string()))
-        } else {
-            Err(ClinixError::InvalidRev(s.to_string()))
-        }
-    }
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		if matches!(s.len(), 40 | 64) && is_lower_hex(s) {
+			Ok(Rev(s.to_string()))
+		} else {
+			Err(ClinixError::InvalidRev(s.to_string()))
+		}
+	}
 }
 
 impl fmt::Display for Rev {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(&self.0)
+	}
 }
 
 /// A nix content hash: an SRI form (`sha256-<base64>`) or the legacy prefixed
@@ -50,30 +50,29 @@ impl fmt::Display for Rev {
 pub struct NarHash(String);
 
 impl NarHash {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
 }
 
 impl FromStr for NarHash {
-    type Err = ClinixError;
+	type Err = ClinixError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let split = s.split_once(|c| c == '-' || c == ':');
-        match split {
-            Some((algo, body))
-                if !body.is_empty()
-                    && matches!(algo, "sha256" | "sha512" | "sha1" | "md5") =>
-            {
-                Ok(NarHash(s.to_string()))
-            }
-            _ => Err(ClinixError::InvalidNarHash(s.to_string())),
-        }
-    }
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let split = s.split_once(|c| c == '-' || c == ':');
+		match split {
+			Some((algo, body))
+				if !body.is_empty() && matches!(algo, "sha256" | "sha512" | "sha1" | "md5") =>
+			{
+				Ok(NarHash(s.to_string()))
+			}
+			_ => Err(ClinixError::InvalidNarHash(s.to_string())),
+		}
+	}
 }
 
 impl fmt::Display for NarHash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(&self.0)
+	}
 }

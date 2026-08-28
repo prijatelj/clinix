@@ -82,7 +82,12 @@ fn print_table(project: &Project, packages: &[ResolvedPkg]) {
 		println!("nixpkgs: {track} @ {:.9}", rev);
 	}
 	println!();
-	let width = packages.iter().map(|p| p.name.len()).max().unwrap_or(7).max(7);
+	let width = packages
+		.iter()
+		.map(|p| p.name.len())
+		.max()
+		.unwrap_or(7)
+		.max(7);
 	println!("{:<width$}  VERSION", "PACKAGE");
 	for p in packages {
 		println!("{:<width$}  {}", p.name, p.version);
@@ -105,7 +110,10 @@ fn print_json(project: &Project, packages: &[ResolvedPkg]) -> Result<()> {
 
 /// List registered envs.
 pub fn list(_context: &Context) -> Result<()> {
-	Err(unimplemented("env list", "plan phase 5: enumerate registry"))
+	Err(unimplemented(
+		"env list",
+		"plan phase 5: enumerate registry",
+	))
 }
 
 /// Where an env's dependencies live on disk: its derivation, each package's store

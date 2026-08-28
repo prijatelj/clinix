@@ -77,7 +77,10 @@ fn classifies_and_reads_github_source() {
 	assert_eq!(locked.kind(), LockedKind::Github);
 	assert_eq!(locked.owner(), Some("NixOS"));
 	assert_eq!(locked.repo(), Some("nixpkgs"));
-	assert_eq!(locked.rev(), Some("2f5a153c270b70cb0f8c11f46d96d6d3bc39f4e3"));
+	assert_eq!(
+		locked.rev(),
+		Some("2f5a153c270b70cb0f8c11f46d96d6d3bc39f4e3")
+	);
 	// The root node has no source.
 	assert!(lock.root_node().unwrap().locked.is_none());
 }

@@ -15,7 +15,7 @@
 
 use clap::{Parser, Subcommand};
 
-use crate::env::{Context, EnvArgs, Shell, ShellOptions, RunCmd};
+use crate::env::{Context, EnvArgs, RunCmd, Shell, ShellOptions};
 use crate::error::Result;
 use crate::sys::SysArgs;
 
@@ -64,13 +64,17 @@ impl Cli {
 			options: ShellOptions {
 				ordered: self.ordered,
 				runtime: self.runtime,
-			}
+			},
 		};
 		match self.command {
 			Some(Command::Sys(args)) => crate::sys::dispatch(args),
 			Some(Command::Env(c)) => c.cmd.run(&context),
 			Some(Command::Shell(names)) => Shell { names, pure: false }.run(&context),
-			None => Shell { names: vec![], pure: false }.run(&context),
+			None => Shell {
+				names: vec![],
+				pure: false,
+			}
+			.run(&context),
 		}
 	}
 }

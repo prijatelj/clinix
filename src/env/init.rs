@@ -181,7 +181,10 @@ fn build_nixpkgs_lock(nixpkgs_ref: &str) -> Result<FlakeLock> {
 		..Node::default()
 	};
 	let mut root_inputs = BTreeMap::new();
-	root_inputs.insert("nixpkgs".to_string(), InputRef::Direct("nixpkgs".to_string()));
+	root_inputs.insert(
+		"nixpkgs".to_string(),
+		InputRef::Direct("nixpkgs".to_string()),
+	);
 	let root_node = Node {
 		inputs: root_inputs,
 		..Node::default()
@@ -201,7 +204,9 @@ fn build_nixpkgs_lock(nixpkgs_ref: &str) -> Result<FlakeLock> {
 /// A 40-char lowercase-hex string — the shape Nix records as `original.rev`
 /// (frozen). Matches `pin`'s `is_rev`.
 fn is_rev(s: &str) -> bool {
-	s.len() == 40 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+	s.len() == 40
+		&& s.bytes()
+			.all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 // Private-helper unit tests live inline (hybrid layout): integration tests in
@@ -220,7 +225,10 @@ mod tests {
 	#[test]
 	fn render_shell_nix_splices_packages() {
 		let shell = render_shell_nix(&[pkg("ripgrep"), pkg("nodejs")]);
-		assert!(shell.contains("    ripgrep\n    nodejs"), "packages spliced");
+		assert!(
+			shell.contains("    ripgrep\n    nodejs"),
+			"packages spliced"
+		);
 		assert!(
 			!shell.contains("# project dependencies go here"),
 			"placeholder replaced"
@@ -273,7 +281,10 @@ mod tests {
 		assert!(locked.rev().is_some_and(|r| r.len() == 40));
 		assert!(locked.nar_hash().is_some_and(|h| h.starts_with("sha256-")));
 		// original tracks the branch ref.
-		assert_eq!(nixpkgs.original.as_ref().unwrap().git_ref(), Some("nixos-26.05"));
+		assert_eq!(
+			nixpkgs.original.as_ref().unwrap().git_ref(),
+			Some("nixos-26.05")
+		);
 		// Serializes to a well-formed, re-parseable lock.
 		let text = lock.to_json();
 		assert_eq!(FlakeLock::from_json(&text).unwrap(), lock);
