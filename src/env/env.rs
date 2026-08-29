@@ -8,7 +8,9 @@ use std::process::ExitStatus;
 
 use clap::{Args, Subcommand};
 
-use crate::error::{ClinixError, Result, unimplemented};
+use crate::env::config::Config;
+use crate::env::registry;
+use crate::error::{ClinixError, Result};
 
 use super::export::Export;
 use super::import::Import;
@@ -39,9 +41,12 @@ pub struct ShellOptions {
 	pub runtime: bool,
 }
 
-/// Shared execution context: state dir, verbosity, resolved options, etc.
+/// Shared execution context: the resolved [`Config`] (config/state roots) plus
+/// the composition options. Built once in [`crate::cli`] and threaded to every
+/// verb, so path resolution is explicit rather than a hidden global.
 pub struct Context {
 	pub options: ShellOptions,
+	pub config: Config,
 }
 
 pub trait RunCmd {
@@ -59,17 +64,16 @@ pub struct Env {
 }
 
 /// The one per-source-divergent seam (plan §resolve). No nix eval, no lock read —
-/// pure name → root-dir resolution:
+/// pure name → root-dir resolution against the resolved [`Config`]:
 /// - `Some(".")` or `None` → the cwd project ([`Kind::Project`]);
 /// - `Some(name)` that is a path (contains `/` or is an existing dir) →
 ///   [`Kind::Project`] at that path;
 /// - `Some(name)` otherwise → a registry env at `state/envs/<name>` if that dir
 ///   exists ([`Kind::Registry`]); else [`ClinixError::UnknownEnv`].
 ///
-/// Full registry indexing/enumeration (listing, config default) lands with
-/// `state.rs` in phase 5; this resolves the registry *path* by convention so
-/// `init`/`shell` work against named envs now.
-pub fn resolve(name: Option<&str>) -> Result<Env> {
+/// The registry *layout* (`envs/<name>`) lives in [`crate::env::registry`]; this only
+/// resolves a name to a root. Enumeration is [`registry::list_names`].
+pub fn resolve(cfg: &Config, name: Option<&str>) -> Result<Env> {
 	match name {
 		None | Some(".") => Ok(Env {
 			name: None,
@@ -85,7 +89,7 @@ pub fn resolve(name: Option<&str>) -> Result<Env> {
 					kind: Kind::Project,
 				});
 			}
-			let root = registry_dir().join(n);
+			let root = registry::env_root(cfg, n);
 			if root.is_dir() {
 				Ok(Env {
 					name: Some(n.to_string()),
@@ -99,45 +103,24 @@ pub fn resolve(name: Option<&str>) -> Result<Env> {
 	}
 }
 
-/// The clinix state root: `$XDG_STATE_HOME/clinix`, else `~/.local/state/clinix`.
-/// A minimal stand-in until `state.rs` (phase 5) adopts `etcetera` + config.
-fn state_dir() -> PathBuf {
-	if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
-		PathBuf::from(xdg).join("clinix")
-	} else if let Some(home) = std::env::var_os("HOME") {
-		PathBuf::from(home).join(".local/state/clinix")
-	} else {
-		PathBuf::from(".clinix-state")
-	}
-}
-
-/// Where registry envs live: `state/envs/<name>` (plan §state layout).
-fn registry_dir() -> PathBuf {
-	state_dir().join("envs")
-}
-
-/// The GC-root path for an env: `state/roots/proj-<slug>` (slug = root path with
-/// `/`→`_`). One indirect root per env root dir; re-entering after `update`
-/// overwrites it, unrooting the previous revision.
-fn root_path(env: &Env) -> PathBuf {
-	let slug = env.root.to_string_lossy().replace('/', "_");
-	state_dir()
-		.join("roots")
-		.join(format!("proj-{}", slug.trim_start_matches('_')))
-}
-
 /// Shared launcher for `shell`/`run`: resolve a **single** env, GC-root its
-/// `shell.nix` ([`crate::nix::instantiate_rooted`]), and enter it via classic
-/// `nix-shell` — interactive, or `--run <command>` for `run`. Multi-env
-/// composition/union over a name stack, and the eval cache, are phase 5.
-pub(crate) fn launch(names: &[String], pure: bool, command: Option<&str>) -> Result<ExitStatus> {
+/// `shell.nix` ([`crate::nix::instantiate_rooted`]) under the env's keyed root
+/// ([`registry::root_path`]), and enter it via classic `nix-shell` —
+/// interactive, or `--run <command>` for `run`. Multi-env composition/union over
+/// a name stack, and the eval cache, are phase 5.
+pub(crate) fn launch(
+	cfg: &Config,
+	names: &[String],
+	pure: bool,
+	command: Option<&str>,
+) -> Result<ExitStatus> {
 	if names.len() > 1 {
-		return Err(unimplemented(
+		return Err(crate::error::unimplemented(
 			"env shell/run with multiple envs",
 			"plan phase 5: compose/union of a name stack",
 		));
 	}
-	let env = resolve(names.first().map(String::as_str))?;
+	let env = resolve(cfg, names.first().map(String::as_str))?;
 	let shell_nix = env.root.join("shell.nix");
 	if !shell_nix.is_file() {
 		return Err(ClinixError::Resolve(format!(
@@ -145,7 +128,8 @@ pub(crate) fn launch(names: &[String], pure: bool, command: Option<&str>) -> Res
 			env.root.display()
 		)));
 	}
-	let drv = crate::nix::instantiate_rooted(&shell_nix, &root_path(&env))?;
+	let root = registry::root_path(cfg, &env);
+	let drv = crate::nix::instantiate_rooted(&shell_nix, &root)?;
 	crate::nix::nix_shell(&drv, pure, command)
 }
 
@@ -246,11 +230,12 @@ pub struct Rename {
 	pub new: String,
 }
 impl RunCmd for Rename {
-	fn run(self, _context: &Context) -> Result<()> {
-		Err(unimplemented(
-			"env rename",
-			"plan phase 5: registry relabel",
-		))
+	/// Relabel a registry env: `mv envs/<old> envs/<new>` plus the `env-<name>`
+	/// GC-root rename ([`registry::rename`]), O(1) and rename-correct.
+	fn run(self, context: &Context) -> Result<()> {
+		registry::rename(&context.config, &self.old, &self.new)?;
+		println!("clinix: renamed env `{}` → `{}`", self.old, self.new);
+		Ok(())
 	}
 }
 

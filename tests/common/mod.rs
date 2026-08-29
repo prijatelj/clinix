@@ -51,7 +51,48 @@ impl Project {
 	pub fn file(&self, name: &str) -> PathBuf {
 		self.dir.path().join(name)
 	}
+
+	/// The clinix state root this sandbox pins (`$XDG_STATE_HOME/clinix`).
+	pub fn state(&self) -> PathBuf {
+		self.state.path().join("clinix")
+	}
+
+	/// A registry env's directory: `state/clinix/envs/<name>`.
+	pub fn env_dir(&self, name: &str) -> PathBuf {
+		self.state().join("envs").join(name)
+	}
+
+	/// A registry env's GC-root symlink path (name-keyed): `state/clinix/roots/env-<name>`.
+	pub fn env_root_link(&self, name: &str) -> PathBuf {
+		self.state().join("roots").join(format!("env-{name}"))
+	}
+
+	/// Materialize a registry env `<name>` with the given `shell.nix` body and a
+	/// minimal `flake.lock`, so registry verbs (`list`/`rename`/`clean`) have
+	/// something to act on without invoking nix. Returns the env directory.
+	pub fn seed_registry_env(&self, name: &str, shell_nix: &str) -> PathBuf {
+		let dir = self.env_dir(name);
+		std::fs::create_dir_all(&dir).unwrap();
+		std::fs::write(dir.join("shell.nix"), shell_nix).unwrap();
+		std::fs::write(dir.join("flake.lock"), MINIMAL_LOCK).unwrap();
+		dir
+	}
 }
+
+/// A one-input `flake.lock` (nixpkgs tracking `nixos-26.05` at a fixed rev), used
+/// to give seeded registry envs a readable pin for `list` enrichment.
+pub const MINIMAL_LOCK: &str = r#"{
+  "nodes": {
+    "nixpkgs": {
+      "locked": { "narHash": "sha256-x", "owner": "NixOS", "repo": "nixpkgs", "rev": "abc1234567890def", "type": "github" },
+      "original": { "owner": "NixOS", "ref": "nixos-26.05", "repo": "nixpkgs", "type": "github" }
+    },
+    "root": { "inputs": { "nixpkgs": "nixpkgs" } }
+  },
+  "root": "root",
+  "version": 7
+}
+"#;
 
 impl Default for Project {
 	fn default() -> Self {

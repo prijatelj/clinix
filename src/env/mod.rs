@@ -13,6 +13,7 @@
 //! module wires them together.
 
 mod clean;
+pub mod config;
 mod env;
 mod export;
 mod import;
@@ -22,6 +23,7 @@ mod new;
 mod nix_edit;
 mod pkgs;
 pub mod project;
+pub mod registry;
 mod run;
 mod shell;
 

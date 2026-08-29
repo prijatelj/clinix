@@ -81,7 +81,7 @@ impl RunCmd for Update {
 	/// classic `pin update`). With no package args, updates every root input that
 	/// tracks a branch/tag; frozen (`original.rev`) and non-github inputs are left
 	/// as-is. Writes a byte-compatible lock only if something advanced.
-	fn run(self, _context: &Context) -> Result<()> {
+	fn run(self, context: &Context) -> Result<()> {
 		if !self.packages.is_empty() {
 			return Err(unimplemented(
 				"env update <pkg>",
@@ -89,7 +89,7 @@ impl RunCmd for Update {
 			));
 		}
 
-		let env = resolve(Some(&self.name))?;
+		let env = resolve(&context.config, Some(&self.name))?;
 		// A single-file env keeps its lock embedded in shell.nix; writing a
 		// flake.lock here would create a second, drifting source of truth.
 		if !env.root.join("flake.lock").exists() {
@@ -230,6 +230,7 @@ mod tests {
 		}
 		.run(&Context {
 			options: Default::default(),
+			config: crate::env::config::Config::resolve(&Default::default()),
 		})
 		.unwrap();
 
@@ -300,8 +301,8 @@ mod tests {
 
 /// Add packages to an env's `shell.nix` `packages` list (offline `rnix` splice;
 /// versions stay implicit in the pinned rev — use `pin` for `pkg=ver`).
-pub fn add(args: Pkgs, _context: &Context) -> Result<()> {
-	let (shell_nix, names) = prepare(&args)?;
+pub fn add(args: Pkgs, context: &Context) -> Result<()> {
+	let (shell_nix, names) = prepare(&args, context)?;
 	let src = std::fs::read_to_string(&shell_nix)?;
 	let edit = super::nix_edit::add_packages(&src, &names)?;
 	finish(
@@ -315,8 +316,8 @@ pub fn add(args: Pkgs, _context: &Context) -> Result<()> {
 }
 
 /// Remove packages from an env's `shell.nix` `packages` list (offline splice).
-pub fn remove(args: Pkgs, _context: &Context) -> Result<()> {
-	let (shell_nix, names) = prepare(&args)?;
+pub fn remove(args: Pkgs, context: &Context) -> Result<()> {
+	let (shell_nix, names) = prepare(&args, context)?;
 	let src = std::fs::read_to_string(&shell_nix)?;
 	let edit = super::nix_edit::remove_packages(&src, &names)?;
 	finish(&shell_nix, &src, edit, args.sort, "removed", "not present")
@@ -346,14 +347,14 @@ fn finish(
 
 /// Resolve the env, require its `shell.nix`, reject versioned specs (versions are
 /// `pin`'s job), and return `(shell.nix path, bare package names)`.
-fn prepare(args: &Pkgs) -> Result<(std::path::PathBuf, Vec<String>)> {
+fn prepare(args: &Pkgs, context: &Context) -> Result<(std::path::PathBuf, Vec<String>)> {
 	if args.packages.iter().any(|p| p.version.is_some()) {
 		return Err(unimplemented(
 			"env add/remove with a versioned package",
 			"names only; use `pin <env> <pkg>=<ver>` for versions (phase 4)",
 		));
 	}
-	let env = resolve(Some(&args.name))?;
+	let env = resolve(&context.config, Some(&args.name))?;
 	let shell_nix = env.root.join("shell.nix");
 	if !shell_nix.is_file() {
 		return Err(ClinixError::ShellNix(format!(
@@ -399,9 +400,9 @@ fn report(changed_label: &str, skipped_label: &str, edit: &super::nix_edit::Edit
 /// Ports `pin freeze` — a standard `flake.lock` edit (`original`: drop `ref`, add
 /// `rev`), plus the `flake.nix` URL swap for `--flake` envs. Offline (copies
 /// `locked.rev`; no resolve). Per-package pinning (`pin <pkg>[=<ver>]`) is phase 4.
-pub fn pin(args: Pin, _context: &Context) -> Result<()> {
+pub fn pin(args: Pin, context: &Context) -> Result<()> {
 	require_scope(&args, "env pin")?;
-	let mut project = Project::load(resolve(Some(&args.name))?)?;
+	let mut project = Project::load(resolve(&context.config, Some(&args.name))?)?;
 	let flake_lock = require_flake_lock(&project.env, "env pin")?;
 
 	let changes = freeze(&mut project.lock);
@@ -424,7 +425,7 @@ pub fn pin(args: Pin, _context: &Context) -> Result<()> {
 
 /// Unfreeze the whole env: resume tracking `--branch <ref>` (`unpin --all`).
 /// Ports `pin unfreeze -b`. Requires `--branch` for now (no remembered ref yet).
-pub fn unpin(args: Pin, _context: &Context) -> Result<()> {
+pub fn unpin(args: Pin, context: &Context) -> Result<()> {
 	require_scope(&args, "env unpin")?;
 	let Some(branch) = args.branch.as_deref() else {
 		return Err(ClinixError::Resolve(
@@ -433,7 +434,7 @@ pub fn unpin(args: Pin, _context: &Context) -> Result<()> {
 				.into(),
 		));
 	};
-	let mut project = Project::load(resolve(Some(&args.name))?)?;
+	let mut project = Project::load(resolve(&context.config, Some(&args.name))?)?;
 	let flake_lock = require_flake_lock(&project.env, "env unpin")?;
 
 	let changes = unfreeze(&mut project.lock, branch);

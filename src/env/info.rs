@@ -21,8 +21,8 @@ pub struct Info {
 	pub json: bool,
 }
 impl RunCmd for Info {
-	fn run(self, _context: &Context) -> Result<()> {
-		let project = Project::load(resolve(self.name.as_deref())?)?;
+	fn run(self, context: &Context) -> Result<()> {
+		let project = Project::load(resolve(&context.config, self.name.as_deref())?)?;
 		let packages = resolved_packages(&project)?;
 		if self.json {
 			print_json(&project, &packages)
@@ -108,12 +108,39 @@ fn print_json(project: &Project, packages: &[ResolvedPkg]) -> Result<()> {
 	Ok(())
 }
 
-/// List registered envs.
-pub fn list(_context: &Context) -> Result<()> {
-	Err(unimplemented(
-		"env list",
-		"plan phase 5: enumerate registry",
-	))
+/// List registered envs (`state/envs/<name>`), each enriched cheaply with its
+/// nixpkgs pin read from `flake.lock`. The filesystem *is* the index
+/// ([`crate::env::registry`]) — nothing to keep in sync. An empty registry prints a
+/// hint instead of a table.
+pub fn list(context: &Context) -> Result<()> {
+	let names = crate::env::registry::list_names(&context.config)?;
+	if names.is_empty() {
+		println!("clinix: no registered envs (create one: clinix env new <name> --from …)");
+		return Ok(());
+	}
+	let width = names.iter().map(String::len).max().unwrap_or(4).max(4);
+	println!("{:<width$}  NIXPKGS", "NAME");
+	for name in &names {
+		let pin = registry_pin(context, name);
+		println!("{name:<width$}  {pin}");
+	}
+	Ok(())
+}
+
+/// A registry env's nixpkgs pin as a short `ref @ rev9` string, or a reason it
+/// could not be read (a malformed env should not abort the whole listing).
+fn registry_pin(context: &Context, name: &str) -> String {
+	let env = match resolve(&context.config, Some(name)) {
+		Ok(env) => env,
+		Err(_) => return "(unresolved)".to_string(),
+	};
+	match Project::load(env) {
+		Ok(project) => match nixpkgs_pin(&project) {
+			Some((track, rev)) => format!("{track} @ {:.9}", rev),
+			None => "(no nixpkgs pin)".to_string(),
+		},
+		Err(_) => "(no flake.lock)".to_string(),
+	}
 }
 
 /// Where an env's dependencies live on disk: its derivation, each package's store
@@ -128,8 +155,8 @@ pub struct Deps {
 	pub size: bool,
 }
 impl RunCmd for Deps {
-	fn run(self, _context: &Context) -> Result<()> {
-		let env = resolve(self.name.as_deref())?;
+	fn run(self, context: &Context) -> Result<()> {
+		let env = resolve(&context.config, self.name.as_deref())?;
 		let shell_nix = env.root.join("shell.nix");
 		if !shell_nix.is_file() {
 			return Err(ClinixError::Resolve(format!(

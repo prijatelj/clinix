@@ -242,3 +242,100 @@ fn pin_requires_all_and_defers_per_package() {
 		.failure()
 		.stderr(predicate::str::contains("phase 4"));
 }
+
+// ---- registry: list / rename / clean (offline filesystem ops) ---------------
+
+const REG_SHELL_NIX: &str = "pkgs.mkShell { packages = with pkgs; [ ripgrep ]; }\n";
+
+#[test]
+fn list_on_empty_registry_hints_instead_of_erroring() {
+	Project::new()
+		.clinix(&["env", "list"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("no registered envs"));
+}
+
+#[test]
+fn list_enumerates_registry_envs_sorted() {
+	let p = Project::new();
+	p.seed_registry_env("rust", REG_SHELL_NIX);
+	p.seed_registry_env("python", REG_SHELL_NIX);
+	p.clinix(&["env", "list"])
+		.assert()
+		.success()
+		// Both names appear; nixpkgs pin is read from each flake.lock.
+		.stdout(predicate::str::contains("python").and(predicate::str::contains("rust")))
+		.stdout(predicate::str::contains("nixos-26.05"));
+}
+
+#[test]
+fn rename_moves_the_env_dir_and_its_gc_root() {
+	let p = Project::new();
+	p.seed_registry_env("old", REG_SHELL_NIX);
+	// Simulate an entered env: a name-keyed GC root exists.
+	std::fs::create_dir_all(p.state().join("roots")).unwrap();
+	std::fs::write(p.env_root_link("old"), "drv").unwrap();
+
+	p.clinix(&["env", "rename", "old", "new"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("renamed"));
+
+	assert!(!p.env_dir("old").exists(), "old env dir gone");
+	assert!(p.env_dir("new").join("shell.nix").exists(), "new env dir present");
+	// The rename-correctness invariant: the root followed the name.
+	assert!(!p.env_root_link("old").exists(), "old root gone");
+	assert!(p.env_root_link("new").exists(), "root re-keyed to new name");
+}
+
+#[test]
+fn rename_to_existing_name_fails_and_leaves_source() {
+	let p = Project::new();
+	p.seed_registry_env("a", REG_SHELL_NIX);
+	p.seed_registry_env("b", REG_SHELL_NIX);
+	p.clinix(&["env", "rename", "a", "b"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("already exists"));
+	assert!(p.env_dir("a").exists(), "source untouched on failure");
+}
+
+#[test]
+fn rename_unknown_env_reports_not_registered() {
+	Project::new()
+		.clinix(&["env", "rename", "ghost", "new"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("not registered"));
+}
+
+#[test]
+fn rename_to_invalid_name_is_rejected() {
+	let p = Project::new();
+	p.seed_registry_env("old", REG_SHELL_NIX);
+	p.clinix(&["env", "rename", "old", "a/b"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("invalid environment name"));
+}
+
+#[test]
+fn clean_removes_the_gc_root_and_is_idempotent() {
+	let p = Project::new();
+	p.seed_registry_env("web", REG_SHELL_NIX);
+	std::fs::create_dir_all(p.state().join("roots")).unwrap();
+	std::fs::write(p.env_root_link("web"), "drv").unwrap();
+
+	p.clinix(&["env", "clean", "web"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("released GC root"));
+	assert!(!p.env_root_link("web").exists(), "root removed");
+
+	// A second clean is a no-op success, not an error.
+	p.clinix(&["env", "clean", "web"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("no GC root"));
+}

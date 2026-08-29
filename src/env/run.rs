@@ -17,9 +17,9 @@ pub struct Run {
 impl RunCmd for Run {
 	/// GC-root the env's `shell.nix` and run `command` inside it via
 	/// `nix-shell --run`, non-interactively. A nonzero command exit fails clinix.
-	fn run(self, _context: &Context) -> Result<()> {
+	fn run(self, context: &Context) -> Result<()> {
 		let command = shell_join(&self.command);
-		let status = launch(&self.names, false, Some(&command))?;
+		let status = launch(&context.config, &self.names, false, Some(&command))?;
 		if status.success() {
 			Ok(())
 		} else {

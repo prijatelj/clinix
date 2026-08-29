@@ -13,8 +13,11 @@
 //! command needs them, so the sugar form can still pass the common options that
 //! `external_subcommand` cannot itself parse.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
+use crate::env::config::{Config, Overrides};
 use crate::env::{Context, EnvArgs, RunCmd, Shell, ShellOptions};
 use crate::error::Result;
 use crate::sys::SysArgs;
@@ -36,6 +39,16 @@ pub struct Cli {
 	/// In a project, compose only the runtime env (skip the dev tools).
 	#[arg(short = 'r', long, global = true)]
 	pub runtime: bool,
+
+	/// Override clinix's config dir (else `$CLINIX_CONFIG_DIR`, `$XDG_CONFIG_HOME`,
+	/// `~/.config/clinix`). See [`crate::env::config`].
+	#[arg(long, global = true, value_name = "DIR")]
+	pub config: Option<PathBuf>,
+
+	/// Override clinix's state dir (else `$CLINIX_STATE_DIR`, `$XDG_STATE_HOME`,
+	/// `~/.local/state/clinix`). Holds the env registry and GC roots.
+	#[arg(long = "state-dir", global = true, value_name = "DIR")]
+	pub state_dir: Option<PathBuf>,
 
 	#[command(subcommand)]
 	pub command: Option<Command>,
@@ -65,6 +78,10 @@ impl Cli {
 				ordered: self.ordered,
 				runtime: self.runtime,
 			},
+			config: Config::resolve(&Overrides {
+				config_dir: self.config,
+				state_dir: self.state_dir,
+			}),
 		};
 		match self.command {
 			Some(Command::Sys(args)) => crate::sys::dispatch(args),

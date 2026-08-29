@@ -15,6 +15,14 @@ pub enum ClinixError {
 	#[error("environment `{0}` is not registered and is not a project directory")]
 	UnknownEnv(String),
 
+	/// A registry env already exists at the requested name (e.g. `rename` target).
+	#[error("environment `{0}` already exists")]
+	EnvExists(String),
+
+	/// A registry name that is not a valid single path component.
+	#[error("invalid environment name `{name}`: {detail}")]
+	InvalidEnvName { name: String, detail: &'static str },
+
 	/// `init` could not decide what to scaffold from the existing directory
 	/// state. `detail` names exactly what is undetermined (user-facing).
 	#[error("cannot initialize `{path}`: {detail}")]
