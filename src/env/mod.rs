@@ -34,7 +34,7 @@ pub use env::{
 };
 pub use export::{Export, ExportTarget};
 pub use import::Import;
-pub use info::{Deps, Info};
+pub use info::{Deps, Info, InfoVerb, context_report};
 pub use init::Init;
 pub use new::New;
 pub use pkgs::{Pin, Pkg, Pkgs, Update};

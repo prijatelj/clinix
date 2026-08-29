@@ -121,6 +121,21 @@ fn on_path(bin: &str) -> bool {
 		.is_ok_and(|o| o.status.success())
 }
 
+/// Whether `nix-store --import` of unsigned paths can succeed here. A multi-user
+/// (daemon) store rejects unsigned paths from a non-root/untrusted user (the
+/// prototype used sudo); a single-user store, or running as root, has no such
+/// gate. Used to guard the closure-import round-trip in E2E.
+pub fn can_import_store() -> bool {
+	let multiuser = Path::new("/nix/var/nix/daemon-socket/socket").exists();
+	let is_root = Command::new("id")
+		.arg("-u")
+		.output()
+		.ok()
+		.and_then(|o| String::from_utf8(o.stdout).ok())
+		.is_some_and(|s| s.trim() == "0");
+	!multiuser || is_root
+}
+
 /// Run a command inside a scaffolded env via vanilla `nix-shell` (the thesis:
 /// `shell.nix` + `flake.lock` runs under plain nix, no flakes). L4 only.
 pub fn nix_shell_run(shell_nix: &Path, command: &str) -> std::process::Output {

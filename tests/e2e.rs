@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{Project, have_nix, nix_shell_run};
+use common::{Project, can_import_store, have_nix, nix_shell_run};
 use predicates::prelude::*;
 
 #[test]
@@ -113,4 +113,97 @@ fn add_edits_shell_nix_and_it_still_runs() {
 	let out = nix_shell_run(&p.file("shell.nix"), "jq --version");
 	assert!(out.status.success());
 	assert!(String::from_utf8_lossy(&out.stdout).contains("jq"));
+}
+
+#[test]
+#[ignore = "needs nix + network"]
+fn shared_compares_two_envs_closures() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	// Two project envs seeded with the same package → high sharing expected.
+	p.clinix(&["env", "init", "./a", "-p", "ripgrep"])
+		.assert()
+		.success();
+	p.clinix(&["env", "init", "./b", "-p", "ripgrep"])
+		.assert()
+		.success();
+	p.clinix(&["env", "shared", "./a", "./b"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("== counts"))
+		.stdout(predicate::str::contains("shared (all)"))
+		.stdout(predicate::str::contains("== disk"));
+}
+
+/// Export writes a single `.closure` archive (nothing else — bundling is the
+/// user's job). Always runnable: exporting reads the store, no write trust needed.
+#[test]
+#[ignore = "needs nix + network"]
+fn closure_export_writes_a_nonempty_archive() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
+		.assert()
+		.success();
+	// Realize the env so export has already-built store paths.
+	p.clinix(&["env", "run", ".", "--", "true"])
+		.assert()
+		.success();
+
+	let archive = p.path().join("env.closure");
+	p.clinix(&["env", "export", ".", "closure", archive.to_str().unwrap()])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("store paths"));
+	assert!(archive.is_file(), "the .closure archive exists");
+	assert!(
+		archive.metadata().unwrap().len() > 0,
+		"the .closure archive is non-empty"
+	);
+	// Export writes ONLY the archive — no shell.nix copy, no manifest.
+	assert!(!p.path().join("clinix-closure.json").exists());
+}
+
+/// The full round-trip: export → import (store + register from the user-carried
+/// shell.nix/flake.lock) → run the restored env. Guarded by `can_import_store()`
+/// because a multi-user store refuses unsigned paths from a non-root user.
+#[test]
+#[ignore = "needs nix + network + importable store"]
+fn closure_import_round_trips_into_the_registry() {
+	if !have_nix() || !can_import_store() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
+		.assert()
+		.success();
+	p.clinix(&["env", "run", ".", "--", "true"])
+		.assert()
+		.success();
+	let archive = p.path().join("env.closure");
+	p.clinix(&["env", "export", ".", "closure", archive.to_str().unwrap()])
+		.assert()
+		.success();
+
+	// Import carries over the env's own shell.nix + flake.lock (as the user would).
+	p.clinix(&[
+		"env",
+		"import",
+		"restored",
+		archive.to_str().unwrap(),
+		"--shell-nix",
+		p.file("shell.nix").to_str().unwrap(),
+		"--flake-lock",
+		p.file("flake.lock").to_str().unwrap(),
+	])
+	.assert()
+	.success();
+	assert!(p.env_dir("restored").join("shell.nix").exists());
+	p.clinix(&["env", "run", "restored", "--", "rg", "--version"])
+		.assert()
+		.success();
 }

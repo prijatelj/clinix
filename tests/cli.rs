@@ -339,3 +339,148 @@ fn clean_removes_the_gc_root_and_is_idempotent() {
 		.success()
 		.stdout(predicate::str::contains("no GC root"));
 }
+
+// ---- check / info (contextual reporting; offline PATH+lock audit) -----------
+
+#[test]
+fn check_on_a_scaffold_reports_shell_lock_and_path_sections() {
+	let p = Project::new();
+	std::fs::write(p.file("shell.nix"), "pkgs.mkShell { packages = with pkgs; [ ]; }\n").unwrap();
+	std::fs::write(p.file("flake.lock"), FLAKE_LOCK).unwrap();
+	p.clinix(&["env", "check"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("== shell"))
+		.stdout(predicate::str::contains("== pinned sources"))
+		.stdout(predicate::str::contains("nixos-26.05")) // tracking from the lock
+		.stdout(predicate::str::contains("== PATH"));
+}
+
+#[test]
+fn check_without_a_lock_still_audits_path() {
+	let p = Project::new();
+	std::fs::write(p.file("shell.nix"), "pkgs.mkShell { }\n").unwrap();
+	p.clinix(&["env", "check"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("no readable flake.lock"))
+		.stdout(predicate::str::contains("== PATH"));
+}
+
+#[test]
+fn info_summary_reports_the_active_shell_from_the_environment() {
+	// Bare `clinix info` describes the active nix-shell it is run inside, read
+	// from the exported derivation env — independent of clinix. Every branch
+	// (nix-shell / develop / neither) mentions "shell".
+	let p = Project::new();
+	p.clinix(&["info"])
+		.env("IN_NIX_SHELL", "impure")
+		.env(
+			"buildInputs",
+			"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-ripgrep-15.1.0",
+		)
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("active: in a nix-shell"))
+		.stdout(predicate::str::contains("ripgrep-15.1.0")); // provided pkg from $buildInputs
+}
+
+#[test]
+fn info_summary_outside_a_shell_falls_back_to_the_cwd_project() {
+	// No IN_NIX_SHELL and no store on PATH → not in a shell; with no project
+	// files present, say so plainly.
+	let p = Project::new();
+	p.clinix(&["info"])
+		.env_remove("IN_NIX_SHELL")
+		.env_remove("NIX_BUILD_TOP")
+		.env("PATH", "/usr/bin:/bin")
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("not in a nix shell"));
+}
+
+#[test]
+fn info_check_delegates_to_env_check() {
+	// `clinix info check` == `env check` on the active (cwd) env.
+	let p = Project::new();
+	std::fs::write(p.file("shell.nix"), "pkgs.mkShell { }\n").unwrap();
+	p.clinix(&["info", "check"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("== shell"))
+		.stdout(predicate::str::contains("== PATH"));
+}
+
+#[test]
+fn shared_with_unknown_env_reports_not_registered() {
+	Project::new()
+		.clinix(&["env", "shared", "ghost", "phantom"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("not registered"));
+}
+
+// ---- export / import closure (offline error paths) --------------------------
+
+#[test]
+fn export_closure_without_a_shell_nix_errors() {
+	let p = Project::new();
+	p.clinix(&["env", "export", ".", "closure"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("no shell.nix"));
+}
+
+#[test]
+fn import_to_an_existing_registry_name_is_refused() {
+	// The name-collision check runs before any file/nix work, so this stays
+	// nix-free (the closure/shell.nix paths need not even exist).
+	let p = Project::new();
+	p.seed_registry_env("taken", "pkgs.mkShell { }\n");
+	p.clinix(&[
+		"env",
+		"import",
+		"taken",
+		"whatever.closure",
+		"--shell-nix",
+		"whatever/shell.nix",
+	])
+	.assert()
+	.failure()
+	.stderr(predicate::str::contains("already exists"));
+}
+
+#[test]
+fn import_with_a_missing_closure_errors() {
+	// Name is free → the next pre-check (closure archive exists) fires, pre-nix.
+	let p = Project::new();
+	p.clinix(&[
+		"env",
+		"import",
+		"restored",
+		"nope.closure",
+		"--shell-nix",
+		"whatever/shell.nix",
+	])
+	.assert()
+	.failure()
+	.stderr(predicate::str::contains("closure archive not found"));
+}
+
+#[test]
+fn import_with_a_missing_shell_nix_errors() {
+	// A real closure file passes its check; the missing shell.nix is next, pre-nix.
+	let p = Project::new();
+	std::fs::write(p.file("env.closure"), b"not really a closure").unwrap();
+	p.clinix(&[
+		"env",
+		"import",
+		"restored",
+		p.file("env.closure").to_str().unwrap(),
+		"--shell-nix",
+		"absent/shell.nix",
+	])
+	.assert()
+	.failure()
+	.stderr(predicate::str::contains("shell.nix not found"));
+}

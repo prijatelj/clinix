@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::env::config::{Config, Overrides};
-use crate::env::{Context, EnvArgs, RunCmd, Shell, ShellOptions};
+use crate::env::{Context, EnvArgs, InfoVerb, RunCmd, Shell, ShellOptions, context_report};
 use crate::error::Result;
 use crate::sys::SysArgs;
 
@@ -62,10 +62,23 @@ pub enum Command {
 	/// Manage a Nix environment: init, shell, run, packages, pins, interop, info.
 	Env(EnvArgs),
 
+	/// Report the active environment (what shell you're in) and, with a subverb,
+	/// audit or inspect it — the contextual counterpart to the explicit `env`
+	/// verbs. `info check`/`info deps` act on the active (cwd) env.
+	Info(InfoArgs),
+
 	/// Bare name list → `env shell <names…>` (see module docs). The first token
 	/// is the "subcommand name" clap could not match, so it is folded back in.
 	#[command(external_subcommand)]
 	Shell(Vec<String>),
+}
+
+/// `clinix info [check|deps]` — the optional subverb defaults to a summary of the
+/// active environment.
+#[derive(clap::Args, Debug)]
+pub struct InfoArgs {
+	#[command(subcommand)]
+	pub verb: Option<InfoVerb>,
 }
 
 impl Cli {
@@ -86,6 +99,7 @@ impl Cli {
 		match self.command {
 			Some(Command::Sys(args)) => crate::sys::dispatch(args),
 			Some(Command::Env(c)) => c.cmd.run(&context),
+			Some(Command::Info(a)) => context_report(a.verb, &context),
 			Some(Command::Shell(names)) => Shell { names, pure: false }.run(&context),
 			None => Shell {
 				names: vec![],

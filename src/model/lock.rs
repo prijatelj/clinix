@@ -90,6 +90,17 @@ pub enum InputRef {
 	Follows(Vec<String>),
 }
 
+impl InputRef {
+	/// The directly-referenced node key, for a [`InputRef::Direct`]. A
+	/// [`InputRef::Follows`] path resolves elsewhere, so this returns `None`.
+	pub fn node_key(&self) -> Option<&str> {
+		match self {
+			InputRef::Direct(k) => Some(k),
+			InputRef::Follows(_) => None,
+		}
+	}
+}
+
 /// A `locked`/`original` source, kept as a lossless ordered map so no field is
 /// dropped and keys serialize in nix's lexical order (module invariant). Typed
 /// access is via the accessors and [`Source::kind`].

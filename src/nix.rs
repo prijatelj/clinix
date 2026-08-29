@@ -15,6 +15,7 @@
 //! `pin` runs via `nix … eval`; that lone `nix-command` use will be flagged when
 //! it lands. The github path used by `init` is fully classic.)
 
+use std::fs::File;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Output};
 
@@ -186,4 +187,91 @@ pub fn gc_roots(drv: &str) -> Result<Vec<String>> {
 		.lines()
 		.map(str::to_string)
 		.collect())
+}
+
+/// A package in an env and the store path of its (intended) output.
+#[derive(Debug, serde::Deserialize)]
+pub struct PackagePath {
+	pub name: String,
+	pub path: String,
+}
+
+/// Evaluate an env's package output paths — the `buildInputs ++ nativeBuildInputs`
+/// of its `shell.nix`. `toString` yields each derivation's output path **without
+/// building** it (classic eval, ADR-1). Shared by `deps` and `export closure`.
+pub fn package_paths(shell_nix: &Path) -> Result<Vec<PackagePath>> {
+	let expr = format!(
+		"let s = import {} {{}}; ins = (s.nativeBuildInputs or []) ++ (s.buildInputs or []); \
+		 in map (p: {{ name = p.name or \"?\"; path = toString p; }}) ins",
+		shell_nix.display()
+	);
+	Ok(serde_json::from_value(eval_json(&expr)?)?)
+}
+
+/// Of `paths`, those **not** valid in the local store (not built/substituted):
+/// `nix-store --check-validity --print-invalid`. Empty ⇒ everything is present.
+/// `--print-invalid` reports rather than failing, so a nonzero exit is a real
+/// error, not "some are missing".
+pub fn invalid_paths(paths: &[String]) -> Result<Vec<String>> {
+	if paths.is_empty() {
+		return Ok(Vec::new());
+	}
+	let mut cmd = Command::new("nix-store");
+	cmd.args(["--check-validity", "--print-invalid"]).args(paths);
+	Ok(stdout_string(&run(cmd)?)
+		.lines()
+		.filter(|l| !l.is_empty())
+		.map(str::to_string)
+		.collect())
+}
+
+/// Runtime requisites of already-realized output paths: `nix-store -qR <paths>`
+/// (no `--include-outputs`, since these are outputs). This is the full set that
+/// `--export` must be handed — `--export` never auto-adds references.
+pub fn requisites(paths: &[String]) -> Result<Vec<String>> {
+	let mut cmd = Command::new("nix-store");
+	cmd.args(["--query", "--requisites"]).args(paths);
+	Ok(stdout_string(&run(cmd)?)
+		.lines()
+		.map(str::to_string)
+		.collect())
+}
+
+/// Serialize a set of store paths (a complete closure) into one archive:
+/// `nix-store --export <paths> > out_file`. The inverse of [`import_closure`].
+pub fn export_paths(paths: &[String], out_file: &Path) -> Result<()> {
+	let file = File::create(out_file)?; // io::Error → ClinixError::Io
+	let mut cmd = Command::new("nix-store");
+	cmd.arg("--export").args(paths).stdout(file);
+	let status = cmd.status()?;
+	if status.success() {
+		Ok(())
+	} else {
+		Err(ClinixError::Nix {
+			cmd: "nix-store --export".into(),
+			status: status.to_string(),
+			stderr: String::new(),
+		})
+	}
+}
+
+/// Import a serialized closure archive into the local store (verifies NAR
+/// hashes): `nix-store --import < archive`. The inverse of [`export_paths`].
+/// `run` captures stderr, so a signature/trust refusal (a multi-user store
+/// rejecting unsigned paths) reaches the caller intact.
+pub fn import_closure(archive: &Path) -> Result<()> {
+	let file = File::open(archive)?; // io::Error → ClinixError::Io
+	let mut cmd = Command::new("nix-store");
+	cmd.arg("--import").stdin(file);
+	run(cmd)?;
+	Ok(())
+}
+
+/// The local system tuple (`builtins.currentSystem`, e.g. `x86_64-linux`) — the
+/// arch guard for `import`.
+pub fn current_system() -> Result<String> {
+	Ok(eval_json("builtins.currentSystem")?
+		.as_str()
+		.unwrap_or_default()
+		.to_string())
 }
