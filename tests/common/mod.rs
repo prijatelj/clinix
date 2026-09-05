@@ -146,3 +146,90 @@ pub fn nix_shell_run(shell_nix: &Path, command: &str) -> std::process::Output {
 		.output()
 		.expect("nix-shell should spawn")
 }
+
+/// A relocated **single-user** Nix store rooted in a tempdir
+/// (`NIX_REMOTE=local?root=…`). A store the caller owns has single-user semantics,
+/// so an **unsigned** closure imports without root or a trusted user — the way to
+/// exercise the offline import/round-trip on a multi-user host (see the
+/// `clinix-closure-import-trust` constraint). Set [`ChrootStore::remote`] as
+/// `NIX_REMOTE` on the clinix/nix command whose store you want redirected.
+///
+/// Cleanup contract: imported store paths are read-only (mode 555), so `Drop`
+/// runs `chmod -R u+w` **before** the inner `TempDir` removes them — otherwise
+/// removal fails and leaks the closure (hundreds of MB).
+pub struct ChrootStore {
+	dir: TempDir,
+}
+
+impl ChrootStore {
+	pub fn new() -> Self {
+		Self {
+			dir: TempDir::new().unwrap(),
+		}
+	}
+
+	/// The `NIX_REMOTE` value that points nix at this store.
+	pub fn remote(&self) -> String {
+		format!("local?root={}", self.dir.path().display())
+	}
+
+	pub fn root(&self) -> &Path {
+		self.dir.path()
+	}
+}
+
+impl Default for ChrootStore {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl Drop for ChrootStore {
+	fn drop(&mut self) {
+		// Make read-only store paths writable so the inner TempDir can remove them
+		// (its Drop runs after this and is what actually deletes the directory).
+		let _ = Command::new("chmod")
+			.args(["-R", "u+w"])
+			.arg(self.dir.path())
+			.status();
+	}
+}
+
+/// The realized **runtime output paths** an env's `shell.nix` needs to be entered,
+/// read from the ambient store: the include-outputs closure of the instantiated
+/// shell derivation, minus the `.drv` recipes. This is the set an offline-usable
+/// export must cover. L4 only (shells out to nix).
+pub fn runtime_paths(shell_nix: &Path) -> Vec<String> {
+	let drv = Command::new("nix-instantiate")
+		.arg(shell_nix)
+		.output()
+		.expect("nix-instantiate should spawn");
+	let drv = String::from_utf8(drv.stdout).unwrap().trim().to_string();
+	let out = Command::new("nix-store")
+		.args(["--query", "--requisites", "--include-outputs", &drv])
+		.output()
+		.expect("nix-store should spawn");
+	String::from_utf8(out.stdout)
+		.unwrap()
+		.lines()
+		.filter(|l| !l.ends_with(".drv"))
+		.map(str::to_string)
+		.collect()
+}
+
+/// How many of `paths` are **not** valid in the store named by `remote`
+/// (`NIX_REMOTE`). Zero means the store contains the whole set — the offline
+/// content-sufficiency check (pure store query: no network, build, or exec).
+pub fn missing_in_store(remote: &str, paths: &[String]) -> usize {
+	let out = Command::new("nix-store")
+		.env("NIX_REMOTE", remote)
+		.args(["--check-validity", "--print-invalid"])
+		.args(paths)
+		.output()
+		.expect("nix-store should spawn");
+	String::from_utf8(out.stdout)
+		.unwrap()
+		.lines()
+		.filter(|l| !l.trim().is_empty())
+		.count()
+}

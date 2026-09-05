@@ -9,7 +9,9 @@
 
 mod common;
 
-use common::{Project, can_import_store, have_nix, nix_shell_run};
+use common::{
+	ChrootStore, Project, can_import_store, have_nix, missing_in_store, nix_shell_run, runtime_paths,
+};
 use predicates::prelude::*;
 
 #[test]
@@ -206,4 +208,82 @@ fn closure_import_round_trips_into_the_registry() {
 	p.clinix(&["env", "run", "restored", "--", "rg", "--version"])
 		.assert()
 		.success();
+}
+
+/// The offline-transfer guarantee, tested against a **single-user chroot store**
+/// so it runs on a multi-user host without root. The default (complete-env) export
+/// must be **offline-sufficient** — every runtime output path present after import
+/// (0 missing) — while `--packages` is the smaller *delta* that deliberately omits
+/// the base (bash/stdenv). This is a pure store-content check: no network, build,
+/// or execution, so nothing can leak in to fake a pass. (Guards Gap F: the import
+/// half never runs on a multi-user daemon store.)
+#[test]
+#[ignore = "needs nix + network"]
+fn closure_export_default_is_offline_sufficient_packages_is_the_delta() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
+		.assert()
+		.success();
+	p.clinix(&["env", "run", ".", "--", "true"])
+		.assert()
+		.success();
+
+	// Two exports from the same built env: default (complete) vs --packages (delta).
+	let full = p.path().join("full.closure");
+	let delta = p.path().join("delta.closure");
+	p.clinix(&["env", "export", ".", "closure", full.to_str().unwrap()])
+		.assert()
+		.success();
+	p.clinix(&["env", "export", ".", "closure", delta.to_str().unwrap(), "--packages"])
+		.assert()
+		.success();
+	// The delta is strictly smaller — it omits the base.
+	let full_sz = std::fs::metadata(&full).unwrap().len();
+	let delta_sz = std::fs::metadata(&delta).unwrap().len();
+	assert!(delta_sz < full_sz, "packages-only ({delta_sz}) < complete env ({full_sz})");
+
+	// The full runtime set required to enter the shell (from the ambient store).
+	let req = runtime_paths(&p.file("shell.nix"));
+	assert!(!req.is_empty(), "runtime path set should be non-empty");
+
+	// Default (complete env) → import into a fresh single-user store → 0 missing.
+	let s_full = ChrootStore::new();
+	p.clinix(&[
+		"env",
+		"import",
+		"from_full",
+		full.to_str().unwrap(),
+		"--shell-nix",
+		p.file("shell.nix").to_str().unwrap(),
+	])
+	.env("NIX_REMOTE", s_full.remote())
+	.assert()
+	.success();
+	assert_eq!(
+		missing_in_store(&s_full.remote(), &req),
+		0,
+		"default (complete-env) export must be offline-sufficient — 0 runtime paths missing"
+	);
+
+	// --packages → import into another fresh store → base (bash/stdenv) is absent,
+	// so runtime paths ARE missing. This documents the delta boundary (not a bug).
+	let s_delta = ChrootStore::new();
+	p.clinix(&[
+		"env",
+		"import",
+		"from_delta",
+		delta.to_str().unwrap(),
+		"--shell-nix",
+		p.file("shell.nix").to_str().unwrap(),
+	])
+	.env("NIX_REMOTE", s_delta.remote())
+	.assert()
+	.success();
+	assert!(
+		missing_in_store(&s_delta.remote(), &req) > 0,
+		"packages-only export is a delta: the base is expected to be absent"
+	);
 }
