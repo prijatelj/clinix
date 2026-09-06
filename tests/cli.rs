@@ -10,6 +10,16 @@ use predicates::prelude::*;
 // ---- help / grammar ---------------------------------------------------------
 
 #[test]
+fn bare_clinix_prints_help_not_the_cwd_project() {
+	// `clinix` with no args shows help (does not silently enter `.`).
+	Project::new()
+		.clinix(&[])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("Usage").and(predicate::str::contains("clinix")));
+}
+
+#[test]
 fn help_and_subcommands_succeed() {
 	Project::new().clinix(&["--help"]).assert().success();
 	Project::new().clinix(&["env", "--help"]).assert().success();

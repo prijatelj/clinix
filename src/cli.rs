@@ -7,7 +7,9 @@
 //!   clap's `external_subcommand` and routed to `env shell <names…>`. This form
 //!   is *terminal* — no verb may follow the names — which is why it is
 //!   unambiguous despite the variadic name list.
-//! - `clinix` with no args enters the current directory's project shell.
+//! - `clinix` with no args prints help — it does **not** enter the cwd project
+//!   (that one case breaks the `clinix X` ≡ `env shell X` shorthand deliberately).
+//!   Enter the cwd project explicitly with `clinix .` or `clinix env shell`.
 //!
 //! Global flags (`-o`, `-r`, `-v`) are declared once here and read by whichever
 //! command needs them, so the sugar form can still pass the common options that
@@ -211,11 +213,13 @@ impl Cli {
 				}
 			}
 			Some(Command::Shell(names)) => Shell { names, pure: false }.run(&context),
-			None => Shell {
-				names: vec![],
-				pure: false,
+			// Bare `clinix` (or only global flags) → print help, rather than
+			// silently entering the cwd project. Enter the project explicitly with
+			// `clinix .` or `clinix env shell`.
+			None => {
+				Cli::command().print_help()?;
+				Ok(())
 			}
-			.run(&context),
 		}
 	}
 }
