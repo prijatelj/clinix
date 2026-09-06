@@ -33,10 +33,6 @@ impl RunCmd for Info {
 			print_json(&project, &packages)
 		} else {
 			print_table(&project, &packages);
-			// Warn when a seed-materialized env has drifted from its sources.
-			for d in super::new::drifted_seeds(&project.env.root)? {
-				eprintln!("clinix: drift: {d}");
-			}
 			Ok(())
 		}
 	}

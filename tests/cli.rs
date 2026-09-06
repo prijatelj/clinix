@@ -126,14 +126,13 @@ fn new_from_materializes_seeds_into_a_portable_registry_env() {
 		.success()
 		.stdout(predicate::str::contains("created registry env"));
 
-	// Self-contained + portable: local seed copy + local lock + provenance record.
+	// Self-contained + portable: local seed copy + local lock, no source paths.
 	let env = p.env_dir("mytools");
 	assert!(env.join("seeds/tool.nix").exists(), "seed copied in");
 	assert!(env.join("flake.lock").exists(), "pin lock copied in");
 	let shell = std::fs::read_to_string(env.join("shell.nix")).unwrap();
 	assert!(shell.contains("import ./seeds/tool.nix"), "unions the local copy");
-	assert!(shell.contains("clinixMeta"), "carries the drift provenance record");
-	assert!(shell.contains("source ="), "records each seed's source");
+	assert!(shell.contains("builtins.readFile ./flake.lock"), "reads the local lock");
 }
 
 #[test]

@@ -329,16 +329,15 @@ fn seed_catalog_composes_single_and_stacked_seeds() {
 
 /// `new --from` materializes a seed stack into a **portable** registry env
 /// (copied fragments + local lock + a self-contained `shell.nix`), which then
-/// enters and runs; editing a source seed makes `info` warn of **drift**.
-/// Verifies Slice 4.
+/// enters and runs. Verifies Slice 4.
 #[test]
 #[ignore = "needs nix + network"]
-fn new_from_materializes_composes_and_detects_drift() {
+fn new_from_materializes_a_portable_env_that_composes_and_runs() {
 	if !have_nix() {
 		return;
 	}
 	let p = Project::new();
-	let seed = p.seed(
+	p.seed(
 		"tool",
 		"{ pkgs }: pkgs.mkShell { packages = with pkgs; [ ripgrep ]; }\n",
 	);
@@ -349,21 +348,6 @@ fn new_from_materializes_composes_and_detects_drift() {
 	p.clinix(&["env", "run", "mytools", "--", "rg", "--version"])
 		.assert()
 		.success();
-	// Fresh materialization: no drift reported.
-	p.clinix(&["env", "info", "mytools"])
-		.assert()
-		.success()
-		.stderr(predicate::str::contains("drift").not());
-	// Edit the source seed → the recorded sha256 no longer matches → drift warned.
-	std::fs::write(
-		&seed,
-		"{ pkgs }: pkgs.mkShell { packages = with pkgs; [ ripgrep jq ]; }\n",
-	)
-	.unwrap();
-	p.clinix(&["env", "info", "mytools"])
-		.assert()
-		.success()
-		.stderr(predicate::str::contains("drift"));
 }
 
 /// `run` is **exit-transparent** (mirrors the command's exact code, like the
