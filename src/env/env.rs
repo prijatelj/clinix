@@ -178,7 +178,7 @@ pub(crate) fn launch(
 		"stack-{}",
 		seeds.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join("-")
 	);
-	let compose_dir = cfg.state_dir.join("compose");
+	let compose_dir = registry::compose_dir(cfg);
 	std::fs::create_dir_all(&compose_dir)?;
 	let compose_file = compose_dir.join(format!("{key}.nix"));
 	std::fs::write(&compose_file, expr)?;

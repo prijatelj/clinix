@@ -95,6 +95,9 @@ pub enum ConfigVerb {
 	},
 	/// Print the resolved config file path clinix reads.
 	Path,
+	/// Show where clinix keeps its state on disk (registry envs, GC roots, the
+	/// generated compose files, and the seed nixpkgs pin).
+	State,
 }
 
 /// `clinix info [check|deps]` — the optional subverb defaults to a summary of the
@@ -136,6 +139,28 @@ impl Cli {
 				}
 				ConfigVerb::Path => {
 					println!("{}", context.config.config_dir.join("config.toml").display());
+					Ok(())
+				}
+				ConfigVerb::State => {
+					use crate::env::registry;
+					let cfg = &context.config;
+					println!("state:    {}", cfg.state_dir.display());
+					println!(
+						"  envs:    {}   registry envs (env new / import)",
+						registry::envs_dir(cfg).display()
+					);
+					println!(
+						"  roots:   {}   GC roots (entered envs)",
+						registry::roots_dir(cfg).display()
+					);
+					println!(
+						"  compose: {}   generated seed-stack compose files",
+						registry::compose_dir(cfg).display()
+					);
+					println!(
+						"pin lock: {}   seed nixpkgs pin (generated; lives in config)",
+						cfg.config_dir.join("flake.lock").display()
+					);
 					Ok(())
 				}
 			},

@@ -30,6 +30,11 @@ pub fn roots_dir(cfg: &Config) -> PathBuf {
 	cfg.state_dir.join("roots")
 }
 
+/// Where generated seed-stack compose expressions live: `state/compose/`.
+pub fn compose_dir(cfg: &Config) -> PathBuf {
+	cfg.state_dir.join("compose")
+}
+
 /// A registry env's root directory: `state/envs/<name>`.
 pub fn env_root(cfg: &Config, name: &str) -> PathBuf {
 	envs_dir(cfg).join(name)

@@ -46,6 +46,19 @@ fn config_path_prints_the_resolved_config_file() {
 		.stdout(predicate::str::contains("clinix").and(predicate::str::contains("config.toml")));
 }
 
+#[test]
+fn config_state_lists_the_state_locations() {
+	Project::new()
+		.clinix(&["config", "state"])
+		.assert()
+		.success()
+		.stdout(
+			predicate::str::contains("envs")
+				.and(predicate::str::contains("roots"))
+				.and(predicate::str::contains("compose")),
+		);
+}
+
 // ---- init: argument validation & deferrals ----------------------------------
 
 #[test]
