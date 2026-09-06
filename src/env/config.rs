@@ -149,13 +149,38 @@ pub struct SeedSettings {
 	pub ignore: Vec<String>,
 }
 
-/// One seed source: a directory (scanned for `*.nix`) or an exact `*.nix` file.
-#[derive(Debug, Clone, Deserialize)]
+/// One seed source: a directory (scanned recursively for `*.nix`) or an exact
+/// `*.nix` file. Deserializes from **either** a bare path string
+/// (`"~/dev_env/shells"`) **or** the table form (`{ path = "…", alias = "…" }`)
+/// when an explicit alias is wanted.
+#[derive(Debug, Clone)]
 pub struct SeedSource {
 	pub path: PathBuf,
 	/// Qualifier for `alias:name`; defaults to the directory basename.
-	#[serde(default)]
 	pub alias: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for SeedSource {
+	fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		// A bare string is the path; a table carries `path` (+ optional `alias`).
+		#[derive(Deserialize)]
+		#[serde(untagged)]
+		enum Repr {
+			Path(PathBuf),
+			Table {
+				path: PathBuf,
+				#[serde(default)]
+				alias: Option<String>,
+			},
+		}
+		Ok(match Repr::deserialize(deserializer)? {
+			Repr::Path(path) => SeedSource { path, alias: None },
+			Repr::Table { path, alias } => SeedSource { path, alias },
+		})
+	}
 }
 
 /// The nixpkgs pin: a git **ref** clinix locks to a rev, or a path to an existing
@@ -168,6 +193,70 @@ pub enum NixpkgsPin {
 	/// `{ flake_lock = "path" }` — an existing lockfile is authoritative.
 	FlakeLock { flake_lock: PathBuf },
 }
+
+/// A minimal `config.toml` scaffold — the common case (a seed source to fill in).
+/// Printed by `clinix config example`.
+pub const MINIMAL_TEMPLATE: &str = r#"# clinix config (TOML). Default location: ~/.config/clinix/config.toml
+# Full annotated template with defaults: `clinix config example --full`
+
+[env.seeds]
+# Seed shells: a directory (scanned recursively for *.nix) or an exact *.nix file.
+# A bare path string is enough; use { path = "...", alias = "..." } to set an alias.
+sources = [
+  # "~/dev_env/shells",
+]
+"#;
+
+/// The extensive `config.toml` template — every option, annotated, with defaults.
+/// Printed by `clinix config example --full`. Kept in sync with [`Settings`] by
+/// `config_templates_are_valid_settings` (it must parse).
+pub const FULL_TEMPLATE: &str = r#"# clinix configuration (TOML)
+#
+# Location: $XDG_CONFIG_HOME/clinix/config.toml (default ~/.config/clinix/config.toml).
+# Override the dir with --config or $CLINIX_CONFIG_DIR.
+# Precedence for every setting: CLI flag > CLINIX_* env var > this file > built-in default.
+# Values shown are clinix's defaults; commented lines are optional overrides/examples.
+
+# Merge-import other config files as a base; this file overrides them. Chainable
+# (a file that is only `use = [...]` acts as a redirect). Later entries win; cycles error.
+# use = ["~/dots/clinix/base.toml"]
+
+[clinix]
+# `clinix <name>` shorthand for `clinix env <name>`. A name that collides with a
+# top-level command (env, sys, info, ...) is NOT captured — use `clinix env <name>`.
+shorthand = true
+
+[env]
+# Where the env registry (materialized envs + GC roots) lives.
+# Default: $XDG_STATE_HOME/clinix (i.e. ~/.local/state/clinix).
+# registry = "~/.local/state/clinix/envs"
+
+# The nixpkgs pin seed fragments build against — a git ref clinix locks into
+# <config>/flake.lock (never a nix-channel), or a path to an existing lockfile.
+nixpkgs = "nixos-26.05"
+# nixpkgs = { flake_lock = "~/dev_env/flake.lock" }
+
+[env.seeds]
+# Seed shells, read in place. Each source is a directory (scanned RECURSIVELY for
+# *.nix, each a seed named by basename) or an exact *.nix file. `alias` (default:
+# the directory's basename) qualifies `alias:name` when a basename appears in more
+# than one source. Enter with `clinix env rust claude` (lexical; -o keeps order),
+# `clinix env <name>`, or the `clinix <name>` shorthand.
+#
+# Each source is either a bare path string, or a { path = "...", alias = "..." }
+# table when you want to set an explicit alias.
+sources = [
+  # "~/dev_env/shells",                                # bare path — simplest
+  # { path = "~/dots/clinix/seeds", alias = "dots" },  # table form to set an alias
+  # "~/one-off/python.nix",                            # an exact file
+]
+
+# gitignore-ish globs that silence "other files exist" warnings (also honored via a
+# .clinix_ignore in a source dir). A pattern with `/` matches the path relative to
+# the source (lib/**, lib/*.nix); without `/` it matches the basename at any depth
+# (_*.nix). `**` crosses directories; `*` and `?` do not.
+ignore = []
+"#;
 
 impl Settings {
 	/// Load `config.toml` from `config_dir`, resolving its `use` import chain. A
@@ -327,6 +416,28 @@ ignore = ["_*.nix"]
 	}
 
 	#[test]
+	fn seed_source_accepts_bare_string_or_table() {
+		let dir = tempfile::tempdir().unwrap();
+		write(
+			dir.path(),
+			"config.toml",
+			r#"
+[env.seeds]
+sources = [ "~/a/shells", { path = "~/b/seeds", alias = "bee" }, "/abs/one.nix" ]
+"#,
+		);
+		let s = Settings::load(dir.path()).unwrap();
+		assert_eq!(s.env.seeds.sources.len(), 3);
+		// bare string → path, no alias.
+		assert_eq!(s.env.seeds.sources[0].path, PathBuf::from("~/a/shells"));
+		assert!(s.env.seeds.sources[0].alias.is_none());
+		// table → path + alias.
+		assert_eq!(s.env.seeds.sources[1].alias.as_deref(), Some("bee"));
+		// bare string works mid-array too.
+		assert!(s.env.seeds.sources[2].alias.is_none());
+	}
+
+	#[test]
 	fn settings_missing_file_is_all_defaults() {
 		let dir = tempfile::tempdir().unwrap();
 		let s = Settings::load(dir.path()).unwrap();
@@ -392,6 +503,18 @@ sources = [ { path = "/local/b" } ]
 		let dir = tempfile::tempdir().unwrap();
 		write(dir.path(), "config.toml", "use = [\"nope.toml\"]\n");
 		assert!(Settings::load(dir.path()).is_err());
+	}
+
+	#[test]
+	fn config_templates_are_valid_settings() {
+		// Both templates must parse against the current schema (guards drift).
+		let _: Settings = toml::from_str(MINIMAL_TEMPLATE).expect("minimal template parses");
+		let full: Settings = toml::from_str(FULL_TEMPLATE).expect("full template parses");
+		// The full template documents the real defaults.
+		assert!(full.shorthand());
+		assert!(matches!(full.env.nixpkgs, Some(NixpkgsPin::Ref(ref r)) if r == "nixos-26.05"));
+		// Unedited templates are warning-free: no live sources.
+		assert!(full.env.seeds.sources.is_empty());
 	}
 
 	#[test]

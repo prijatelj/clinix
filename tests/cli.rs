@@ -20,6 +20,32 @@ fn help_and_subcommands_succeed() {
 		.stdout(predicate::str::contains("[PATH]"));
 }
 
+// ---- config: template generation & path -------------------------------------
+
+#[test]
+fn config_example_prints_a_fillable_template() {
+	// Minimal by default; --full is the extensive annotated form.
+	Project::new()
+		.clinix(&["config", "example"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("[env.seeds]"));
+	Project::new()
+		.clinix(&["config", "example", "--full"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("shorthand").and(predicate::str::contains("nixpkgs")));
+}
+
+#[test]
+fn config_path_prints_the_resolved_config_file() {
+	Project::new()
+		.clinix(&["config", "path"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("clinix").and(predicate::str::contains("config.toml")));
+}
+
 // ---- init: argument validation & deferrals ----------------------------------
 
 #[test]

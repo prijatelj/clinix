@@ -67,10 +67,34 @@ pub enum Command {
 	/// verbs. `info check`/`info deps` act on the active (cwd) env.
 	Info(InfoArgs),
 
+	/// Show clinix's config file path, or print a template to fill in.
+	Config(ConfigArgs),
+
 	/// Bare name list → `env shell <names…>` (see module docs). The first token
 	/// is the "subcommand name" clap could not match, so it is folded back in.
 	#[command(external_subcommand)]
 	Shell(Vec<String>),
+}
+
+/// `clinix config <example|path>`.
+#[derive(clap::Args, Debug)]
+pub struct ConfigArgs {
+	#[command(subcommand)]
+	pub verb: ConfigVerb,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigVerb {
+	/// Print a config template to stdout — minimal by default, `--full` for the
+	/// extensive annotated template with defaults. Redirect into your config file:
+	/// `clinix config example --full > ~/.config/clinix/config.toml`.
+	Example {
+		/// Emit the extensive, fully-annotated template (every option + defaults).
+		#[arg(long)]
+		full: bool,
+	},
+	/// Print the resolved config file path clinix reads.
+	Path,
 }
 
 /// `clinix info [check|deps]` — the optional subverb defaults to a summary of the
@@ -100,6 +124,21 @@ impl Cli {
 			Some(Command::Sys(args)) => crate::sys::dispatch(args),
 			Some(Command::Env(c)) => c.cmd.run(&context),
 			Some(Command::Info(a)) => context_report(a.verb, &context),
+			Some(Command::Config(a)) => match a.verb {
+				ConfigVerb::Example { full } => {
+					let tmpl = if full {
+						crate::env::config::FULL_TEMPLATE
+					} else {
+						crate::env::config::MINIMAL_TEMPLATE
+					};
+					print!("{tmpl}");
+					Ok(())
+				}
+				ConfigVerb::Path => {
+					println!("{}", context.config.config_dir.join("config.toml").display());
+					Ok(())
+				}
+			},
 			Some(Command::Shell(names)) => Shell { names, pure: false }.run(&context),
 			None => Shell {
 				names: vec![],
