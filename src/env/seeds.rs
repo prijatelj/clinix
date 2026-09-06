@@ -245,7 +245,12 @@ fn glob_match(pat: &[u8], s: &[u8]) -> bool {
 /// mechanism). `seeds` are the fragment files **in composition order**; `label`
 /// is the human name (e.g. `"claude rust"`). All seeds share the one pin, so there
 /// is a single nixpkgs instance (fragments-only, no multi-pin — the design's §5).
-pub fn compose_expr(lock: &Path, seeds: &[PathBuf], label: &str) -> String {
+pub fn compose_expr(
+	lock: &Path,
+	seeds: &[PathBuf],
+	label: &str,
+	nixpkgs_config: Option<&Path>,
+) -> String {
 	let imports = seeds
 		.iter()
 		.map(|p| format!("    (import {} {{ inherit pkgs; }})", nix_str(p)))
@@ -254,9 +259,19 @@ pub fn compose_expr(lock: &Path, seeds: &[PathBuf], label: &str) -> String {
 	let sanitized = label.replace(' ', "-");
 	COMPOSE_TEMPLATE
 		.replace("@LOCK@", &nix_str(lock))
+		.replace("@CONFIG@", &nixpkgs_config_frag(nixpkgs_config))
 		.replace("@IMPORTS@", &imports)
 		.replace("@NAME@", &sanitized)
 		.replace("@LABEL@", label)
+}
+
+/// The ` config = import "<path>";` fragment for the nixpkgs import, or empty (so
+/// nixpkgs uses its default `~/.config/nixpkgs/config.nix`).
+pub(crate) fn nixpkgs_config_frag(config: Option<&Path>) -> String {
+	match config {
+		Some(p) => format!(" config = import {};", nix_str(p)),
+		None => String::new(),
+	}
 }
 
 /// The compose expression template. Paths are substituted as escaped nix strings
@@ -272,7 +287,7 @@ let
       (builtins.fetchGit { inherit (i) url rev; }).outPath
     else throw "clinix compose: unsupported input type '${i.type}'";
   sources = builtins.mapAttrs (_: fetch) lock.nodes.root.inputs;
-  pkgs = import sources.nixpkgs { inherit system; };
+  pkgs = import sources.nixpkgs { inherit system;@CONFIG@ };
 in
 pkgs.mkShell {
   name = "@NAME@";
@@ -379,7 +394,7 @@ mod tests {
 	fn compose_expr_unions_fragments_in_order_against_one_pin() {
 		let lock = PathBuf::from("/cfg/flake.lock");
 		let seeds = vec![PathBuf::from("/s/rust.nix"), PathBuf::from("/s/claude.nix")];
-		let expr = compose_expr(&lock, &seeds, "rust claude");
+		let expr = compose_expr(&lock, &seeds, "rust claude", None);
 		assert!(expr.contains("builtins.readFile \"/cfg/flake.lock\""));
 		assert!(expr.contains("import \"/s/rust.nix\" { inherit pkgs; }"));
 		assert!(expr.contains("import \"/s/claude.nix\" { inherit pkgs; }"));
@@ -388,6 +403,12 @@ mod tests {
 		assert!(expr.contains("inputsFrom"));
 		assert!(expr.contains("name = \"rust-claude\";"), "sanitized store name");
 		assert!(expr.contains("rust claude"), "un-sanitized label in the hook");
+		assert!(!expr.contains("config = import"), "no nixpkgs config by default");
+
+		// A nixpkgs config file is applied to the nixpkgs import (allowUnfree etc.).
+		let cfg = PathBuf::from("/cfg/nixpkgs-config.nix");
+		let expr2 = compose_expr(&lock, &seeds, "rust claude", Some(&cfg));
+		assert!(expr2.contains("config = import \"/cfg/nixpkgs-config.nix\";"));
 	}
 
 	#[test]

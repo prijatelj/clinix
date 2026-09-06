@@ -172,7 +172,8 @@ pub(crate) fn launch(
 
 	// Compose against the configured nixpkgs pin, root by the ordered stack, enter.
 	let lock = seed_lock(cfg, &settings)?;
-	let expr = crate::env::seeds::compose_expr(&lock, &paths, &label);
+	let nixpkgs_config = nixpkgs_config_path(&settings)?;
+	let expr = crate::env::seeds::compose_expr(&lock, &paths, &label, nixpkgs_config.as_deref());
 	let key = format!(
 		"stack-{}",
 		seeds.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join("-")
@@ -252,6 +253,27 @@ pub(crate) fn seed_lock(cfg: &Config, settings: &crate::env::config::Settings) -
 		}
 		Some(NixpkgsPin::Ref(r)) => ensure_seed_lock(cfg, r),
 		None => ensure_seed_lock(cfg, "nixos-26.05"),
+	}
+}
+
+/// The optional nixpkgs `config` file (`[env].nixpkgs_config`, e.g. an
+/// `allowUnfree` predicate), expanded and validated to exist. `None` when unset —
+/// clinix then passes no explicit config, so nixpkgs uses its default
+/// (`~/.config/nixpkgs/config.nix`).
+pub(crate) fn nixpkgs_config_path(settings: &crate::env::config::Settings) -> Result<Option<PathBuf>> {
+	match &settings.env.nixpkgs_config {
+		Some(p) => {
+			let path = crate::env::config::expand_tilde(p);
+			if path.is_file() {
+				Ok(Some(path))
+			} else {
+				Err(ClinixError::Config(format!(
+					"[env].nixpkgs_config not found: {}",
+					path.display()
+				)))
+			}
+		}
+		None => Ok(None),
 	}
 }
 

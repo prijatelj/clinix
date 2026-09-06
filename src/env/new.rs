@@ -72,12 +72,24 @@ impl RunCmd for New {
 			std::fs::copy(spath, seeds_dir.join(format!("{sname}.nix")))?;
 		}
 		std::fs::copy(&lock, dest.join("flake.lock"))?;
+		// If a nixpkgs config is configured, copy it in too so the env stays
+		// portable (referenced relatively), not tied to the user's source path.
+		let with_config = match super::env::nixpkgs_config_path(&settings)? {
+			Some(src) => {
+				std::fs::copy(&src, dest.join("nixpkgs-config.nix"))?;
+				true
+			}
+			None => false,
+		};
 		let label = seeds
 			.iter()
 			.map(|(n, _)| n.as_str())
 			.collect::<Vec<_>>()
 			.join(" ");
-		std::fs::write(dest.join("shell.nix"), render_shell_nix(&seeds, &label))?;
+		std::fs::write(
+			dest.join("shell.nix"),
+			render_shell_nix(&seeds, &label, with_config),
+		)?;
 
 		println!(
 			"clinix: created registry env `{}` from {} seed(s): {label}",
@@ -92,14 +104,21 @@ impl RunCmd for New {
 /// The self-contained `shell.nix` for a materialized registry env: reads
 /// `./flake.lock`, imports the pinned nixpkgs, and unions the local seed copies
 /// via `inputsFrom`. Portable — no reference to the user's source paths.
-fn render_shell_nix(seeds: &[(String, PathBuf)], label: &str) -> String {
+fn render_shell_nix(seeds: &[(String, PathBuf)], label: &str, with_config: bool) -> String {
 	let imports = seeds
 		.iter()
 		.map(|(n, _)| format!("    (import ./seeds/{n}.nix {{ inherit pkgs; }})"))
 		.collect::<Vec<_>>()
 		.join("\n");
 	let sanitized = label.replace(' ', "-");
+	// A copied nixpkgs config is referenced relatively (portable).
+	let config = if with_config {
+		" config = import ./nixpkgs-config.nix;"
+	} else {
+		""
+	};
 	SHELL_NIX_TEMPLATE
+		.replace("@CONFIG@", config)
 		.replace("@NAME@", &sanitized)
 		.replace("@IMPORTS@", &imports)
 		.replace("@LABEL@", label)
@@ -116,7 +135,7 @@ let
       (builtins.fetchGit { inherit (i) url rev; }).outPath
     else throw "clinix: unsupported input type '${i.type}'";
   sources = builtins.mapAttrs (_: fetch) lock.nodes.root.inputs;
-  pkgs = import sources.nixpkgs { inherit system; };
+  pkgs = import sources.nixpkgs { inherit system;@CONFIG@ };
 in
 pkgs.mkShell {
   name = "@NAME@";
@@ -137,12 +156,17 @@ mod tests {
 			("rust".to_string(), PathBuf::from("/src/rust.nix")),
 			("claude".to_string(), PathBuf::from("/src/claude.nix")),
 		];
-		let s = render_shell_nix(&seeds, "rust claude");
+		let s = render_shell_nix(&seeds, "rust claude", false);
 		// Portable: reads the local lock + local seed copies, not the source paths.
 		assert!(s.contains("builtins.readFile ./flake.lock"));
 		assert!(s.contains("import ./seeds/rust.nix { inherit pkgs; }"));
 		assert!(s.contains("import ./seeds/claude.nix { inherit pkgs; }"));
 		assert!(!s.contains("/src/"), "must not reference source paths");
 		assert!(s.contains("name = \"rust-claude\";"));
+		assert!(!s.contains("nixpkgs-config"), "no config when none configured");
+
+		// A copied nixpkgs config is referenced relatively (stays portable).
+		let s2 = render_shell_nix(&seeds, "rust claude", true);
+		assert!(s2.contains("config = import ./nixpkgs-config.nix;"));
 	}
 }

@@ -135,6 +135,10 @@ pub struct EnvSettings {
 	pub registry: Option<PathBuf>,
 	/// The nixpkgs pin fragments build against (a ref clinix locks, or a lockfile).
 	pub nixpkgs: Option<NixpkgsPin>,
+	/// A nix file evaluating to a nixpkgs `config` attrset (e.g. an `allowUnfree`
+	/// predicate), applied when building seeds. If unset, clinix passes no explicit
+	/// config, so nixpkgs uses its default (`~/.config/nixpkgs/config.nix`).
+	pub nixpkgs_config: Option<PathBuf>,
 	pub seeds: SeedSettings,
 }
 
@@ -236,6 +240,11 @@ shorthand = true
 nixpkgs = "nixos-26.05"
 # nixpkgs = { flake_lock = "~/dev_env/flake.lock" }
 
+# A nix file evaluating to a nixpkgs `config` attrset applied when building seeds
+# — e.g. an allowUnfree predicate (like dev_env's nixpkgs-config.nix) or CUDA.
+# If unset, nixpkgs uses its default (~/.config/nixpkgs/config.nix).
+# nixpkgs_config = "~/dev_env/nixpkgs-config.nix"
+
 [env.seeds]
 # Seed shells, read in place. Each source is a directory (scanned RECURSIVELY for
 # *.nix, each a seed named by basename) or an exact *.nix file. `alias` (default:
@@ -282,6 +291,7 @@ impl Settings {
 			env: EnvSettings {
 				registry: other.env.registry.or(self.env.registry),
 				nixpkgs: other.env.nixpkgs.or(self.env.nixpkgs),
+				nixpkgs_config: other.env.nixpkgs_config.or(self.env.nixpkgs_config),
 				seeds: SeedSettings {
 					sources: concat_first(other.env.seeds.sources, self.env.seeds.sources),
 					ignore: concat_first(other.env.seeds.ignore, self.env.seeds.ignore),
