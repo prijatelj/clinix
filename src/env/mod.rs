@@ -25,6 +25,7 @@ mod pkgs;
 pub mod project;
 pub mod registry;
 mod run;
+pub mod seeds;
 mod shell;
 
 pub(crate) use env::launch;

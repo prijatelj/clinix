@@ -192,7 +192,8 @@ fn ensure_absent(path: &Path, root: &Path) -> Result<()> {
 /// frozen `original.rev`; anything else is a tracked `original.ref` resolved via
 /// `git ls-remote`. The single node is a github source
 /// (`{narHash, owner, repo, rev, type}`), mirroring `pin init` + `pin update`.
-fn build_nixpkgs_lock(nixpkgs_ref: &str) -> Result<FlakeLock> {
+/// Also reused to lazily lock the seed catalog's nixpkgs pin (`env::env::launch`).
+pub(crate) fn build_nixpkgs_lock(nixpkgs_ref: &str) -> Result<FlakeLock> {
 	const OWNER: &str = "NixOS";
 	const REPO: &str = "nixpkgs";
 

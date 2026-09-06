@@ -20,7 +20,7 @@ impl RunCmd for Shell {
 	/// The launcher. Reached by `env shell`, the bare-name sugar, and the no-arg
 	/// cwd case. GC-roots the env's `shell.nix` and enters it interactively.
 	fn run(self, context: &Context) -> Result<()> {
-		launch(&context.config, &self.names, self.pure, None)?;
+		launch(context, &self.names, self.pure, None)?;
 		Ok(())
 	}
 }

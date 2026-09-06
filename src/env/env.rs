@@ -103,24 +103,91 @@ pub fn resolve(cfg: &Config, name: Option<&str>) -> Result<Env> {
 	}
 }
 
-/// Shared launcher for `shell`/`run`: resolve a **single** env, GC-root its
-/// `shell.nix` ([`crate::nix::instantiate_rooted`]) under the env's keyed root
-/// ([`registry::root_path`]), and enter it via classic `nix-shell` —
-/// interactive, or `--run <command>` for `run`. Multi-env composition/union over
-/// a name stack, and the eval cache, are phase 5.
+/// A resolved stack node: an env with its own `shell.nix` (project/registry), or
+/// a seed fragment file from the catalog.
+enum Node {
+	Env(Env),
+	Seed { name: String, path: PathBuf },
+}
+
+/// Shared launcher for `shell`/`run`. Resolves the name stack, then either enters
+/// a single project/registry env's `shell.nix`, or **composes a stack of seed
+/// fragments** against the configured nixpkgs pin (lexical order, or the given
+/// order under `-o`) — the `~/dev_env` `compose-dev.nix` behavior. GC-roots the
+/// result and enters it via classic `nix-shell`. Composing a self-contained env
+/// (project/registry) into a multi-node stack is deferred with self-contained
+/// seeds, so a stack must currently be all seeds.
 pub(crate) fn launch(
-	cfg: &Config,
+	ctx: &Context,
 	names: &[String],
 	pure: bool,
 	command: Option<&str>,
 ) -> Result<ExitStatus> {
-	if names.len() > 1 {
-		return Err(crate::error::unimplemented(
-			"env shell/run with multiple envs",
-			"plan phase 5: compose/union of a name stack",
-		));
+	let cfg = &ctx.config;
+	let settings = crate::env::config::Settings::load(&cfg.config_dir)?;
+	let catalog = crate::env::seeds::Catalog::build(&settings.env.seeds);
+	for w in &catalog.warnings {
+		eprintln!("clinix: {w}");
 	}
-	let env = resolve(cfg, names.first().map(String::as_str))?;
+
+	// Empty stack ⇒ the cwd project.
+	if names.is_empty() {
+		return launch_env(cfg, &resolve(cfg, None)?, pure, command);
+	}
+
+	let nodes: Vec<Node> = names
+		.iter()
+		.map(|n| resolve_node(cfg, &catalog, n))
+		.collect::<Result<_>>()?;
+
+	// A single project/registry env: enter its own shell.nix.
+	if let [Node::Env(env)] = nodes.as_slice() {
+		return launch_env(cfg, env, pure, command);
+	}
+
+	// Otherwise a stack: v1 supports seeds only.
+	let mut seeds: Vec<(String, PathBuf)> = Vec::with_capacity(nodes.len());
+	for node in &nodes {
+		match node {
+			Node::Seed { name, path } => seeds.push((name.clone(), path.clone())),
+			Node::Env(_) => {
+				return Err(crate::error::unimplemented(
+					"composing a project/registry env into a stack",
+					"seeds-only stacks for now; self-contained seeds are deferred",
+				));
+			}
+		}
+	}
+
+	// Order: lexical by default; `-o` preserves the given order.
+	if !ctx.options.ordered {
+		seeds.sort_by(|a, b| a.0.cmp(&b.0));
+	}
+	let label = seeds
+		.iter()
+		.map(|(n, _)| n.as_str())
+		.collect::<Vec<_>>()
+		.join(" ");
+	let paths: Vec<PathBuf> = seeds.iter().map(|(_, p)| p.clone()).collect();
+
+	// Compose against the configured nixpkgs pin, root by the ordered stack, enter.
+	let lock = seed_lock(cfg, &settings)?;
+	let expr = crate::env::seeds::compose_expr(&lock, &paths, &label);
+	let key = format!(
+		"stack-{}",
+		seeds.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join("-")
+	);
+	let compose_dir = cfg.state_dir.join("compose");
+	std::fs::create_dir_all(&compose_dir)?;
+	let compose_file = compose_dir.join(format!("{key}.nix"));
+	std::fs::write(&compose_file, expr)?;
+	let root = registry::roots_dir(cfg).join(&key);
+	let drv = crate::nix::instantiate_rooted(&compose_file, &root)?;
+	crate::nix::nix_shell(&drv, pure, command)
+}
+
+/// Enter a single env's own `shell.nix` (project/registry), GC-rooted by its key.
+fn launch_env(cfg: &Config, env: &Env, pure: bool, command: Option<&str>) -> Result<ExitStatus> {
 	let shell_nix = env.root.join("shell.nix");
 	if !shell_nix.is_file() {
 		return Err(ClinixError::Resolve(format!(
@@ -128,9 +195,77 @@ pub(crate) fn launch(
 			env.root.display()
 		)));
 	}
-	let root = registry::root_path(cfg, &env);
+	let root = registry::root_path(cfg, env);
 	let drv = crate::nix::instantiate_rooted(&shell_nix, &root)?;
 	crate::nix::nix_shell(&drv, pure, command)
+}
+
+/// Map a name to a stack node: a project/registry env if [`resolve`] finds one,
+/// else a seed from the catalog (`alias:name`, or a bare name — the highest-
+/// precedence match, warning on a collision), else [`ClinixError::UnknownEnv`].
+fn resolve_node(cfg: &Config, catalog: &crate::env::seeds::Catalog, name: &str) -> Result<Node> {
+	use crate::env::seeds::Resolved;
+	match resolve(cfg, Some(name)) {
+		Ok(env) => Ok(Node::Env(env)),
+		Err(ClinixError::UnknownEnv(_)) => match catalog.find(name) {
+			Some(Resolved::One(seed)) => Ok(Node::Seed {
+				name: seed.name.clone(),
+				path: seed.path.clone(),
+			}),
+			Some(Resolved::Collision { chosen, others }) => {
+				let alts = others
+					.iter()
+					.map(|s| format!("{}:{}", s.alias, s.name))
+					.collect::<Vec<_>>()
+					.join(", ");
+				eprintln!(
+					"clinix: seed `{name}` is ambiguous — using `{}:{}` (also: {alts}; qualify to pick another)",
+					chosen.alias, chosen.name
+				);
+				Ok(Node::Seed {
+					name: chosen.name.clone(),
+					path: chosen.path.clone(),
+				})
+			}
+			None => Err(ClinixError::UnknownEnv(name.to_string())),
+		},
+		Err(e) => Err(e),
+	}
+}
+
+/// The lockfile providing the seed catalog's nixpkgs pin: a configured
+/// `flake_lock` path, or a ref clinix lazily locks into `<config>/flake.lock`
+/// (default `nixos-26.05`). Never a channel (the design's §0).
+pub(crate) fn seed_lock(cfg: &Config, settings: &crate::env::config::Settings) -> Result<PathBuf> {
+	use crate::env::config::{NixpkgsPin, expand_tilde};
+	match &settings.env.nixpkgs {
+		Some(NixpkgsPin::FlakeLock { flake_lock }) => {
+			let p = expand_tilde(flake_lock);
+			if p.is_file() {
+				Ok(p)
+			} else {
+				Err(ClinixError::Config(format!(
+					"[env].nixpkgs.flake_lock not found: {}",
+					p.display()
+				)))
+			}
+		}
+		Some(NixpkgsPin::Ref(r)) => ensure_seed_lock(cfg, r),
+		None => ensure_seed_lock(cfg, "nixos-26.05"),
+	}
+}
+
+/// Lazily create `<config>/flake.lock` pinning nixpkgs to `nixpkgs_ref` (network,
+/// once), reusing `init`'s classic lock builder. Committable — the user's pin.
+fn ensure_seed_lock(cfg: &Config, nixpkgs_ref: &str) -> Result<PathBuf> {
+	let lock = cfg.config_dir.join("flake.lock");
+	if lock.is_file() {
+		return Ok(lock);
+	}
+	let built = crate::env::init::build_nixpkgs_lock(nixpkgs_ref)?;
+	std::fs::create_dir_all(&cfg.config_dir)?;
+	std::fs::write(&lock, built.to_json())?;
+	Ok(lock)
 }
 
 /// The unified verb set. Every verb takes an env name (or several, for the
@@ -178,6 +313,13 @@ pub enum Cmd {
 	Check(OptionalTarget),
 	/// Release an env's GC root so its store paths can be collected.
 	Clean(Target),
+
+	/// Bare name list under `env` → `shell <names…>` (parity with the top-level
+	/// `clinix <names…>` sugar), so `clinix env rust claude` composes those envs.
+	/// The unmatched first token is folded back in. A name equal to a verb above
+	/// is taken as that verb — use `env shell <name>` to enter such an env.
+	#[command(external_subcommand)]
+	Compose(Vec<String>),
 }
 impl RunCmd for Cmd {
 	/// Pure dispatch. Verbs with a dedicated struct delegate to their own
@@ -211,6 +353,9 @@ impl RunCmd for Cmd {
 			Shared(a) => info::shared(a, context),
 			Check(a) => info::check(a, context),
 			Clean(a) => clean::clean(a, context),
+
+			// Bare-name sugar → the launcher (interactive shell).
+			Compose(names) => super::shell::Shell { names, pure: false }.run(context),
 		}
 	}
 }

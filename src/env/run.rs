@@ -21,7 +21,7 @@ impl RunCmd for Run {
 	/// `exec nix-shell` prototype), so `run` composes in scripts and CI.
 	fn run(self, context: &Context) -> Result<()> {
 		let command = shell_join(&self.command);
-		let status = launch(&context.config, &self.names, false, Some(&command))?;
+		let status = launch(context, &self.names, false, Some(&command))?;
 		if status.success() {
 			Ok(())
 		} else {

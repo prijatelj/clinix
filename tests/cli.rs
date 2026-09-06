@@ -92,12 +92,74 @@ fn update_on_single_file_env_is_guarded_and_writes_no_lock() {
 // ---- launcher & diagnostics: error paths ------------------------------------
 
 #[test]
-fn run_with_multiple_envs_is_deferred() {
+fn run_with_an_unknown_name_in_a_stack_errors() {
+	// Multi-name stacks now compose (seeds); an unknown name is a clear error.
 	Project::new()
 		.clinix(&["env", "run", ".", "other", "--", "true"])
 		.assert()
 		.failure()
-		.stderr(predicate::str::contains("multiple envs"));
+		.stderr(predicate::str::contains("not registered"));
+}
+
+#[test]
+fn env_bare_name_routes_to_shell() {
+	// `clinix env <name>` (no verb) routes to the launcher via the env-level
+	// external_subcommand, so an unknown name is an env error — not a clap
+	// "unrecognized subcommand".
+	Project::new()
+		.clinix(&["env", "ghost"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("not registered"));
+}
+
+#[test]
+fn new_from_materializes_seeds_into_a_portable_registry_env() {
+	let p = Project::new();
+	p.seed("tool", "{ pkgs }: pkgs.mkShell { }\n");
+	// Pre-create the config nixpkgs lock so `new` needs no network.
+	std::fs::create_dir_all(p.config_dir()).unwrap();
+	std::fs::write(p.config_dir().join("flake.lock"), common::MINIMAL_LOCK).unwrap();
+
+	p.clinix(&["env", "new", "mytools", "--from", "tool"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("created registry env"));
+
+	// Self-contained + portable: local seed copy + local lock + provenance record.
+	let env = p.env_dir("mytools");
+	assert!(env.join("seeds/tool.nix").exists(), "seed copied in");
+	assert!(env.join("flake.lock").exists(), "pin lock copied in");
+	let shell = std::fs::read_to_string(env.join("shell.nix")).unwrap();
+	assert!(shell.contains("import ./seeds/tool.nix"), "unions the local copy");
+	assert!(shell.contains("clinixMeta"), "carries the drift provenance record");
+	assert!(shell.contains("source ="), "records each seed's source");
+}
+
+#[test]
+fn new_from_a_non_seed_name_is_rejected() {
+	let p = Project::new();
+	std::fs::create_dir_all(p.config_dir()).unwrap();
+	std::fs::write(p.config_dir().join("flake.lock"), common::MINIMAL_LOCK).unwrap();
+	// No seeds configured → "ghost" resolves to nothing.
+	p.clinix(&["env", "new", "x", "--from", "ghost"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("is not one"));
+}
+
+#[test]
+fn run_mixing_a_project_env_into_a_seed_stack_is_deferred() {
+	// A stack must be all seeds for now (self-contained composition deferred).
+	// `.` (cwd project) + a seed hits that boundary before any nix call.
+	let p = Project::new();
+	p.seed("dev", "{ pkgs }: pkgs.mkShell { }\n");
+	p.clinix(&["env", "run", ".", "dev", "--", "true"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains(
+			"composing a project/registry env into a stack",
+		));
 }
 
 #[test]

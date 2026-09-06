@@ -66,6 +66,11 @@ pub enum ClinixError {
 	#[error("could not resolve: {0}")]
 	Resolve(String),
 
+	/// `config.toml` (or a file it `use`-imports) failed to load, parse, or formed
+	/// an import cycle.
+	#[error("config: {0}")]
+	Config(String),
+
 	/// Editing a `shell.nix` failed (parse error, or no `packages` list found).
 	#[error("shell.nix: {0}")]
 	ShellNix(String),

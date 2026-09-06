@@ -57,6 +57,11 @@ impl Project {
 		self.state.path().join("clinix")
 	}
 
+	/// The clinix config root this sandbox pins (`$XDG_CONFIG_HOME/clinix`).
+	pub fn config_dir(&self) -> PathBuf {
+		self.config.path().join("clinix")
+	}
+
 	/// A registry env's directory: `state/clinix/envs/<name>`.
 	pub fn env_dir(&self, name: &str) -> PathBuf {
 		self.state().join("envs").join(name)
@@ -65,6 +70,28 @@ impl Project {
 	/// A registry env's GC-root symlink path (name-keyed): `state/clinix/roots/env-<name>`.
 	pub fn env_root_link(&self, name: &str) -> PathBuf {
 		self.state().join("roots").join(format!("env-{name}"))
+	}
+
+	/// Configure a seed catalog: write `config.toml` pointing at a seeds dir and
+	/// drop a `<name>.nix` fragment into it, so `clinix env <name>` resolves a
+	/// seed. Repeated calls add more seeds (the config.toml is rewritten to the
+	/// one seeds dir). Returns the seed file path.
+	pub fn seed(&self, name: &str, body: &str) -> PathBuf {
+		let cfg = self.config.path().join("clinix");
+		let seeds = self.config.path().join("seeds");
+		std::fs::create_dir_all(&cfg).unwrap();
+		std::fs::create_dir_all(&seeds).unwrap();
+		let file = seeds.join(format!("{name}.nix"));
+		std::fs::write(&file, body).unwrap();
+		std::fs::write(
+			cfg.join("config.toml"),
+			format!(
+				"[env.seeds]\nsources = [ {{ path = \"{}\" }} ]\n",
+				seeds.display()
+			),
+		)
+		.unwrap();
+		file
 	}
 
 	/// Materialize a registry env `<name>` with the given `shell.nix` body and a

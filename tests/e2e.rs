@@ -288,6 +288,84 @@ fn closure_export_default_is_offline_sufficient_packages_is_the_delta() {
 	);
 }
 
+/// The seed catalog composes user `{ pkgs }:` fragments against the lazily-locked
+/// nixpkgs pin (the `~/dev_env` `compose-dev.nix` behavior), for both a single
+/// seed and a stack. Verifies Slice 2/3: `clinix env <seed…>` resolves seeds from
+/// config, unions them via `inputsFrom`, and runs.
+#[test]
+#[ignore = "needs nix + network"]
+fn seed_catalog_composes_single_and_stacked_seeds() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.seed(
+		"tool",
+		"{ pkgs }: pkgs.mkShell { packages = with pkgs; [ ripgrep ]; }\n",
+	);
+	p.seed(
+		"data",
+		"{ pkgs }: pkgs.mkShell { packages = with pkgs; [ jq ]; }\n",
+	);
+
+	// Single seed: builds the config nixpkgs lock on first use, composes, runs.
+	p.clinix(&["env", "run", "tool", "--", "rg", "--version"])
+		.assert()
+		.success();
+	// Stacked seeds: both tools present in the one composed shell.
+	p.clinix(&[
+		"env",
+		"run",
+		"data",
+		"tool",
+		"--",
+		"sh",
+		"-c",
+		"rg --version >/dev/null && jq --version >/dev/null",
+	])
+	.assert()
+	.success();
+}
+
+/// `new --from` materializes a seed stack into a **portable** registry env
+/// (copied fragments + local lock + a self-contained `shell.nix`), which then
+/// enters and runs; editing a source seed makes `info` warn of **drift**.
+/// Verifies Slice 4.
+#[test]
+#[ignore = "needs nix + network"]
+fn new_from_materializes_composes_and_detects_drift() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	let seed = p.seed(
+		"tool",
+		"{ pkgs }: pkgs.mkShell { packages = with pkgs; [ ripgrep ]; }\n",
+	);
+	// Materialize (builds the config nixpkgs lock on first use), then enter + run.
+	p.clinix(&["env", "new", "mytools", "--from", "tool"])
+		.assert()
+		.success();
+	p.clinix(&["env", "run", "mytools", "--", "rg", "--version"])
+		.assert()
+		.success();
+	// Fresh materialization: no drift reported.
+	p.clinix(&["env", "info", "mytools"])
+		.assert()
+		.success()
+		.stderr(predicate::str::contains("drift").not());
+	// Edit the source seed → the recorded sha256 no longer matches → drift warned.
+	std::fs::write(
+		&seed,
+		"{ pkgs }: pkgs.mkShell { packages = with pkgs; [ ripgrep jq ]; }\n",
+	)
+	.unwrap();
+	p.clinix(&["env", "info", "mytools"])
+		.assert()
+		.success()
+		.stderr(predicate::str::contains("drift"));
+}
+
 /// `run` is **exit-transparent** (mirrors the command's exact code, like the
 /// `~/dev_env` `exec nix-shell` prototype) and **GC-roots** the env on entry, so
 /// `nix-collect-garbage` cannot reap a shell you just entered. (Gaps A + B.)
