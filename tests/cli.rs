@@ -59,6 +59,38 @@ fn config_state_lists_the_state_locations() {
 		);
 }
 
+// ---- completions & man (generated from the clap definition) -----------------
+
+#[test]
+fn completions_prints_a_shell_script() {
+	Project::new()
+		.clinix(&["completions", "bash"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("clinix"));
+	// an unknown shell is rejected by clap's value parser.
+	Project::new()
+		.clinix(&["completions", "notashell"])
+		.assert()
+		.failure();
+}
+
+#[test]
+fn man_prints_roff_to_stdout_and_writes_to_a_dir() {
+	// stdout form: a roff man page (`.TH` header + the tool's about line).
+	Project::new()
+		.clinix(&["man"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains(".TH").and(predicate::str::contains("Manage Nix")));
+	// directory form: writes clinix.1 for install onto MANPATH.
+	let p = Project::new();
+	p.clinix(&["man", p.path().to_str().unwrap()])
+		.assert()
+		.success();
+	assert!(p.file("clinix.1").exists(), "clinix.1 written to the dir");
+}
+
 // ---- init: argument validation & deferrals ----------------------------------
 
 #[test]

@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::env::config::{Config, Overrides};
 use crate::env::{Context, EnvArgs, InfoVerb, RunCmd, Shell, ShellOptions, context_report};
@@ -70,10 +70,33 @@ pub enum Command {
 	/// Show clinix's config file path, or print a template to fill in.
 	Config(ConfigArgs),
 
+	/// Print a shell completion script to stdout (bash, zsh, fish, elvish,
+	/// powershell). Install it, or in nix `installShellCompletion`.
+	Completions(CompletionsArgs),
+
+	/// Write the man page (roff) — so `man clinix` works. To a directory on
+	/// MANPATH, or stdout.
+	Man(ManArgs),
+
 	/// Bare name list → `env shell <names…>` (see module docs). The first token
 	/// is the "subcommand name" clap could not match, so it is folded back in.
 	#[command(external_subcommand)]
 	Shell(Vec<String>),
+}
+
+/// `clinix completions <shell>`.
+#[derive(clap::Args, Debug)]
+pub struct CompletionsArgs {
+	/// Shell to emit a completion script for.
+	pub shell: clap_complete::Shell,
+}
+
+/// `clinix man [dir]`.
+#[derive(clap::Args, Debug)]
+pub struct ManArgs {
+	/// Output directory for `clinix.1` (install onto MANPATH, e.g.
+	/// `~/.local/share/man/man1`). Omit to print the roff to stdout.
+	pub dir: Option<PathBuf>,
 }
 
 /// `clinix config <example|path>`.
@@ -164,6 +187,29 @@ impl Cli {
 					Ok(())
 				}
 			},
+			Some(Command::Completions(a)) => {
+				let mut cmd = Cli::command();
+				clap_complete::generate(a.shell, &mut cmd, "clinix", &mut std::io::stdout());
+				Ok(())
+			}
+			Some(Command::Man(a)) => {
+				let man = clap_mangen::Man::new(Cli::command());
+				match a.dir {
+					Some(dir) => {
+						std::fs::create_dir_all(&dir)?;
+						let path = dir.join("clinix.1");
+						let mut buf = Vec::new();
+						man.render(&mut buf)?;
+						std::fs::write(&path, buf)?;
+						eprintln!("clinix: wrote {}", path.display());
+						Ok(())
+					}
+					None => {
+						man.render(&mut std::io::stdout())?;
+						Ok(())
+					}
+				}
+			}
 			Some(Command::Shell(names)) => Shell { names, pure: false }.run(&context),
 			None => Shell {
 				names: vec![],
