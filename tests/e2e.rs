@@ -287,3 +287,39 @@ fn closure_export_default_is_offline_sufficient_packages_is_the_delta() {
 		"packages-only export is a delta: the base is expected to be absent"
 	);
 }
+
+/// `run` is **exit-transparent** (mirrors the command's exact code, like the
+/// `~/dev_env` `exec nix-shell` prototype) and **GC-roots** the env on entry, so
+/// `nix-collect-garbage` cannot reap a shell you just entered. (Gaps A + B.)
+#[test]
+#[ignore = "needs nix + network"]
+fn run_is_exit_transparent_and_roots_the_env_on_entry() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
+		.assert()
+		.success();
+
+	// Success path: exit 0, and a real indirect GC root lands under the isolated
+	// state dir (a `proj-<slug>` symlink), not a synthetic one.
+	p.clinix(&["env", "run", ".", "--", "true"])
+		.assert()
+		.success();
+	let roots = p.state().join("roots");
+	let has_proj_root = std::fs::read_dir(&roots)
+		.expect("roots dir should exist after entering an env")
+		.filter_map(Result::ok)
+		.any(|e| e.file_name().to_string_lossy().starts_with("proj-"));
+	assert!(has_proj_root, "entering the env must create a proj-* GC root");
+
+	// Exit-transparency: a nonzero command propagates its *exact* code, not a
+	// blanket failure (false → 1; `exit 3` → 3).
+	p.clinix(&["env", "run", ".", "--", "false"])
+		.assert()
+		.code(1);
+	p.clinix(&["env", "run", ".", "--", "sh", "-c", "exit 3"])
+		.assert()
+		.code(3);
+}

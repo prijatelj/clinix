@@ -55,6 +55,13 @@ pub enum ClinixError {
 		stderr: String,
 	},
 
+	/// A command run inside an env (`run … -- cmd`) exited nonzero. clinix mirrors
+	/// the command's exit code (like `nix-shell --run`), so `run` is
+	/// exit-transparent for scripts/CI. `main.rs` exits with `code` and prints no
+	/// clinix error line — the command already reported its own failure.
+	#[error("command exited with status {code}")]
+	CommandFailed { code: i32 },
+
 	/// A ref could not be resolved to a revision (command succeeded, no match).
 	#[error("could not resolve: {0}")]
 	Resolve(String),

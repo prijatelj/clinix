@@ -16,17 +16,18 @@ pub struct Run {
 }
 impl RunCmd for Run {
 	/// GC-root the env's `shell.nix` and run `command` inside it via
-	/// `nix-shell --run`, non-interactively. A nonzero command exit fails clinix.
+	/// `nix-shell --run`, non-interactively. clinix is **exit-transparent**: it
+	/// mirrors the command's exit code (like `nix-shell --run` / the `~/dev_env`
+	/// `exec nix-shell` prototype), so `run` composes in scripts and CI.
 	fn run(self, context: &Context) -> Result<()> {
 		let command = shell_join(&self.command);
 		let status = launch(&context.config, &self.names, false, Some(&command))?;
 		if status.success() {
 			Ok(())
 		} else {
-			Err(ClinixError::Nix {
-				cmd: format!("nix-shell --run {command}"),
-				status: status.to_string(),
-				stderr: String::new(),
+			// Propagate the exact code (128+signal collapses to 1 via `unwrap_or`).
+			Err(ClinixError::CommandFailed {
+				code: status.code().unwrap_or(1),
 			})
 		}
 	}

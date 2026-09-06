@@ -56,3 +56,73 @@ fn extract_embedded_lock(shell_nix: &str) -> Result<String> {
 		.trim()
 		.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::env::Kind;
+
+	// A minimal one-input lock (nixpkgs tracking nixos-26.05), same shape as the
+	// test fixtures elsewhere — parses without validating rev/hash strictly.
+	const LOCK_JSON: &str = r#"{
+  "nodes": {
+    "nixpkgs": {
+      "locked": { "narHash": "sha256-x", "owner": "NixOS", "repo": "nixpkgs", "rev": "abc123", "type": "github" },
+      "original": { "owner": "NixOS", "ref": "nixos-26.05", "repo": "nixpkgs", "type": "github" }
+    },
+    "root": { "inputs": { "nixpkgs": "nixpkgs" } }
+  },
+  "root": "root",
+  "version": 7
+}"#;
+
+	/// A single-file `shell.nix` as `init --single-file` writes it: the lock JSON
+	/// embedded via `builtins.fromJSON (''<json>'')`, with no sibling `flake.lock`.
+	fn single_file_shell_nix(lock_json: &str) -> String {
+		format!("let lock = builtins.fromJSON (''{lock_json}''); in pkgs.mkShell {{ }}\n")
+	}
+
+	fn env_at(dir: &std::path::Path) -> Env {
+		Env {
+			name: None,
+			root: dir.to_path_buf(),
+			kind: Kind::Project,
+		}
+	}
+
+	#[test]
+	fn extract_embedded_lock_recovers_the_json() {
+		let shell = single_file_shell_nix(LOCK_JSON);
+		let json = extract_embedded_lock(&shell).unwrap();
+		let lock = FlakeLock::from_json(&json).unwrap();
+		assert!(lock.nodes.contains_key("nixpkgs"));
+	}
+
+	#[test]
+	fn extract_embedded_lock_errors_when_there_is_no_here_string() {
+		assert!(extract_embedded_lock("pkgs.mkShell { }\n").is_err());
+	}
+
+	#[test]
+	fn load_reads_the_embedded_lock_when_no_flake_lock() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(
+			dir.path().join("shell.nix"),
+			single_file_shell_nix(LOCK_JSON),
+		)
+		.unwrap();
+		// Deliberately no flake.lock: `load` must fall back to the embedded lock.
+		let project = Project::load(env_at(dir.path())).unwrap();
+		assert!(project.lock.nodes.contains_key("nixpkgs"));
+	}
+
+	#[test]
+	fn load_prefers_the_flake_lock_file_when_present() {
+		let dir = tempfile::tempdir().unwrap();
+		// shell.nix carries no embedded lock; the flake.lock file supplies it.
+		fs::write(dir.path().join("shell.nix"), "pkgs.mkShell { }\n").unwrap();
+		fs::write(dir.path().join("flake.lock"), LOCK_JSON).unwrap();
+		let project = Project::load(env_at(dir.path())).unwrap();
+		assert!(project.lock.nodes.contains_key("nixpkgs"));
+	}
+}
