@@ -214,14 +214,20 @@ fn resolve_node(cfg: &Config, catalog: &crate::env::seeds::Catalog, name: &str) 
 				path: seed.path.clone(),
 			}),
 			Some(Resolved::Collision { chosen, others }) => {
+				// Prefer the `alias:name` selector; an unaliased seed has no such
+				// form, so point at its exact path (the always-works selector).
+				let selector = |s: &crate::env::seeds::Seed| match &s.alias {
+					Some(a) => format!("{a}:{}", s.name),
+					None => s.path.display().to_string(),
+				};
 				let alts = others
 					.iter()
-					.map(|s| format!("{}:{}", s.alias, s.name))
+					.map(|s| selector(s))
 					.collect::<Vec<_>>()
 					.join(", ");
 				eprintln!(
-					"clinix: seed `{name}` is ambiguous — using `{}:{}` (also: {alts}; qualify to pick another)",
-					chosen.alias, chosen.name
+					"clinix: seed `{name}` is ambiguous — using `{}` (also: {alts}; qualify to pick another)",
+					selector(chosen)
 				);
 				Ok(Node::Seed {
 					name: chosen.name.clone(),

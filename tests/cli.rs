@@ -412,6 +412,22 @@ fn list_enumerates_registry_envs_sorted() {
 }
 
 #[test]
+fn list_includes_seeds_from_the_catalog() {
+	// `env list` shows both registry envs and in-place seeds.
+	let p = Project::new();
+	p.seed("codex", "{ pkgs }: pkgs.mkShell { }\n");
+	p.seed("pi", "{ pkgs }: pkgs.mkShell { }\n");
+	p.clinix(&["env", "list"])
+		.assert()
+		.success()
+		.stdout(
+			predicate::str::contains("seeds:")
+				.and(predicate::str::contains("codex"))
+				.and(predicate::str::contains("pi")),
+		);
+}
+
+#[test]
 fn rename_moves_the_env_dir_and_its_gc_root() {
 	let p = Project::new();
 	p.seed_registry_env("old", REG_SHELL_NIX);

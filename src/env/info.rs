@@ -113,21 +113,63 @@ fn print_json(project: &Project, packages: &[ResolvedPkg]) -> Result<()> {
 	Ok(())
 }
 
-/// List registered envs (`state/envs/<name>`), each enriched cheaply with its
-/// nixpkgs pin read from `flake.lock`. The filesystem *is* the index
-/// ([`crate::env::registry`]) — nothing to keep in sync. An empty registry prints a
-/// hint instead of a table.
+/// List what `clinix env <name>` can enter: **registry** envs
+/// (`state/envs/<name>`, each enriched with its nixpkgs pin from `flake.lock`) and
+/// **seeds** (the in-place `*.nix` fragments discovered from `[env.seeds].sources`).
+/// The filesystem *is* the registry index; the catalog is rebuilt from config —
+/// nothing to keep in sync. Empty of both prints a hint.
 pub fn list(context: &Context) -> Result<()> {
 	let names = crate::env::registry::list_names(&context.config)?;
-	if names.is_empty() {
-		println!("clinix: no registered envs (create one: clinix env new <name> --from …)");
+	let settings = crate::env::config::Settings::load(&context.config.config_dir)?;
+	let catalog = crate::env::seeds::Catalog::build(&settings.env.seeds);
+	for w in &catalog.warnings {
+		eprintln!("clinix: {w}");
+	}
+
+	if names.is_empty() && catalog.seeds.is_empty() {
+		println!(
+			"clinix: no registered envs or seeds\n  \
+			 create a registry env: clinix env new <name> --from …\n  \
+			 or add seed sources: [env.seeds] in {}",
+			context.config.config_dir.join("config.toml").display()
+		);
 		return Ok(());
 	}
-	let width = names.iter().map(String::len).max().unwrap_or(4).max(4);
-	println!("{:<width$}  NIXPKGS", "NAME");
-	for name in &names {
-		let pin = registry_pin(context, name);
-		println!("{name:<width$}  {pin}");
+
+	if !names.is_empty() {
+		println!("registry envs:");
+		let width = names.iter().map(String::len).max().unwrap_or(4).max(4);
+		println!("  {:<width$}  NIXPKGS", "NAME");
+		for name in &names {
+			let pin = registry_pin(context, name);
+			println!("  {name:<width$}  {pin}");
+		}
+	}
+
+	if !catalog.seeds.is_empty() {
+		if !names.is_empty() {
+			println!();
+		}
+		println!("seeds:");
+		let nw = catalog
+			.seeds
+			.iter()
+			.map(|s| s.name.len())
+			.max()
+			.unwrap_or(4)
+			.max(4);
+		let aw = catalog
+			.seeds
+			.iter()
+			.map(|s| s.alias.as_deref().map_or(0, str::len))
+			.max()
+			.unwrap_or(5)
+			.max(5);
+		println!("  {:<nw$}  {:<aw$}  SOURCE", "NAME", "ALIAS");
+		for seed in &catalog.seeds {
+			let alias = seed.alias.as_deref().unwrap_or("");
+			println!("  {:<nw$}  {alias:<aw$}  {}", seed.name, seed.path.display());
+		}
 	}
 	Ok(())
 }

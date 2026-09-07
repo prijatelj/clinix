@@ -16,12 +16,13 @@ use rnix::{SyntaxKind, SyntaxNode};
 
 use crate::env::config::{SeedSettings, SeedSource, expand_tilde};
 
-/// One cataloged seed: its bare `name` (file stem), the `alias` of the source it
-/// came from (for the `alias:name` qualified form), and the `*.nix` file itself.
+/// One cataloged seed: its bare `name` (file stem), the source's `alias` if one
+/// was **explicitly** set in config (`Some` → usable as the `alias:name` qualified
+/// form; `None` → no alias, so disambiguate by exact path), and the `*.nix` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seed {
 	pub name: String,
-	pub alias: String,
+	pub alias: Option<String>,
 	pub path: PathBuf,
 }
 
@@ -73,7 +74,7 @@ impl Catalog {
 			return self
 				.seeds
 				.iter()
-				.find(|s| s.alias == alias && s.name == name)
+				.find(|s| s.alias.as_deref() == Some(alias) && s.name == name)
 				.map(Resolved::One);
 		}
 		let mut matches = self.seeds.iter().filter(|s| s.name == token);
@@ -89,10 +90,9 @@ impl Catalog {
 	fn add_source(&mut self, source: &SeedSource, config_ignore: &[String]) {
 		let path = expand_tilde(&source.path);
 		if path.is_dir() {
-			let alias = source
-				.alias
-				.clone()
-				.unwrap_or_else(|| basename(&path));
+			// The alias is only what the user explicitly set — no derived default,
+			// so an unaliased source's seeds carry `None` (empty in `env list`).
+			let alias = source.alias.clone();
 			let mut ignore = config_ignore.to_vec();
 			ignore.extend(read_clinix_ignore(&path));
 			// Recursively collect `*.nix` under the source, deterministically. A
@@ -122,10 +122,7 @@ impl Catalog {
 		} else if path.is_file() {
 			// An explicitly named file is not subject to ignore globs (the user
 			// pointed at it directly).
-			let alias = source
-				.alias
-				.clone()
-				.unwrap_or_else(|| parent_basename(&path));
+			let alias = source.alias.clone();
 			self.add_file(&path, &alias);
 		} else {
 			self.warnings
@@ -133,7 +130,7 @@ impl Catalog {
 		}
 	}
 
-	fn add_file(&mut self, file: &Path, alias: &str) {
+	fn add_file(&mut self, file: &Path, alias: &Option<String>) {
 		let name = file.file_stem().unwrap().to_string_lossy().into_owned();
 		let src = match std::fs::read_to_string(file) {
 			Ok(s) => s,
@@ -145,7 +142,7 @@ impl Catalog {
 		match classify(&src) {
 			SeedKind::Shell => self.seeds.push(Seed {
 				name,
-				alias: alias.to_string(),
+				alias: alias.clone(),
 				path: file.to_path_buf(),
 			}),
 			SeedKind::Flake => self.warnings.push(format!(
@@ -309,16 +306,6 @@ fn nix_str(path: &Path) -> String {
 	format!("\"{escaped}\"")
 }
 
-fn basename(path: &Path) -> String {
-	path.file_name()
-		.map(|s| s.to_string_lossy().into_owned())
-		.unwrap_or_default()
-}
-
-fn parent_basename(path: &Path) -> String {
-	path.parent().map(basename).unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -343,6 +330,19 @@ mod tests {
 		);
 		assert_eq!(classify(FLAKE), SeedKind::Flake);
 		assert_eq!(classify("{ this is ( not valid"), SeedKind::Invalid);
+	}
+
+	#[test]
+	fn unaliased_source_yields_no_alias() {
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("rust.nix"), FRAGMENT).unwrap();
+		let settings = SeedSettings {
+			sources: vec![source(dir.path(), None)], // no alias set in config
+			ignore: vec![],
+		};
+		let cat = Catalog::build(&settings);
+		assert_eq!(cat.seeds.len(), 1);
+		assert_eq!(cat.seeds[0].alias, None, "no derived-basename default");
 	}
 
 	#[test]
@@ -384,7 +384,7 @@ mod tests {
 		names.sort();
 		// `go` comes from the lang/ subdir; lib/ + _helper are ignored.
 		assert_eq!(names, vec!["claude", "go", "rust"]);
-		assert!(cat.seeds.iter().all(|s| s.alias == "dev"));
+		assert!(cat.seeds.iter().all(|s| s.alias.as_deref() == Some("dev")));
 		// flake.nix + broken.nix warn; ignored files are silent.
 		assert_eq!(cat.warnings.len(), 2, "warnings: {:?}", cat.warnings);
 		assert!(cat.warnings.iter().any(|w| w.contains("flake")));
@@ -429,13 +429,15 @@ mod tests {
 		// Unique bare name.
 		assert!(matches!(cat.find("rust"), Some(Resolved::One(s)) if s.name == "rust"));
 		// Qualified form selects a specific source.
-		assert!(matches!(cat.find("two:claude"), Some(Resolved::One(s)) if s.alias == "two"));
+		assert!(
+			matches!(cat.find("two:claude"), Some(Resolved::One(s)) if s.alias.as_deref() == Some("two"))
+		);
 		// Bare collision: highest-precedence source wins, the other is reported.
 		match cat.find("claude") {
 			Some(Resolved::Collision { chosen, others }) => {
-				assert_eq!(chosen.alias, "one");
+				assert_eq!(chosen.alias.as_deref(), Some("one"));
 				assert_eq!(others.len(), 1);
-				assert_eq!(others[0].alias, "two");
+				assert_eq!(others[0].alias.as_deref(), Some("two"));
 			}
 			other => panic!("expected a collision, got {other:?}"),
 		}
