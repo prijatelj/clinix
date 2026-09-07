@@ -19,9 +19,9 @@ pub enum ClinixError {
 	#[error("environment `{0}` already exists")]
 	EnvExists(String),
 
-	/// A registry name that is not a valid single path component.
+	/// A registry name that does not obey the namespace naming rules.
 	#[error("invalid environment name `{name}`: {detail}")]
-	InvalidEnvName { name: String, detail: &'static str },
+	InvalidEnvName { name: String, detail: String },
 
 	/// `init` could not decide what to scaffold from the existing directory
 	/// state. `detail` names exactly what is undetermined (user-facing).

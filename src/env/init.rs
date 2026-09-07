@@ -54,7 +54,7 @@ impl RunCmd for Init {
 	/// `flake.lock` (and `flake.nix` under `--flake`). Never clobbers existing
 	/// project files, and does the network resolution *before* any write so a
 	/// failure leaves the directory untouched.
-	fn run(self, _context: &Context) -> Result<()> {
+	fn run(self, context: &Context) -> Result<()> {
 		// `--from` adopt (ADR-2 state detection) and package-level version pins
 		// are later slices; reject rather than silently drop their semantics.
 		if self.from.is_some() {
@@ -135,6 +135,13 @@ impl RunCmd for Init {
 		}
 		if self.flake {
 			println!("clinix: wrote flake.nix wrapping shell.nix (flake users: `nix develop`)");
+		}
+		// If the project dir's basename collides with a registry env or seed, warn —
+		// `clinix env <basename>` would resolve that, not this path-based project.
+		if let Some(base) = root.file_name().and_then(|s| s.to_str()) {
+			if crate::env::registry::validate_name(base).is_ok() {
+				super::env::warn_name_collision(&context.config, base);
+			}
 		}
 		Ok(())
 	}

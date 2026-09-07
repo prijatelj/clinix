@@ -64,15 +64,19 @@ pub struct Env {
 }
 
 /// The one per-source-divergent seam (plan §resolve). No nix eval, no lock read —
-/// pure name → root-dir resolution against the resolved [`Config`]:
+/// pure name → root-dir resolution against the resolved [`Config`]. Resolves the
+/// *directory-backed* target shapes (the launcher's [`resolve_node`] handles the
+/// `*.nix` **File** shape and the seed catalog before delegating here):
 /// - `Some(".")` or `None` → the cwd project ([`Kind::Project`]);
-/// - `Some(name)` that is a path (contains `/` or is an existing dir) →
-///   [`Kind::Project`] at that path;
-/// - `Some(name)` otherwise → a registry env at `state/envs/<name>` if that dir
-///   exists ([`Kind::Registry`]); else [`ClinixError::UnknownEnv`].
+/// - a **Dir** (`/`-bearing or an existing dir) → [`Kind::Project`] at that path;
+/// - a **Member** `namespace:member` → the registry env's member subshell at
+///   `envs/<namespace>/<member>` ([`Kind::Registry`]); absent → [`ClinixError::UnknownEnv`];
+/// - a **bare name** → a registry env at `envs/<name>` if it exists
+///   ([`Kind::Registry`]); else [`ClinixError::UnknownEnv`].
 ///
-/// The registry *layout* (`envs/<name>`) lives in [`crate::env::registry`]; this only
-/// resolves a name to a root. Enumeration is [`registry::list_names`].
+/// The registry *layout* (`envs/<name>`, members `envs/<name>/<member>`) lives in
+/// [`crate::env::registry`]; this only resolves a name to a root. Enumeration is
+/// [`registry::list_names`].
 pub fn resolve(cfg: &Config, name: Option<&str>) -> Result<Env> {
 	match name {
 		None | Some(".") => Ok(Env {
@@ -82,6 +86,7 @@ pub fn resolve(cfg: &Config, name: Option<&str>) -> Result<Env> {
 		}),
 		Some(n) => {
 			let path = Path::new(n);
+			// Dir target: a `/`-bearing path or an existing dir → a project there.
 			if n.contains('/') || path.is_dir() {
 				return Ok(Env {
 					name: Some(n.to_string()),
@@ -89,6 +94,25 @@ pub fn resolve(cfg: &Config, name: Option<&str>) -> Result<Env> {
 					kind: Kind::Project,
 				});
 			}
+			// Member target: `namespace:member` → a registry env's member subshell
+			// at `envs/<namespace>/<member>` (members are subdirs sharing the parent
+			// env's pin). If that dir is absent, fall through to `UnknownEnv` so the
+			// caller can try the seed catalog (a seed `namespace:name`). Both halves
+			// must be valid single components (guards against `..` traversal).
+			if let Some((ns, member)) = n.split_once(':') {
+				if registry::validate_name(ns).is_ok() && registry::validate_name(member).is_ok() {
+					let root = registry::env_root(cfg, ns).join(member);
+					if root.is_dir() {
+						return Ok(Env {
+							name: Some(n.to_string()),
+							root,
+							kind: Kind::Registry,
+						});
+					}
+				}
+				return Err(ClinixError::UnknownEnv(n.to_string()));
+			}
+			// Bare name: a registry env at `envs/<name>` (its default/runtime shell).
 			let root = registry::env_root(cfg, n);
 			if root.is_dir() {
 				Ok(Env {
@@ -103,10 +127,40 @@ pub fn resolve(cfg: &Config, name: Option<&str>) -> Result<Env> {
 	}
 }
 
-/// A resolved stack node: an env with its own `shell.nix` (project/registry), or
-/// a seed fragment file from the catalog.
+/// Warn (never error) when creating an env named `name` would collide, under the
+/// namespace normalization (`-`≡`_`), with an existing **registry env** or a
+/// **seed** — since `resolve_node` resolves a registry env before a seed, a new
+/// registry env silently shadows a same-named seed. Best-effort: a config/registry
+/// read error is ignored (creation should not fail on a diagnostic).
+pub(crate) fn warn_name_collision(cfg: &Config, name: &str) {
+	let key = crate::env::naming::namespace_key(name);
+	if let Ok(names) = registry::list_names(cfg) {
+		for existing in names.iter().filter(|e| e.as_str() != name) {
+			if crate::env::naming::namespace_key(existing) == key {
+				eprintln!(
+					"clinix: warning: `{name}` normalizes to the same as existing registry env `{existing}` (`-`≡`_`)"
+				);
+			}
+		}
+	}
+	if let Ok(settings) = crate::env::config::Settings::load(&cfg.config_dir) {
+		let catalog = crate::env::seeds::Catalog::build(&settings.env.seeds);
+		for seed in &catalog.seeds {
+			if crate::env::naming::namespace_key(&seed.name) == key {
+				eprintln!(
+					"clinix: warning: `{name}` shadows seed `{}` — `clinix env {name}` will enter the new env, not the seed",
+					seed.name
+				);
+			}
+		}
+	}
+}
+
+/// A resolved stack node: an env with its own `shell.nix` (project/registry), an
+/// explicit `*.nix` **File** run directly, or a seed fragment from the catalog.
 enum Node {
 	Env(Env),
+	File { path: PathBuf },
 	Seed { name: String, path: PathBuf },
 }
 
@@ -140,19 +194,23 @@ pub(crate) fn launch(
 		.map(|n| resolve_node(cfg, &catalog, n))
 		.collect::<Result<_>>()?;
 
-	// A single project/registry env: enter its own shell.nix.
-	if let [Node::Env(env)] = nodes.as_slice() {
-		return launch_env(cfg, env, pure, command);
+	// A single self-contained node enters directly (no composition): a
+	// project/registry env's own shell, or an explicit `*.nix` file.
+	match nodes.as_slice() {
+		[Node::Env(env)] => return launch_env(cfg, env, pure, command),
+		[Node::File { path }] => return launch_file(cfg, path, pure, command),
+		_ => {}
 	}
 
-	// Otherwise a stack: v1 supports seeds only.
+	// Otherwise a stack: v1 composes seeds only. A self-contained node (env or
+	// file) in a multi-node stack needs self-contained composition (deferred).
 	let mut seeds: Vec<(String, PathBuf)> = Vec::with_capacity(nodes.len());
 	for node in &nodes {
 		match node {
 			Node::Seed { name, path } => seeds.push((name.clone(), path.clone())),
-			Node::Env(_) => {
+			Node::Env(_) | Node::File { .. } => {
 				return Err(crate::error::unimplemented(
-					"composing a project/registry env into a stack",
+					"composing a self-contained env/file into a stack",
 					"seeds-only stacks for now; self-contained seeds are deferred",
 				));
 			}
@@ -187,25 +245,61 @@ pub(crate) fn launch(
 	crate::nix::nix_shell(&drv, pure, command)
 }
 
-/// Enter a single env's own `shell.nix` (project/registry), GC-rooted by its key.
+/// Enter a single env's own shell (project/registry), GC-rooted by its key. The
+/// entry file is `shell.nix`, else `default.nix` — the same fallback `nix-shell`
+/// itself uses.
 fn launch_env(cfg: &Config, env: &Env, pure: bool, command: Option<&str>) -> Result<ExitStatus> {
-	let shell_nix = env.root.join("shell.nix");
-	if !shell_nix.is_file() {
-		return Err(ClinixError::Resolve(format!(
-			"no shell.nix at {} (run: clinix env init)",
-			env.root.display()
-		)));
-	}
+	let shell_file = env_shell_file(&env.root)?;
 	let root = registry::root_path(cfg, env);
-	let drv = crate::nix::instantiate_rooted(&shell_nix, &root)?;
+	let drv = crate::nix::instantiate_rooted(&shell_file, &root)?;
 	crate::nix::nix_shell(&drv, pure, command)
 }
 
-/// Map a name to a stack node: a project/registry env if [`resolve`] finds one,
-/// else a seed from the catalog (`alias:name`, or a bare name — the highest-
-/// precedence match, warning on a collision), else [`ClinixError::UnknownEnv`].
+/// Run an explicit `*.nix` **File** target directly (`clinix env shell dev.nix`),
+/// GC-rooted by a path slug (like a project — the file has no registry name). The
+/// file is a standalone shell expression; it is entered as-is, not composed.
+fn launch_file(cfg: &Config, file: &Path, pure: bool, command: Option<&str>) -> Result<ExitStatus> {
+	let slug = file.to_string_lossy().replace('/', "_");
+	let root = registry::roots_dir(cfg).join(format!("file-{}", slug.trim_start_matches('_')));
+	let drv = crate::nix::instantiate_rooted(file, &root)?;
+	crate::nix::nix_shell(&drv, pure, command)
+}
+
+/// The entry file for a directory-backed env: `shell.nix` if present, else
+/// `default.nix` (matching `nix-shell`'s own lookup), else a clear error.
+pub(crate) fn env_shell_file(root: &Path) -> Result<PathBuf> {
+	for name in ["shell.nix", "default.nix"] {
+		let candidate = root.join(name);
+		if candidate.is_file() {
+			return Ok(candidate);
+		}
+	}
+	Err(ClinixError::Resolve(format!(
+		"no shell.nix or default.nix at {} (run: clinix env init)",
+		root.display()
+	)))
+}
+
+/// Map one token to a stack node, following the target precedence: an explicit
+/// `*.nix` **File** (checked first, so `./dev.nix` runs the file, not
+/// `./dev.nix/shell.nix`); else a directory-backed env via [`resolve`]
+/// (cwd/Dir/Member/bare); else a seed from the catalog (`namespace:name`, or a
+/// bare name — highest-precedence match, warning on a collision); else
+/// [`ClinixError::UnknownEnv`].
 fn resolve_node(cfg: &Config, catalog: &crate::env::seeds::Catalog, name: &str) -> Result<Node> {
 	use crate::env::seeds::Resolved;
+	// File target: a `*.nix` path (or any existing file). A `.nix` name that does
+	// not exist is a clear error, not a fall-through to a registry/seed lookup.
+	let path = Path::new(name);
+	if name.ends_with(".nix") || path.is_file() {
+		return if path.is_file() {
+			Ok(Node::File {
+				path: std::fs::canonicalize(path)?,
+			})
+		} else {
+			Err(ClinixError::Resolve(format!("no such shell file: {name}")))
+		};
+	}
 	match resolve(cfg, Some(name)) {
 		Ok(env) => Ok(Node::Env(env)),
 		Err(ClinixError::UnknownEnv(_)) => match catalog.find(name) {
@@ -214,10 +308,10 @@ fn resolve_node(cfg: &Config, catalog: &crate::env::seeds::Catalog, name: &str) 
 				path: seed.path.clone(),
 			}),
 			Some(Resolved::Collision { chosen, others }) => {
-				// Prefer the `alias:name` selector; an unaliased seed has no such
-				// form, so point at its exact path (the always-works selector).
-				let selector = |s: &crate::env::seeds::Seed| match &s.alias {
-					Some(a) => format!("{a}:{}", s.name),
+				// Prefer the `namespace:name` selector; a seed without a namespace
+				// has no such form, so point at its exact path (always works).
+				let selector = |s: &crate::env::seeds::Seed| match &s.namespace {
+					Some(ns) => format!("{ns}:{}", s.name),
 					None => s.path.display().to_string(),
 				};
 				let alts = others
@@ -432,4 +526,28 @@ pub struct OptionalTarget {
 pub struct Targets {
 	#[arg(required = true)]
 	pub names: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn env_shell_file_prefers_shell_nix_then_default_nix() {
+		let dir = tempfile::tempdir().unwrap();
+		// Neither present → a clear error naming the directory.
+		assert!(env_shell_file(dir.path()).is_err());
+		// default.nix alone → used (nix-shell's fallback).
+		std::fs::write(dir.path().join("default.nix"), "{}").unwrap();
+		assert_eq!(
+			env_shell_file(dir.path()).unwrap(),
+			dir.path().join("default.nix")
+		);
+		// shell.nix takes precedence when both exist.
+		std::fs::write(dir.path().join("shell.nix"), "{}").unwrap();
+		assert_eq!(
+			env_shell_file(dir.path()).unwrap(),
+			dir.path().join("shell.nix")
+		);
+	}
 }

@@ -16,13 +16,13 @@ use rnix::{SyntaxKind, SyntaxNode};
 
 use crate::env::config::{SeedSettings, SeedSource, expand_tilde};
 
-/// One cataloged seed: its bare `name` (file stem), the source's `alias` if one
-/// was **explicitly** set in config (`Some` → usable as the `alias:name` qualified
-/// form; `None` → no alias, so disambiguate by exact path), and the `*.nix` file.
+/// One cataloged seed: its bare `name` (file stem), the source's `namespace` if
+/// one was **explicitly** set in config (`Some` → usable as the `namespace:name`
+/// selector; `None` → none, so disambiguate by exact path), and the `*.nix` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seed {
 	pub name: String,
-	pub alias: Option<String>,
+	pub namespace: Option<String>,
 	pub path: PathBuf,
 }
 
@@ -44,7 +44,7 @@ pub enum Resolved<'a> {
 	One(&'a Seed),
 	/// A bare name matched several seeds; `chosen` is the highest-precedence one
 	/// (first source wins), `others` are the shadowed matches (for a warning that
-	/// names the `alias:name` form to select them).
+	/// names the `namespace:name` form to select them).
 	Collision { chosen: &'a Seed, others: Vec<&'a Seed> },
 }
 
@@ -58,23 +58,32 @@ pub struct Catalog {
 }
 
 impl Catalog {
-	/// Build the catalog from the configured seed sources.
+	/// Build the catalog from the configured seed sources. A source without its own
+	/// `namespace` inherits the `[env.seeds]` default (`settings.namespace`,
+	/// `"seeds"` unless overridden or set to none).
 	pub fn build(settings: &SeedSettings) -> Catalog {
 		let mut cat = Catalog::default();
 		for source in &settings.sources {
-			cat.add_source(source, &settings.ignore);
+			cat.add_source(source, &settings.ignore, settings.namespace.as_deref());
 		}
 		cat
 	}
 
-	/// Resolve a name token: `alias:name` (exact), or a bare `name` (unique, else
-	/// the highest-precedence match with the others reported as a collision).
+	/// Resolve a name token: `namespace:name` (exact), or a bare `name` (unique,
+	/// else the highest-precedence match with the others reported as a collision).
 	pub fn find(&self, token: &str) -> Option<Resolved<'_>> {
-		if let Some((alias, name)) = token.split_once(':') {
+		if let Some((namespace, name)) = token.split_once(':') {
+			// Namespaces collide under `-`≡`_`, so compare normalized keys.
+			let key = crate::env::naming::namespace_key(namespace);
 			return self
 				.seeds
 				.iter()
-				.find(|s| s.alias.as_deref() == Some(alias) && s.name == name)
+				.find(|s| {
+					s.namespace
+						.as_deref()
+						.is_some_and(|ns| crate::env::naming::namespace_key(ns) == key)
+						&& s.name == name
+				})
 				.map(Resolved::One);
 		}
 		let mut matches = self.seeds.iter().filter(|s| s.name == token);
@@ -87,17 +96,17 @@ impl Catalog {
 		}
 	}
 
-	fn add_source(&mut self, source: &SeedSource, config_ignore: &[String]) {
+	fn add_source(&mut self, source: &SeedSource, config_ignore: &[String], default_ns: Option<&str>) {
 		let path = expand_tilde(&source.path);
 		if path.is_dir() {
-			// The alias is only what the user explicitly set — no derived default,
-			// so an unaliased source's seeds carry `None` (empty in `env list`).
-			let alias = source.alias.clone();
+			// A source's own namespace wins; otherwise inherit the config default
+			// (`"seeds"` unless overridden or set to none).
+			let namespace = source.namespace.clone().or_else(|| default_ns.map(String::from));
 			let mut ignore = config_ignore.to_vec();
 			ignore.extend(read_clinix_ignore(&path));
 			// Recursively collect `*.nix` under the source, deterministically. A
 			// seed is still named by basename (subdirs organize, not qualify);
-			// same-basename files across subdirs collide (warned; use `alias:name`).
+			// same-basename files across subdirs collide (warned; use `namespace:name`).
 			let mut files: Vec<PathBuf> = walkdir::WalkDir::new(&path)
 				.into_iter()
 				.filter_map(std::result::Result::ok)
@@ -117,20 +126,20 @@ impl Catalog {
 				if ignore.iter().any(|g| ignore_matches(g, &rel, &base)) {
 					continue; // ignored — silent
 				}
-				self.add_file(file, &alias);
+				self.add_file(file, &namespace);
 			}
 		} else if path.is_file() {
 			// An explicitly named file is not subject to ignore globs (the user
 			// pointed at it directly).
-			let alias = source.alias.clone();
-			self.add_file(&path, &alias);
+			let namespace = source.namespace.clone().or_else(|| default_ns.map(String::from));
+			self.add_file(&path, &namespace);
 		} else {
 			self.warnings
 				.push(format!("seed source not found: {}", path.display()));
 		}
 	}
 
-	fn add_file(&mut self, file: &Path, alias: &Option<String>) {
+	fn add_file(&mut self, file: &Path, namespace: &Option<String>) {
 		let name = file.file_stem().unwrap().to_string_lossy().into_owned();
 		let src = match std::fs::read_to_string(file) {
 			Ok(s) => s,
@@ -142,7 +151,7 @@ impl Catalog {
 		match classify(&src) {
 			SeedKind::Shell => self.seeds.push(Seed {
 				name,
-				alias: alias.clone(),
+				namespace: namespace.clone(),
 				path: file.to_path_buf(),
 			}),
 			SeedKind::Flake => self.warnings.push(format!(
@@ -310,10 +319,10 @@ fn nix_str(path: &Path) -> String {
 mod tests {
 	use super::*;
 
-	fn source(path: &Path, alias: Option<&str>) -> SeedSource {
+	fn source(path: &Path, namespace: Option<&str>) -> SeedSource {
 		SeedSource {
 			path: path.to_path_buf(),
-			alias: alias.map(str::to_string),
+			namespace: namespace.map(str::to_string),
 		}
 	}
 
@@ -333,16 +342,25 @@ mod tests {
 	}
 
 	#[test]
-	fn unaliased_source_yields_no_alias() {
+	fn default_namespace_applies_to_sources_without_their_own() {
 		let dir = tempfile::tempdir().unwrap();
 		std::fs::write(dir.path().join("rust.nix"), FRAGMENT).unwrap();
-		let settings = SeedSettings {
-			sources: vec![source(dir.path(), None)], // no alias set in config
+		// A source without its own namespace inherits the configured default.
+		let with_default = SeedSettings {
+			sources: vec![source(dir.path(), None)],
 			ignore: vec![],
+			namespace: Some("seeds".to_string()),
 		};
-		let cat = Catalog::build(&settings);
+		let cat = Catalog::build(&with_default);
 		assert_eq!(cat.seeds.len(), 1);
-		assert_eq!(cat.seeds[0].alias, None, "no derived-basename default");
+		assert_eq!(cat.seeds[0].namespace.as_deref(), Some("seeds"));
+		// No default (None = unset/none) leaves the seed without a namespace.
+		let none_default = SeedSettings {
+			sources: vec![source(dir.path(), None)],
+			ignore: vec![],
+			namespace: None,
+		};
+		assert_eq!(Catalog::build(&none_default).seeds[0].namespace, None);
 	}
 
 	#[test]
@@ -377,6 +395,7 @@ mod tests {
 		let settings = SeedSettings {
 			sources: vec![source(dir.path(), Some("dev"))],
 			ignore: vec!["_*.nix".to_string(), "lib/**".to_string()],
+			namespace: None,
 		};
 		let cat = Catalog::build(&settings);
 
@@ -384,7 +403,7 @@ mod tests {
 		names.sort();
 		// `go` comes from the lang/ subdir; lib/ + _helper are ignored.
 		assert_eq!(names, vec!["claude", "go", "rust"]);
-		assert!(cat.seeds.iter().all(|s| s.alias.as_deref() == Some("dev")));
+		assert!(cat.seeds.iter().all(|s| s.namespace.as_deref() == Some("dev")));
 		// flake.nix + broken.nix warn; ignored files are silent.
 		assert_eq!(cat.warnings.len(), 2, "warnings: {:?}", cat.warnings);
 		assert!(cat.warnings.iter().any(|w| w.contains("flake")));
@@ -412,17 +431,18 @@ mod tests {
 	}
 
 	#[test]
-	fn find_resolves_bare_alias_and_collision() {
+	fn find_resolves_bare_namespace_and_collision() {
 		let a = tempfile::tempdir().unwrap();
 		let b = tempfile::tempdir().unwrap();
 		std::fs::write(a.path().join("claude.nix"), FRAGMENT).unwrap();
 		std::fs::write(a.path().join("rust.nix"), FRAGMENT).unwrap();
 		std::fs::write(b.path().join("claude.nix"), FRAGMENT).unwrap();
 
-		// Source `a` (alias "one") is higher precedence than `b` (alias "two").
+		// Source `a` (namespace "a-ns") is higher precedence than `b` ("two").
 		let settings = SeedSettings {
-			sources: vec![source(a.path(), Some("one")), source(b.path(), Some("two"))],
+			sources: vec![source(a.path(), Some("a-ns")), source(b.path(), Some("two"))],
 			ignore: vec![],
+			namespace: None,
 		};
 		let cat = Catalog::build(&settings);
 
@@ -430,14 +450,18 @@ mod tests {
 		assert!(matches!(cat.find("rust"), Some(Resolved::One(s)) if s.name == "rust"));
 		// Qualified form selects a specific source.
 		assert!(
-			matches!(cat.find("two:claude"), Some(Resolved::One(s)) if s.alias.as_deref() == Some("two"))
+			matches!(cat.find("two:claude"), Some(Resolved::One(s)) if s.namespace.as_deref() == Some("two"))
+		);
+		// Namespace matching is `-`≡`_`: `a_ns:claude` selects the `a-ns` source.
+		assert!(
+			matches!(cat.find("a_ns:claude"), Some(Resolved::One(s)) if s.namespace.as_deref() == Some("a-ns"))
 		);
 		// Bare collision: highest-precedence source wins, the other is reported.
 		match cat.find("claude") {
 			Some(Resolved::Collision { chosen, others }) => {
-				assert_eq!(chosen.alias.as_deref(), Some("one"));
+				assert_eq!(chosen.namespace.as_deref(), Some("a-ns"));
 				assert_eq!(others.len(), 1);
-				assert_eq!(others[0].alias.as_deref(), Some("two"));
+				assert_eq!(others[0].namespace.as_deref(), Some("two"));
 			}
 			other => panic!("expected a collision, got {other:?}"),
 		}

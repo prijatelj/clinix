@@ -410,3 +410,87 @@ fn run_is_exit_transparent_and_roots_the_env_on_entry() {
 		.assert()
 		.code(3);
 }
+
+/// A **File target** — an explicit `*.nix` path — is entered directly (not
+/// composed), so `clinix env run ./shell.nix -- …` runs that file's shell.
+#[test]
+#[ignore = "needs nix + network"]
+fn shell_file_target_runs_the_file_directly() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
+		.assert()
+		.success();
+	p.clinix(&["env", "run", "./shell.nix", "--", "rg", "--version"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("ripgrep"));
+	// A file target GC-roots by a path slug (`file-*`), like a project.
+	let has_file_root = std::fs::read_dir(p.state().join("roots"))
+		.unwrap()
+		.filter_map(Result::ok)
+		.any(|e| e.file_name().to_string_lossy().starts_with("file-"));
+	assert!(has_file_root, "a file target creates a file-* GC root");
+}
+
+/// `new … --from <dir>` (register, non-copy) wraps the referenced source: the
+/// wrapper reads the established pin, injects `pkgs`, and imports the source — so
+/// entering the registered env runs the source shell.
+#[test]
+#[ignore = "needs nix + network"]
+fn new_register_non_copy_runs_the_referenced_shell() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", "src", "-p", "ripgrep"]).assert().success();
+	p.clinix(&["env", "new", "tools", "--from", "src"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("referenced"));
+	p.clinix(&["env", "run", "tools", "--", "rg", "--version"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("ripgrep"));
+}
+
+/// `new namespace:member --from <dir>` registers a member sharing the namespace
+/// pin (`../flake.lock`); entering `namespace:member` runs it.
+#[test]
+#[ignore = "needs nix + network"]
+fn new_register_member_runs_sharing_the_namespace_pin() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", "src", "-p", "ripgrep"]).assert().success();
+	p.clinix(&["env", "new", "proj:dev", "--from", "src"])
+		.assert()
+		.success()
+		.stderr(predicate::str::contains("created empty namespace"));
+	p.clinix(&["env", "run", "proj:dev", "--", "rg", "--version"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("ripgrep"));
+}
+
+/// A directory env with no `shell.nix` falls back to `default.nix` (the same
+/// lookup `nix-shell` performs), so `clinix env run .` still enters it.
+#[test]
+#[ignore = "needs nix + network"]
+fn default_nix_fallback_is_entered() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
+		.assert()
+		.success();
+	std::fs::rename(p.file("shell.nix"), p.file("default.nix")).unwrap();
+	p.clinix(&["env", "run", ".", "--", "rg", "--version"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("ripgrep"));
+}

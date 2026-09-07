@@ -19,6 +19,7 @@ mod export;
 mod import;
 mod info;
 mod init;
+pub mod naming;
 mod new;
 mod nix_edit;
 mod pkgs;

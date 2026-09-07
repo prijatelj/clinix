@@ -158,17 +158,17 @@ pub fn list(context: &Context) -> Result<()> {
 			.max()
 			.unwrap_or(4)
 			.max(4);
-		let aw = catalog
+		let nsw = catalog
 			.seeds
 			.iter()
-			.map(|s| s.alias.as_deref().map_or(0, str::len))
+			.map(|s| s.namespace.as_deref().map_or(0, str::len))
 			.max()
-			.unwrap_or(5)
-			.max(5);
-		println!("  {:<nw$}  {:<aw$}  SOURCE", "NAME", "ALIAS");
+			.unwrap_or(9)
+			.max(9);
+		println!("  {:<nw$}  {:<nsw$}  SOURCE", "NAME", "NAMESPACE");
 		for seed in &catalog.seeds {
-			let alias = seed.alias.as_deref().unwrap_or("");
-			println!("  {:<nw$}  {alias:<aw$}  {}", seed.name, seed.path.display());
+			let namespace = seed.namespace.as_deref().unwrap_or("");
+			println!("  {:<nw$}  {namespace:<nsw$}  {}", seed.name, seed.path.display());
 		}
 	}
 	Ok(())

@@ -151,17 +151,50 @@ pub struct SeedSettings {
 	/// gitignore-style globs suppressing "other files exist" warnings (also
 	/// honored via a `.clinix_ignore` per source dir).
 	pub ignore: Vec<String>,
+	/// Default namespace for sources without their own (`{ path, namespace }`):
+	/// `None` when unset **or** `false` (the two are the same — no namespace), else
+	/// the validated string. Bare-name access is unaffected. See
+	/// `notes/clinix/design/target-resolution.md` §5.
+	#[serde(deserialize_with = "de_seed_namespace")]
+	pub namespace: Option<String>,
+}
+
+/// Deserialize the seed default namespace when present: a validated string, or
+/// `false` for none (identical to leaving it unset). Absence is handled by the
+/// struct-level `#[serde(default)]` → `None`.
+fn de_seed_namespace<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	use serde::de::Error;
+	#[derive(Deserialize)]
+	#[serde(untagged)]
+	enum Repr {
+		Name(String),
+		Toggle(bool),
+	}
+	match Repr::deserialize(deserializer)? {
+		Repr::Name(s) => {
+			crate::env::naming::validate_namespace(&s).map_err(D::Error::custom)?;
+			Ok(Some(s))
+		}
+		Repr::Toggle(false) => Ok(None),
+		Repr::Toggle(true) => Err(D::Error::custom(
+			"namespace = true is not valid; use a string or `false`",
+		)),
+	}
 }
 
 /// One seed source: a directory (scanned recursively for `*.nix`) or an exact
 /// `*.nix` file. Deserializes from **either** a bare path string
-/// (`"~/dev_env/shells"`) **or** the table form (`{ path = "…", alias = "…" }`)
-/// when an explicit alias is wanted.
+/// (`"~/dev_env/shells"`) **or** the table form (`{ path = "…", namespace = "…" }`)
+/// when an explicit namespace is wanted.
 #[derive(Debug, Clone)]
 pub struct SeedSource {
 	pub path: PathBuf,
-	/// Qualifier for `alias:name`; defaults to the directory basename.
-	pub alias: Option<String>,
+	/// Qualifier for the `namespace:name` selector; `None` when unset (explicit
+	/// only — no derived default).
+	pub namespace: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for SeedSource {
@@ -169,7 +202,7 @@ impl<'de> Deserialize<'de> for SeedSource {
 	where
 		D: serde::Deserializer<'de>,
 	{
-		// A bare string is the path; a table carries `path` (+ optional `alias`).
+		// A bare string is the path; a table carries `path` (+ optional `namespace`).
 		#[derive(Deserialize)]
 		#[serde(untagged)]
 		enum Repr {
@@ -177,12 +210,18 @@ impl<'de> Deserialize<'de> for SeedSource {
 			Table {
 				path: PathBuf,
 				#[serde(default)]
-				alias: Option<String>,
+				namespace: Option<String>,
 			},
 		}
+		use serde::de::Error;
 		Ok(match Repr::deserialize(deserializer)? {
-			Repr::Path(path) => SeedSource { path, alias: None },
-			Repr::Table { path, alias } => SeedSource { path, alias },
+			Repr::Path(path) => SeedSource { path, namespace: None },
+			Repr::Table { path, namespace } => {
+				if let Some(ns) = &namespace {
+					crate::env::naming::validate_namespace(ns).map_err(D::Error::custom)?;
+				}
+				SeedSource { path, namespace }
+			}
 		})
 	}
 }
@@ -205,7 +244,7 @@ pub const MINIMAL_TEMPLATE: &str = r#"# clinix config (TOML). Default location: 
 
 [env.seeds]
 # Seed shells: a directory (scanned recursively for *.nix) or an exact *.nix file.
-# A bare path string is enough; use { path = "...", alias = "..." } to set an alias.
+# A bare path string is enough; use { path = "...", namespace = "..." } for a namespace.
 sources = [
   # "~/dev_env/shells",
 ]
@@ -247,17 +286,23 @@ nixpkgs = "nixos-26.05"
 
 [env.seeds]
 # Seed shells, read in place. Each source is a directory (scanned RECURSIVELY for
-# *.nix, each a seed named by basename) or an exact *.nix file. `alias` (default:
-# the directory's basename) qualifies `alias:name` when a basename appears in more
-# than one source. Enter with `clinix env rust claude` (lexical; -o keeps order),
-# `clinix env <name>`, or the `clinix <name>` shorthand.
+# *.nix, each a seed named by basename) or an exact *.nix file. A per-source
+# `namespace` qualifies the `namespace:name` selector when a basename appears in
+# more than one source. Enter with `clinix env rust claude` (lexical; -o keeps
+# order), `clinix env <name>`, or the `clinix <name>` shorthand.
 #
-# Each source is either a bare path string, or a { path = "...", alias = "..." }
-# table when you want to set an explicit alias.
+# Default namespace applied to sources without their own. Unset (or `false`) means
+# no namespace — the two are the same. A custom string follows Rust-identifier
+# rules: starts a-zA-Z, then [a-zA-Z0-9_-], `-`==`_`, no `:`. Bare-name access is
+# unaffected either way.
+# namespace = "seeds"
+#
+# Each source is either a bare path string, or a { path = "...", namespace = "..." }
+# table when you want to override the default namespace for that source.
 sources = [
-  # "~/dev_env/shells",                                # bare path — simplest
-  # { path = "~/dots/clinix/seeds", alias = "dots" },  # table form to set an alias
-  # "~/one-off/python.nix",                            # an exact file
+  # "~/dev_env/shells",                                    # bare path — simplest
+  # { path = "~/dots/clinix/seeds", namespace = "dots" },  # table form: set a namespace
+  # "~/one-off/python.nix",                                # an exact file
 ]
 
 # gitignore-ish globs that silence "other files exist" warnings (also honored via a
@@ -295,6 +340,7 @@ impl Settings {
 				seeds: SeedSettings {
 					sources: concat_first(other.env.seeds.sources, self.env.seeds.sources),
 					ignore: concat_first(other.env.seeds.ignore, self.env.seeds.ignore),
+					namespace: other.env.seeds.namespace.or(self.env.seeds.namespace),
 				},
 			},
 		}
@@ -413,7 +459,7 @@ shorthand = false
 [env]
 nixpkgs = "nixos-26.05"
 [env.seeds]
-sources = [ { path = "~/dev_env/shells", alias = "dev" }, { path = "/abs/one.nix" } ]
+sources = [ { path = "~/dev_env/shells", namespace = "dev" }, { path = "/abs/one.nix" } ]
 ignore = ["_*.nix"]
 "#,
 		);
@@ -421,7 +467,7 @@ ignore = ["_*.nix"]
 		assert!(!s.shorthand());
 		assert!(matches!(s.env.nixpkgs, Some(NixpkgsPin::Ref(ref r)) if r == "nixos-26.05"));
 		assert_eq!(s.env.seeds.sources.len(), 2);
-		assert_eq!(s.env.seeds.sources[0].alias.as_deref(), Some("dev"));
+		assert_eq!(s.env.seeds.sources[0].namespace.as_deref(), Some("dev"));
 		assert_eq!(s.env.seeds.ignore, vec!["_*.nix".to_string()]);
 	}
 
@@ -433,18 +479,18 @@ ignore = ["_*.nix"]
 			"config.toml",
 			r#"
 [env.seeds]
-sources = [ "~/a/shells", { path = "~/b/seeds", alias = "bee" }, "/abs/one.nix" ]
+sources = [ "~/a/shells", { path = "~/b/seeds", namespace = "bee" }, "/abs/one.nix" ]
 "#,
 		);
 		let s = Settings::load(dir.path()).unwrap();
 		assert_eq!(s.env.seeds.sources.len(), 3);
-		// bare string → path, no alias.
+		// bare string → path, no namespace.
 		assert_eq!(s.env.seeds.sources[0].path, PathBuf::from("~/a/shells"));
-		assert!(s.env.seeds.sources[0].alias.is_none());
-		// table → path + alias.
-		assert_eq!(s.env.seeds.sources[1].alias.as_deref(), Some("bee"));
+		assert!(s.env.seeds.sources[0].namespace.is_none());
+		// table → path + namespace.
+		assert_eq!(s.env.seeds.sources[1].namespace.as_deref(), Some("bee"));
 		// bare string works mid-array too.
-		assert!(s.env.seeds.sources[2].alias.is_none());
+		assert!(s.env.seeds.sources[2].namespace.is_none());
 	}
 
 	#[test]
@@ -453,6 +499,34 @@ sources = [ "~/a/shells", { path = "~/b/seeds", alias = "bee" }, "/abs/one.nix" 
 		let s = Settings::load(dir.path()).unwrap();
 		assert!(s.shorthand(), "shorthand defaults on");
 		assert!(s.env.seeds.sources.is_empty());
+		// The seed default namespace is unset (None) when nothing is configured.
+		assert_eq!(s.env.seeds.namespace, None);
+	}
+
+	#[test]
+	fn seed_default_namespace_unset_false_or_custom() {
+		let load = |body: &str| {
+			let dir = tempfile::tempdir().unwrap();
+			write(dir.path(), "config.toml", body);
+			Settings::load(dir.path())
+		};
+		// Absent and `false` are the same — None (no namespace).
+		assert_eq!(
+			load("[env.seeds]\nsources = []\n").unwrap().env.seeds.namespace,
+			None
+		);
+		assert_eq!(
+			load("[env.seeds]\nnamespace = false\n").unwrap().env.seeds.namespace,
+			None
+		);
+		// A custom string is validated and used.
+		assert_eq!(
+			load("[env.seeds]\nnamespace = \"mine\"\n").unwrap().env.seeds.namespace.as_deref(),
+			Some("mine")
+		);
+		// An invalid namespace (leading digit / `:`) is a load error.
+		assert!(load("[env.seeds]\nnamespace = \"1bad\"\n").is_err());
+		assert!(load("[env.seeds]\nnamespace = \"a:b\"\n").is_err());
 	}
 
 	#[test]
@@ -495,6 +569,39 @@ sources = [ { path = "/local/b" } ]
 			.map(|x| x.path.to_string_lossy().into_owned())
 			.collect();
 		assert_eq!(paths, vec!["/local/b".to_string(), "/base/a".to_string()]);
+	}
+
+	#[test]
+	fn use_merge_namespace_unset_and_false_both_inherit_base() {
+		let dir = tempfile::tempdir().unwrap();
+		write(
+			dir.path(),
+			"base.toml",
+			"[env.seeds]\nnamespace = \"base\"\nsources = []\n",
+		);
+		// unset and `false` are the same (both None), so both inherit the base via
+		// `.or()`. A local string is what overrides.
+		for local in [
+			"use = [\"base.toml\"]\n[env.seeds]\nsources = []\n",
+			"use = [\"base.toml\"]\n[env.seeds]\nnamespace = false\nsources = []\n",
+		] {
+			write(dir.path(), "config.toml", local);
+			assert_eq!(
+				Settings::load(dir.path()).unwrap().env.seeds.namespace.as_deref(),
+				Some("base"),
+				"None (unset/false) inherits base"
+			);
+		}
+		write(
+			dir.path(),
+			"config.toml",
+			"use = [\"base.toml\"]\n[env.seeds]\nnamespace = \"local\"\nsources = []\n",
+		);
+		assert_eq!(
+			Settings::load(dir.path()).unwrap().env.seeds.namespace.as_deref(),
+			Some("local"),
+			"a local string overrides base"
+		);
 	}
 
 	#[test]

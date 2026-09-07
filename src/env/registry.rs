@@ -117,24 +117,16 @@ pub fn clean(cfg: &Config, env: &Env) -> Result<bool> {
 	}
 }
 
-/// A registry name must be a single path component: no separators (which
-/// [`crate::env::resolve`] reads as a project path), no `.`/`..`, non-empty. This
-/// keeps names disjoint from project paths and safe as a directory name.
+/// A registry name is a **namespace** (it can hold `namespace:member` subshells),
+/// so it obeys the namespace naming rules (`crate::env::naming`): start `[a-zA-Z]`,
+/// then `[a-zA-Z0-9_-]`, no `:` (the member separator), no path separators or
+/// `.`/`..`. This keeps names disjoint from project paths and safe as a directory
+/// name, and consistent with seed namespaces.
 pub fn validate_name(name: &str) -> Result<()> {
-	let invalid = |detail| ClinixError::InvalidEnvName {
+	crate::env::naming::validate_namespace(name).map_err(|detail| ClinixError::InvalidEnvName {
 		name: name.to_string(),
 		detail,
-	};
-	if name.is_empty() {
-		return Err(invalid("name is empty"));
-	}
-	if name == "." || name == ".." {
-		return Err(invalid("`.`/`..` are reserved"));
-	}
-	if name.contains('/') || name.contains('\\') {
-		return Err(invalid("name may not contain a path separator"));
-	}
-	Ok(())
+	})
 }
 
 #[cfg(test)]
@@ -173,11 +165,14 @@ mod tests {
 	}
 
 	#[test]
-	fn validate_name_rejects_separators_and_dots() {
+	fn validate_name_enforces_namespace_rules() {
 		assert!(validate_name("python").is_ok());
+		assert!(validate_name("my-tool_2").is_ok());
 		assert!(validate_name("").is_err());
 		assert!(validate_name(".").is_err());
 		assert!(validate_name("..").is_err());
 		assert!(validate_name("a/b").is_err());
+		assert!(validate_name("2fast").is_err(), "no leading digit");
+		assert!(validate_name("ns:member").is_err(), "`:` is the member separator");
 	}
 }

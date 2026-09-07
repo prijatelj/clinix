@@ -228,6 +228,115 @@ fn new_from_a_non_seed_name_is_rejected() {
 		.stderr(predicate::str::contains("is not one"));
 }
 
+// ---- new: register a single shell (dir/file source) — no nix needed ----------
+
+/// A clinix-style shell that reads its own `./flake.lock` (so lock detection fires).
+const SHELL_READS_LOCK: &str =
+	"{ sources ? (builtins.fromJSON (builtins.readFile ./flake.lock)), pkgs ? import <nixpkgs> {} }: pkgs.mkShell { }\n";
+
+/// Write a source project dir (`<name>/shell.nix` + `flake.lock`) under the cwd.
+fn write_source_project(p: &Project, name: &str, lock: &str) {
+	let dir = p.file(name);
+	std::fs::create_dir_all(&dir).unwrap();
+	std::fs::write(dir.join("shell.nix"), SHELL_READS_LOCK).unwrap();
+	std::fs::write(dir.join("flake.lock"), lock).unwrap();
+}
+
+#[test]
+fn new_register_non_copy_references_source_and_establishes_pin() {
+	let p = Project::new();
+	write_source_project(&p, "proj", common::MINIMAL_LOCK);
+	let abs = std::fs::canonicalize(p.file("proj/shell.nix")).unwrap();
+	p.clinix(&["env", "new", "myenv", "--from", "proj"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("referenced"));
+	// Non-copy: the wrapper imports the source's absolute path and injects pkgs.
+	let wrapper = std::fs::read_to_string(p.env_dir("myenv").join("shell.nix")).unwrap();
+	assert!(wrapper.contains(&format!("import \"{}\" {{ inherit pkgs; }}", abs.display())));
+	assert!(wrapper.contains("builtins.readFile ./flake.lock"));
+	// The source's lock is established as the namespace pin.
+	assert!(p.env_dir("myenv").join("flake.lock").is_file());
+	assert!(!p.env_dir("myenv").join("source.nix").exists(), "non-copy: no body copy");
+}
+
+#[test]
+fn new_register_copy_copies_the_shell_body() {
+	let p = Project::new();
+	write_source_project(&p, "proj", common::MINIMAL_LOCK);
+	p.clinix(&["env", "new", "myenv", "--from", "proj", "--copy"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("copied"));
+	assert!(p.env_dir("myenv").join("source.nix").is_file(), "copy: body is copied in");
+	let wrapper = std::fs::read_to_string(p.env_dir("myenv").join("shell.nix")).unwrap();
+	assert!(wrapper.contains("import ./source.nix { inherit pkgs; }"));
+}
+
+#[test]
+fn new_register_member_creates_empty_namespace_and_shares_the_pin() {
+	let p = Project::new();
+	std::fs::write(p.file("dev.nix"), SHELL_READS_LOCK).unwrap();
+	std::fs::write(p.file("flake.lock"), common::MINIMAL_LOCK).unwrap();
+	p.clinix(&["env", "new", "proj:dev", "--from", "./dev.nix"])
+		.assert()
+		.success()
+		.stderr(predicate::str::contains("created empty namespace"));
+	// Member lives in a subdir and reads the SHARED pin at ../flake.lock.
+	let member = p.env_dir("proj").join("dev").join("shell.nix");
+	assert!(member.is_file());
+	assert!(
+		std::fs::read_to_string(&member).unwrap().contains("builtins.readFile ../flake.lock")
+	);
+	assert!(p.env_dir("proj").join("flake.lock").is_file(), "shared pin at the namespace root");
+}
+
+#[test]
+fn new_register_unpinned_source_warns() {
+	let p = Project::new();
+	// A shell that reads no flake.lock.
+	std::fs::write(p.file("bare.nix"), "{ pkgs }: pkgs.mkShell { }\n").unwrap();
+	p.clinix(&["env", "new", "myenv", "--from", "./bare.nix"])
+		.assert()
+		.success()
+		.stderr(predicate::str::contains("unpinned"));
+	let wrapper = std::fs::read_to_string(p.env_dir("myenv").join("shell.nix")).unwrap();
+	assert!(wrapper.contains("import ") && wrapper.contains("{ }"), "imported as-is");
+	assert!(!p.env_dir("myenv").join("flake.lock").exists(), "no pin established");
+}
+
+#[test]
+fn new_register_lock_conflict_errors_then_overwrite_repins() {
+	let p = Project::new();
+	// A second, distinct lock (different rev) for the conflict.
+	let other_lock = common::MINIMAL_LOCK.replace("abc1234567890def", "fff0000000000000");
+	write_source_project(&p, "a", common::MINIMAL_LOCK);
+	write_source_project(&p, "b", &other_lock);
+	// First member establishes the namespace pin.
+	p.clinix(&["env", "new", "proj:one", "--from", "a"]).assert().success();
+	// Second member with a different lock → conflict error (no flag).
+	p.clinix(&["env", "new", "proj:two", "--from", "b"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("differs from namespace").and(predicate::str::contains("--overwrite")));
+	// --overwrite repins the namespace to b's lock.
+	p.clinix(&["env", "new", "proj:two", "--from", "b", "--overwrite"]).assert().success();
+	let pin = std::fs::read_to_string(p.env_dir("proj").join("flake.lock")).unwrap();
+	assert!(pin.contains("fff0000000000000"), "namespace repinned to b's lock");
+}
+
+#[test]
+fn new_warns_when_the_name_shadows_a_seed() {
+	let p = Project::new();
+	p.seed("rust", "{ pkgs }: pkgs.mkShell { }\n"); // a seed named `rust`
+	write_source_project(&p, "proj", common::MINIMAL_LOCK);
+	// Registering an env `rust` shadows the seed in resolution → warn (not error).
+	p.clinix(&["env", "new", "rust", "--from", "proj"])
+		.assert()
+		.success()
+		.stderr(predicate::str::contains("shadows seed `rust`"));
+}
+
 #[test]
 fn run_mixing_a_project_env_into_a_seed_stack_is_deferred() {
 	// A stack must be all seeds for now (self-contained composition deferred).
@@ -238,7 +347,7 @@ fn run_mixing_a_project_env_into_a_seed_stack_is_deferred() {
 		.assert()
 		.failure()
 		.stderr(predicate::str::contains(
-			"composing a project/registry env into a stack",
+			"composing a self-contained env/file into a stack",
 		));
 }
 
@@ -246,6 +355,43 @@ fn run_mixing_a_project_env_into_a_seed_stack_is_deferred() {
 fn shell_unknown_env_reports_not_registered() {
 	Project::new()
 		.clinix(&["env", "shell", "definitely-not-an-env"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("not registered"));
+}
+
+#[test]
+fn shell_file_target_missing_errors_clearly() {
+	// A `*.nix` target that does not exist is a File-shape error, not a
+	// fall-through to a registry/seed lookup (stops before any nix call).
+	Project::new()
+		.clinix(&["env", "shell", "nope.nix"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("no such shell file: nope.nix"));
+}
+
+#[test]
+fn member_target_resolves_to_the_member_subdir() {
+	// `namespace:member` resolves to `envs/<namespace>/<member>`. With the member
+	// dir present but no shell file, the launcher errors *at that path* — proving
+	// resolution reached the member subdir, all without invoking nix.
+	let p = Project::new();
+	std::fs::create_dir_all(p.env_dir("proj").join("dev")).unwrap();
+	p.clinix(&["env", "shell", "proj:dev"])
+		.assert()
+		.failure()
+		.stderr(
+			predicate::str::contains("no shell.nix or default.nix")
+				.and(predicate::str::contains("envs/proj/dev")),
+		);
+}
+
+#[test]
+fn member_target_unknown_reports_unknown_env() {
+	// No such registry member and no such seed → unknown env (nix-free).
+	Project::new()
+		.clinix(&["env", "shell", "ghost:dev"])
 		.assert()
 		.failure()
 		.stderr(predicate::str::contains("not registered"));
