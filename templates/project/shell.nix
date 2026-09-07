@@ -1,8 +1,8 @@
 # The shell definition. One file, three entry points:
 #
-#   nix-shell        classic; resolves sources from flake.lock below
-#   nix develop      flake; Nix fetches the inputs and passes them in
-#   shell            the launcher, which roots this against the GC
+#   nix-shell         classic; resolves sources from flake.lock below
+#   nix develop       flake; Nix fetches the inputs and passes them in
+#   clinix env shell  the launcher, which roots this against the GC
 #
 # Taking `sources`/`system`/`pkgs` as arguments is what makes that work: each
 # caller supplies whatever it already resolved, so there is never a second

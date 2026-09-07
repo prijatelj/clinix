@@ -290,7 +290,10 @@ fn ensure_seed_lock(cfg: &Config, nixpkgs_ref: &str) -> Result<PathBuf> {
 	if lock.is_file() {
 		return Ok(lock);
 	}
-	let built = crate::env::init::build_nixpkgs_lock(nixpkgs_ref)?;
+	// Silent for now (no `--quiet` on launch); the same first-run lock could show
+	// progress if wanted — see `crate::progress`.
+	let built =
+		crate::env::init::build_nixpkgs_lock(nixpkgs_ref, &crate::progress::Progress::silent())?;
 	std::fs::create_dir_all(&cfg.config_dir)?;
 	std::fs::write(&lock, built.to_json())?;
 	Ok(lock)

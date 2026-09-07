@@ -8,6 +8,7 @@ use clap::Args;
 use crate::env::{Context, Pkg, RunCmd};
 use crate::error::{ClinixError, Result, unimplemented};
 use crate::model::lock::{FlakeLock, InputRef, Node, Source};
+use crate::progress::Progress;
 
 /// Scaffold a **project** env (`Kind::Project`) in a directory. A project is
 /// identified by its directory (not a name — `resolve` finds it by path/cwd, and
@@ -43,6 +44,10 @@ pub struct Init {
 	/// Adopt an existing spec (`pyproject.toml`, `Cargo.toml`, `shell.nix`, …).
 	#[arg(long = "from")]
 	pub from: Option<PathBuf>,
+	/// Suppress the step-by-step progress (printed to stderr by default). The
+	/// final result summary on stdout is unaffected.
+	#[arg(short = 'q', long = "quiet")]
+	pub quiet: bool,
 }
 impl RunCmd for Init {
 	/// Resolve + build `flake.lock` classically, then write `shell.nix` +
@@ -84,9 +89,27 @@ impl RunCmd for Init {
 			ensure_absent(&flake_nix, &root)?;
 		}
 
-		// Resolve nixpkgs and build the lock (network); nothing written on error.
-		let lock = build_nixpkgs_lock(&self.nixpkgs)?;
+		// Progress steps: the network lock-build (1 step frozen / 2 tracked) plus
+		// one write step. Numbering is continuous because `build_nixpkgs_lock`
+		// shares this same reporter. Steps go to stderr; `--quiet` silences them.
+		let lock_steps = if is_rev(&self.nixpkgs) { 1 } else { 2 };
+		let progress = if self.quiet {
+			Progress::silent()
+		} else {
+			Progress::new(lock_steps + 1)
+		};
 
+		// Resolve nixpkgs and build the lock (network); nothing written on error.
+		let lock = build_nixpkgs_lock(&self.nixpkgs, &progress)?;
+
+		let mut files = vec!["shell.nix"];
+		if !self.single_file {
+			files.push("flake.lock");
+		}
+		if self.flake {
+			files.push("flake.nix");
+		}
+		progress.step(&format!("writing project files ({})", files.join(", ")));
 		if self.single_file {
 			// One self-contained file: the lock is embedded in shell.nix, no
 			// flake.lock (like `--flake` adds a file, this removes one).
@@ -192,20 +215,34 @@ fn ensure_absent(path: &Path, root: &Path) -> Result<()> {
 /// frozen `original.rev`; anything else is a tracked `original.ref` resolved via
 /// `git ls-remote`. The single node is a github source
 /// (`{narHash, owner, repo, rev, type}`), mirroring `pin init` + `pin update`.
-/// Also reused to lazily lock the seed catalog's nixpkgs pin (`env::env::launch`).
-pub(crate) fn build_nixpkgs_lock(nixpkgs_ref: &str) -> Result<FlakeLock> {
+/// Also reused to lazily lock the seed catalog's nixpkgs pin (`env::env::launch`),
+/// which passes [`Progress::silent`]. Emits one progress step (frozen) or two
+/// (tracked: resolve then hash), each **before** its network call.
+pub(crate) fn build_nixpkgs_lock(nixpkgs_ref: &str, progress: &Progress) -> Result<FlakeLock> {
 	const OWNER: &str = "NixOS";
 	const REPO: &str = "nixpkgs";
 
 	// A 40-hex ref is a frozen rev (hash it directly); anything else is a tracked
-	// branch/tag (resolve it first). `resolve_github`/`Source::github_*` are the
-	// same helpers `update` uses.
+	// branch/tag (resolve it first). The tarball hash downloads all of nixpkgs, so
+	// it is the slow step — reported before it runs. Same helpers `update` uses.
 	let frozen = is_rev(nixpkgs_ref);
 	let (rev, nar_hash) = if frozen {
+		progress.step(&format!(
+			"fetching + hashing nixpkgs@{:.12} (downloads the tarball; can take a while)",
+			nixpkgs_ref
+		));
 		let nar_hash = crate::nix::github_tarball_narhash(OWNER, REPO, nixpkgs_ref)?;
 		(nixpkgs_ref.to_string(), nar_hash)
 	} else {
-		let (rev, nar_hash) = crate::nix::resolve_github(OWNER, REPO, nixpkgs_ref)?;
+		progress.step(&format!(
+			"resolving nixpkgs/{nixpkgs_ref} to a revision (git ls-remote)"
+		));
+		let rev = crate::nix::resolve_github_ref(OWNER, REPO, nixpkgs_ref)?;
+		progress.step(&format!(
+			"fetching + hashing nixpkgs@{:.12} (downloads the tarball; can take a while)",
+			rev.as_str()
+		));
+		let nar_hash = crate::nix::github_tarball_narhash(OWNER, REPO, rev.as_str())?;
 		(rev.as_str().to_string(), nar_hash)
 	};
 
@@ -326,7 +363,7 @@ mod tests {
 	#[test]
 	#[ignore = "requires network + git/nix-prefetch-url/nix-hash"]
 	fn build_nixpkgs_lock_resolves_and_roundtrips() {
-		let lock = build_nixpkgs_lock("nixos-26.05").expect("resolve+build");
+		let lock = build_nixpkgs_lock("nixos-26.05", &Progress::silent()).expect("resolve+build");
 		let nixpkgs = &lock.nodes["nixpkgs"];
 		let locked = nixpkgs.locked.as_ref().unwrap();
 		assert_eq!(locked.source_type(), Some("github"));

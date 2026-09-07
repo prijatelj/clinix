@@ -21,15 +21,40 @@ fn init_default_scaffolds_and_runs_under_nix_shell() {
 		return;
 	}
 	let p = Project::new();
+	// Default: numbered progress on stderr (resolve → hash → write), result on
+	// stdout. A tracked ref → 3 steps.
 	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
 		.assert()
-		.success();
+		.success()
+		.stderr(
+			predicate::str::contains("[1/3] resolving nixpkgs/nixos-26.05")
+				.and(predicate::str::contains("[3/3] writing project files")),
+		)
+		.stdout(predicate::str::contains("initialized project env"));
 	assert!(p.file("shell.nix").exists() && p.file("flake.lock").exists());
 	assert!(!p.file("flake.nix").exists());
+	// The generated shell.nix documents the real launcher command, not `shell`.
+	let shell = std::fs::read_to_string(p.file("shell.nix")).unwrap();
+	assert!(shell.contains("clinix env shell  the launcher"));
 
 	let out = nix_shell_run(&p.file("shell.nix"), "rg --version");
 	assert!(out.status.success());
 	assert!(String::from_utf8_lossy(&out.stdout).contains("ripgrep"));
+}
+
+#[test]
+#[ignore = "needs nix + network"]
+fn init_quiet_suppresses_progress() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	// `-q`: no progress on stderr; the stdout result summary is unaffected.
+	p.clinix(&["env", "init", ".", "--quiet"])
+		.assert()
+		.success()
+		.stderr(predicate::str::contains("[1/").not())
+		.stdout(predicate::str::contains("initialized project env"));
 }
 
 #[test]

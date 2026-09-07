@@ -14,4 +14,5 @@ pub mod env;
 pub mod error;
 pub mod model;
 pub mod nix;
+pub mod progress;
 pub mod sys;
