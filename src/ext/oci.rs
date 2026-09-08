@@ -47,7 +47,9 @@ pub fn parse_ref(image: &str) -> ImageRef {
 	};
 	// 2. registry vs the rest.
 	let (registry, remainder, had_registry) = match name_tag.split_once('/') {
-		Some((first, rest)) if first.contains('.') || first.contains(':') || first == "localhost" => {
+		Some((first, rest))
+			if first.contains('.') || first.contains(':') || first == "localhost" =>
+		{
 			(first.to_string(), rest.to_string(), true)
 		}
 		_ => (DOCKER_HUB.to_string(), name_tag.to_string(), false),
@@ -219,8 +221,8 @@ pub fn parse_challenge(value: &str) -> Option<(String, String, Option<String>)> 
 /// Fetch an anonymous bearer token from the challenge's realm. `Ok(None)` means
 /// the token endpoint refused anonymous access (→ needs credentials).
 fn fetch_token(challenge: &str) -> Result<Option<String>> {
-	let (realm, service, scope) =
-		parse_challenge(challenge).ok_or_else(|| config("unparseable WWW-Authenticate challenge"))?;
+	let (realm, service, scope) = parse_challenge(challenge)
+		.ok_or_else(|| config("unparseable WWW-Authenticate challenge"))?;
 	let mut cmd = Command::new("curl");
 	cmd.args(["-sS", "-G", &realm]);
 	cmd.args(["--data-urlencode", &format!("service={service}")]);
@@ -244,7 +246,12 @@ fn fetch_token(challenge: &str) -> Result<Option<String>> {
 /// `skopeo inspect` — daemon-free, honours docker credentials for private repos.
 fn resolve_via_skopeo(image: &str) -> Option<String> {
 	let out = Command::new("skopeo")
-		.args(["inspect", "--format", "{{.Digest}}", &format!("docker://{image}")])
+		.args([
+			"inspect",
+			"--format",
+			"{{.Digest}}",
+			&format!("docker://{image}"),
+		])
 		.output()
 		.ok()?;
 	if !out.status.success() {

@@ -329,7 +329,10 @@ pub(crate) fn one_input_lock(rev: &str, nar: &str) -> FlakeLock {
 		},
 	);
 	let mut inputs = BTreeMap::new();
-	inputs.insert("nixpkgs".to_string(), InputRef::Direct("nixpkgs".to_string()));
+	inputs.insert(
+		"nixpkgs".to_string(),
+		InputRef::Direct("nixpkgs".to_string()),
+	);
 	nodes.insert(
 		"root".to_string(),
 		Node {
@@ -363,12 +366,22 @@ mod tests {
 			Some(&InputRef::Direct("helper".to_string()))
 		);
 		// A duplicate name is rejected; `root` is reserved.
-		assert!(lock
-			.add_input("helper", Source::github_ref("o", "r", "x"), Source::github_ref("o", "r", "x"))
-			.is_err());
-		assert!(lock
-			.add_input("root", Source::github_ref("o", "r", "x"), Source::github_ref("o", "r", "x"))
-			.is_err());
+		assert!(
+			lock.add_input(
+				"helper",
+				Source::github_ref("o", "r", "x"),
+				Source::github_ref("o", "r", "x")
+			)
+			.is_err()
+		);
+		assert!(
+			lock.add_input(
+				"root",
+				Source::github_ref("o", "r", "x"),
+				Source::github_ref("o", "r", "x")
+			)
+			.is_err()
+		);
 	}
 
 	#[test]

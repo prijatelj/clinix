@@ -129,8 +129,9 @@ pub fn resolve_git(url: &str, git_ref: Option<&str>) -> Result<(Rev, NarHash)> {
 		cmd.args(["--rev", r]);
 	}
 	let out = run(cmd)?;
-	let json: serde_json::Value = serde_json::from_slice(&out.stdout)
-		.map_err(|e| ClinixError::Resolve(format!("nix-prefetch-git gave no JSON for {url}: {e}")))?;
+	let json: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+		ClinixError::Resolve(format!("nix-prefetch-git gave no JSON for {url}: {e}"))
+	})?;
 	let rev: Rev = json
 		.get("rev")
 		.and_then(|v| v.as_str())
@@ -140,10 +141,9 @@ pub fn resolve_git(url: &str, git_ref: Option<&str>) -> Result<(Rev, NarHash)> {
 	let nar_hash = match json.get("hash").and_then(|v| v.as_str()) {
 		Some(h) if h.starts_with("sha256-") => h.parse()?,
 		_ => {
-			let sha = json
-				.get("sha256")
-				.and_then(|v| v.as_str())
-				.ok_or_else(|| ClinixError::Resolve(format!("nix-prefetch-git: no sha256 for {url}")))?;
+			let sha = json.get("sha256").and_then(|v| v.as_str()).ok_or_else(|| {
+				ClinixError::Resolve(format!("nix-prefetch-git: no sha256 for {url}"))
+			})?;
 			to_sri(sha)?
 		}
 	};
@@ -248,7 +248,8 @@ pub fn invalid_paths(paths: &[String]) -> Result<Vec<String>> {
 		return Ok(Vec::new());
 	}
 	let mut cmd = Command::new("nix-store");
-	cmd.args(["--check-validity", "--print-invalid"]).args(paths);
+	cmd.args(["--check-validity", "--print-invalid"])
+		.args(paths);
 	Ok(stdout_string(&run(cmd)?)
 		.lines()
 		.filter(|l| !l.is_empty())

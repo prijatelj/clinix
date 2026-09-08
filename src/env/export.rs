@@ -184,4 +184,3 @@ fn ensure_built(what: &str, paths: &[String]) -> Result<()> {
 	}
 	Ok(())
 }
-

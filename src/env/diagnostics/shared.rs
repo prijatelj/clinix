@@ -92,7 +92,11 @@ fn analyze_sharing(sets: &[(String, BTreeSet<PathBuf>)]) -> SharingReport {
 			.filter(|(j, _)| *j != i)
 			.flat_map(|(_, (_, s))| s.iter())
 			.collect();
-		let only: Vec<PathBuf> = set.iter().filter(|p| !others.contains(p)).cloned().collect();
+		let only: Vec<PathBuf> = set
+			.iter()
+			.filter(|p| !others.contains(p))
+			.cloned()
+			.collect();
 		unique.push((name.clone(), only.len()));
 		unique_paths.push((name.clone(), only));
 	}
@@ -105,7 +109,11 @@ fn analyze_sharing(sets: &[(String, BTreeSet<PathBuf>)]) -> SharingReport {
 				continue;
 			}
 			let inter = sa.intersection(sb).count();
-			let pct = if sa.is_empty() { 0 } else { inter * 100 / sa.len() };
+			let pct = if sa.is_empty() {
+				0
+			} else {
+				inter * 100 / sa.len()
+			};
 			matrix.push((a.clone(), b.clone(), pct));
 		}
 	}
@@ -148,7 +156,11 @@ mod tests {
 		assert_eq!(r.unique[0], ("a".to_string(), 1));
 		assert_eq!(r.unique[1], ("b".to_string(), 1)); // b1
 		// a∩b = {common} = 1 of a's 3 → 33%.
-		let ab = r.matrix.iter().find(|(x, y, _)| x == "a" && y == "b").unwrap();
+		let ab = r
+			.matrix
+			.iter()
+			.find(|(x, y, _)| x == "a" && y == "b")
+			.unwrap();
 		assert_eq!(ab.2, 33);
 	}
 

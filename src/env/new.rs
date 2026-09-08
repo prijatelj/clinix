@@ -388,7 +388,13 @@ fn render_composed_shell(seeds: &[(String, PathBuf)], label: &str, with_config: 
 	} else {
 		""
 	};
-	crate::env::nix_expr::compose_shell("./flake.lock", config, &label.replace(' ', "-"), &imports, label)
+	crate::env::nix_expr::compose_shell(
+		"./flake.lock",
+		config,
+		&label.replace(' ', "-"),
+		&imports,
+		label,
+	)
 }
 
 #[cfg(test)]
@@ -398,7 +404,10 @@ mod tests {
 	#[test]
 	fn decide_lock_covers_the_coherence_table() {
 		// No pin → establish; identical → reuse (regardless of flags).
-		assert_eq!(decide_lock(false, false, false, false), LockAction::Establish);
+		assert_eq!(
+			decide_lock(false, false, false, false),
+			LockAction::Establish
+		);
 		assert_eq!(decide_lock(true, true, false, false), LockAction::Reuse);
 		// Differs → conflict, unless a resolution flag is given.
 		assert_eq!(decide_lock(true, false, false, false), LockAction::Conflict);

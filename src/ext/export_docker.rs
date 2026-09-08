@@ -53,7 +53,10 @@ pub fn run(names: &[String], opts: Opts, ctx: &Context) -> Result<()> {
 		.name
 		.clone()
 		.unwrap_or_else(|| crate::env::naming::slug(&comp.label, true, true, Some("env")));
-	let outdir = opts.out.clone().unwrap_or_else(|| PathBuf::from("containers"));
+	let outdir = opts
+		.out
+		.clone()
+		.unwrap_or_else(|| PathBuf::from("containers"));
 	std::fs::create_dir_all(&outdir)?;
 
 	match &opts.from {
@@ -74,13 +77,7 @@ pub fn run(names: &[String], opts: Opts, ctx: &Context) -> Result<()> {
 
 /// The nix-base path: write `docker-base.nix` (a complete `streamLayeredImage`),
 /// then `--build`/`--load` it.
-fn nix_base(
-	shell_file: &Path,
-	lock: &Path,
-	image: &str,
-	opts: &Opts,
-	outdir: &Path,
-) -> Result<()> {
+fn nix_base(shell_file: &Path, lock: &Path, image: &str, opts: &Opts, outdir: &Path) -> Result<()> {
 	let base_nix = outdir.join("docker-base.nix");
 	std::fs::write(
 		&base_nix,
@@ -140,7 +137,10 @@ fn from_base(base: &str, image: &str, opts: &Opts, outdir: &Path) -> Result<()> 
 
 /// `nix-build <file> --no-out-link` → the streamer script's store path.
 fn nix_build(file: &Path) -> Result<String> {
-	let out = Command::new("nix-build").arg(file).arg("--no-out-link").output()?;
+	let out = Command::new("nix-build")
+		.arg(file)
+		.arg("--no-out-link")
+		.output()?;
 	if !out.status.success() {
 		return Err(ClinixError::Config(format!(
 			"nix-build failed:\n{}",
@@ -172,7 +172,9 @@ fn stream_to(streamer: &str, out: &Path) -> Result<()> {
 		.arg(format!("{streamer} > {}", shell_quote(out)))
 		.status()?;
 	if !status.success() {
-		return Err(ClinixError::Config("streaming the image tarball failed".to_string()));
+		return Err(ClinixError::Config(
+			"streaming the image tarball failed".to_string(),
+		));
 	}
 	Ok(())
 }
@@ -185,7 +187,10 @@ fn render_base_nix(lock: &Path, shell_file: &Path, name: &str, include: &[PathBu
 	let includes: String = include
 		.iter()
 		.map(|p| {
-			let base = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+			let base = p
+				.file_name()
+				.map(|s| s.to_string_lossy().into_owned())
+				.unwrap_or_default();
 			// A bare path literal interpolates to a store path (copies the file in).
 			format!("    cp -a ${{{}}} ./{base}\n", p.display())
 		})
@@ -208,7 +213,10 @@ fn render_dockerfile(pinned_base: &str, include: &[PathBuf]) -> String {
 		 FROM {pinned_base}\nWORKDIR /workspace\n"
 	);
 	for p in include {
-		let base = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+		let base = p
+			.file_name()
+			.map(|s| s.to_string_lossy().into_owned())
+			.unwrap_or_default();
 		df.push_str(&format!("COPY {base} ./{base}\n"));
 	}
 	df
@@ -278,8 +286,16 @@ mod tests {
 
 	#[test]
 	fn render_base_nix_without_includes_has_empty_extra_commands() {
-		let s = render_base_nix(Path::new("/e/flake.lock"), Path::new("/e/shell.nix"), "x", &[]);
-		assert!(s.contains("extraCommands = ''\n  '';"), "empty include block");
+		let s = render_base_nix(
+			Path::new("/e/flake.lock"),
+			Path::new("/e/shell.nix"),
+			"x",
+			&[],
+		);
+		assert!(
+			s.contains("extraCommands = ''\n  '';"),
+			"empty include block"
+		);
 	}
 
 	#[test]

@@ -45,7 +45,10 @@ pub enum Resolved<'a> {
 	/// A bare name matched several seeds; `chosen` is the highest-precedence one
 	/// (first source wins), `others` are the shadowed matches (for a warning that
 	/// names the `namespace:name` form to select them).
-	Collision { chosen: &'a Seed, others: Vec<&'a Seed> },
+	Collision {
+		chosen: &'a Seed,
+		others: Vec<&'a Seed>,
+	},
 }
 
 /// All seeds discovered across the configured sources, in precedence order
@@ -92,16 +95,27 @@ impl Catalog {
 		if others.is_empty() {
 			Some(Resolved::One(first))
 		} else {
-			Some(Resolved::Collision { chosen: first, others })
+			Some(Resolved::Collision {
+				chosen: first,
+				others,
+			})
 		}
 	}
 
-	fn add_source(&mut self, source: &SeedSource, config_ignore: &[String], default_ns: Option<&str>) {
+	fn add_source(
+		&mut self,
+		source: &SeedSource,
+		config_ignore: &[String],
+		default_ns: Option<&str>,
+	) {
 		let path = expand_tilde(&source.path);
 		if path.is_dir() {
 			// A source's own namespace wins; otherwise inherit the config default
 			// (`"seeds"` unless overridden or set to none).
-			let namespace = source.namespace.clone().or_else(|| default_ns.map(String::from));
+			let namespace = source
+				.namespace
+				.clone()
+				.or_else(|| default_ns.map(String::from));
 			let mut ignore = config_ignore.to_vec();
 			ignore.extend(read_clinix_ignore(&path));
 			// Recursively collect `*.nix` under the source, deterministically. A
@@ -131,7 +145,10 @@ impl Catalog {
 		} else if path.is_file() {
 			// An explicitly named file is not subject to ignore globs (the user
 			// pointed at it directly).
-			let namespace = source.namespace.clone().or_else(|| default_ns.map(String::from));
+			let namespace = source
+				.namespace
+				.clone()
+				.or_else(|| default_ns.map(String::from));
 			self.add_file(&path, &namespace);
 		} else {
 			self.warnings
@@ -193,7 +210,10 @@ fn looks_like_flake(root: &SyntaxNode) -> bool {
 	}
 	top.children()
 		.filter(|n| n.kind() == SyntaxKind::NODE_ATTRPATH_VALUE)
-		.filter_map(|av| av.children().find(|c| c.kind() == SyntaxKind::NODE_ATTRPATH))
+		.filter_map(|av| {
+			av.children()
+				.find(|c| c.kind() == SyntaxKind::NODE_ATTRPATH)
+		})
 		.any(|p| p.text().to_string().trim() == "outputs")
 }
 
@@ -292,8 +312,7 @@ mod tests {
 	}
 
 	const FRAGMENT: &str = "{ pkgs }: pkgs.mkShell { packages = with pkgs; [ ripgrep ]; }\n";
-	const FLAKE: &str =
-		"{\n  inputs.nixpkgs.url = \"github:NixOS/nixpkgs\";\n  outputs = { self, nixpkgs }: { };\n}\n";
+	const FLAKE: &str = "{\n  inputs.nixpkgs.url = \"github:NixOS/nixpkgs\";\n  outputs = { self, nixpkgs }: { };\n}\n";
 
 	#[test]
 	fn classify_distinguishes_shell_flake_and_invalid() {
@@ -368,7 +387,11 @@ mod tests {
 		names.sort();
 		// `go` comes from the lang/ subdir; lib/ + _helper are ignored.
 		assert_eq!(names, vec!["claude", "go", "rust"]);
-		assert!(cat.seeds.iter().all(|s| s.namespace.as_deref() == Some("dev")));
+		assert!(
+			cat.seeds
+				.iter()
+				.all(|s| s.namespace.as_deref() == Some("dev"))
+		);
 		// flake.nix + broken.nix warn; ignored files are silent.
 		assert_eq!(cat.warnings.len(), 2, "warnings: {:?}", cat.warnings);
 		assert!(cat.warnings.iter().any(|w| w.contains("flake")));
@@ -386,12 +409,21 @@ mod tests {
 		let expr = compose_expr(&lock, &imports, "rust proj", None);
 		assert!(expr.contains("builtins.readFile \"/cfg/flake.lock\""));
 		assert!(expr.contains("import \"/s/rust.nix\" { inherit pkgs; }"));
-		assert!(expr.contains("import \"/proj/shell.nix\" { }"), "self-contained: no inject");
+		assert!(
+			expr.contains("import \"/proj/shell.nix\" { }"),
+			"self-contained: no inject"
+		);
 		// composition order preserved (caller sorts lexically or honors -o).
 		assert!(expr.find("/s/rust.nix").unwrap() < expr.find("/proj/shell.nix").unwrap());
 		assert!(expr.contains("inputsFrom"));
-		assert!(expr.contains("name = \"rust-proj\";"), "sanitized store name");
-		assert!(!expr.contains("config = import"), "no nixpkgs config by default");
+		assert!(
+			expr.contains("name = \"rust-proj\";"),
+			"sanitized store name"
+		);
+		assert!(
+			!expr.contains("config = import"),
+			"no nixpkgs config by default"
+		);
 
 		// A nixpkgs config file is applied to the nixpkgs import (allowUnfree etc.).
 		let cfg = PathBuf::from("/cfg/nixpkgs-config.nix");
@@ -409,7 +441,10 @@ mod tests {
 
 		// Source `a` (namespace "a-ns") is higher precedence than `b` ("two").
 		let settings = SeedSettings {
-			sources: vec![source(a.path(), Some("a-ns")), source(b.path(), Some("two"))],
+			sources: vec![
+				source(a.path(), Some("a-ns")),
+				source(b.path(), Some("two")),
+			],
 			ignore: vec![],
 			namespace: None,
 		};

@@ -10,7 +10,8 @@
 mod common;
 
 use common::{
-	ChrootStore, Project, can_import_store, have_nix, missing_in_store, nix_shell_run, runtime_paths,
+	ChrootStore, Project, can_import_store, have_nix, missing_in_store, nix_shell_run,
+	runtime_paths,
 };
 use predicates::prelude::*;
 
@@ -82,7 +83,9 @@ fn init_flake_wraps_shell_nix() {
 		return;
 	}
 	let p = Project::new();
-	p.clinix(&["env", "init", ".", "--flake"]).assert().success();
+	p.clinix(&["env", "init", ".", "--flake"])
+		.assert()
+		.success();
 	let flake = std::fs::read_to_string(p.file("flake.nix")).unwrap();
 	assert!(flake.contains("import ./shell.nix"));
 }
@@ -182,10 +185,17 @@ fn closure_export_writes_a_nonempty_archive() {
 		.success();
 
 	let archive = p.path().join("env.closure");
-	p.clinix(&["env", "export", "closure", "--out", archive.to_str().unwrap(), "."])
-		.assert()
-		.success()
-		.stdout(predicate::str::contains("store paths"));
+	p.clinix(&[
+		"env",
+		"export",
+		"closure",
+		"--out",
+		archive.to_str().unwrap(),
+		".",
+	])
+	.assert()
+	.success()
+	.stdout(predicate::str::contains("store paths"));
 	assert!(archive.is_file(), "the .closure archive exists");
 	assert!(
 		archive.metadata().unwrap().len() > 0,
@@ -212,9 +222,16 @@ fn closure_import_round_trips_into_the_registry() {
 		.assert()
 		.success();
 	let archive = p.path().join("env.closure");
-	p.clinix(&["env", "export", "closure", "--out", archive.to_str().unwrap(), "."])
-		.assert()
-		.success();
+	p.clinix(&[
+		"env",
+		"export",
+		"closure",
+		"--out",
+		archive.to_str().unwrap(),
+		".",
+	])
+	.assert()
+	.success();
 
 	// Import carries over the env's own shell.nix + flake.lock (as the user would).
 	p.clinix(&[
@@ -259,16 +276,34 @@ fn closure_export_default_is_offline_sufficient_packages_is_the_delta() {
 	// Two exports from the same built env: default (complete) vs --packages (delta).
 	let full = p.path().join("full.closure");
 	let delta = p.path().join("delta.closure");
-	p.clinix(&["env", "export", "closure", "--out", full.to_str().unwrap(), "."])
-		.assert()
-		.success();
-	p.clinix(&["env", "export", "closure", "--out", delta.to_str().unwrap(), "--packages", "."])
-		.assert()
-		.success();
+	p.clinix(&[
+		"env",
+		"export",
+		"closure",
+		"--out",
+		full.to_str().unwrap(),
+		".",
+	])
+	.assert()
+	.success();
+	p.clinix(&[
+		"env",
+		"export",
+		"closure",
+		"--out",
+		delta.to_str().unwrap(),
+		"--packages",
+		".",
+	])
+	.assert()
+	.success();
 	// The delta is strictly smaller — it omits the base.
 	let full_sz = std::fs::metadata(&full).unwrap().len();
 	let delta_sz = std::fs::metadata(&delta).unwrap().len();
-	assert!(delta_sz < full_sz, "packages-only ({delta_sz}) < complete env ({full_sz})");
+	assert!(
+		delta_sz < full_sz,
+		"packages-only ({delta_sz}) < complete env ({full_sz})"
+	);
 
 	// The full runtime set required to enter the shell (from the ambient store).
 	let req = runtime_paths(&p.file("shell.nix"));
@@ -366,18 +401,33 @@ fn flake_add_github_input_then_rm_round_trips() {
 		.success();
 	// A tiny, stable public repo.
 	p.clinix(&[
-		"env", "flake", ".", "add", "github", "numtide", "flake-utils", "-b", "main",
+		"env",
+		"flake",
+		".",
+		"add",
+		"github",
+		"numtide",
+		"flake-utils",
+		"-b",
+		"main",
 	])
 	.assert()
 	.success()
 	.stdout(predicate::str::contains("added input `flake-utils`"));
 	let lock = std::fs::read_to_string(p.file("flake.lock")).unwrap();
-	assert!(lock.contains("\"repo\": \"flake-utils\""), "input added to the lock");
+	assert!(
+		lock.contains("\"repo\": \"flake-utils\""),
+		"input added to the lock"
+	);
 	// And remove it (pure edit).
 	p.clinix(&["env", "flake", ".", "rm", "flake-utils"])
 		.assert()
 		.success();
-	assert!(!std::fs::read_to_string(p.file("flake.lock")).unwrap().contains("flake-utils"));
+	assert!(
+		!std::fs::read_to_string(p.file("flake.lock"))
+			.unwrap()
+			.contains("flake-utils")
+	);
 }
 
 /// The **shared-`flake.lock` project ∪ dev union**: the cwd project (its own
@@ -435,12 +485,18 @@ fn export_closure_of_a_union_of_seeds() {
 		.assert()
 		.success();
 	let archive = p.path().join("union.closure");
-	p.clinix(&["env", "export", "closure", "--out", archive.to_str().unwrap(), "tool", "data"])
-		.assert()
-		.success()
-		.stdout(
-			predicate::str::contains("tool data").and(predicate::str::contains("store paths")),
-		);
+	p.clinix(&[
+		"env",
+		"export",
+		"closure",
+		"--out",
+		archive.to_str().unwrap(),
+		"tool",
+		"data",
+	])
+	.assert()
+	.success()
+	.stdout(predicate::str::contains("tool data").and(predicate::str::contains("store paths")));
 	assert!(archive.is_file() && archive.metadata().unwrap().len() > 0);
 }
 
@@ -473,7 +529,10 @@ fn export_docker_nix_base_builds_an_image_tarball() {
 	.success()
 	.stdout(predicate::str::contains("image tarball"));
 	let tar = out.join("testimg.tar");
-	assert!(tar.is_file() && tar.metadata().unwrap().len() > 0, "image tar produced");
+	assert!(
+		tar.is_file() && tar.metadata().unwrap().len() > 0,
+		"image tar produced"
+	);
 }
 
 /// `new --from` materializes a seed stack into a **portable** registry env
@@ -523,7 +582,10 @@ fn run_is_exit_transparent_and_roots_the_env_on_entry() {
 		.expect("roots dir should exist after entering an env")
 		.filter_map(Result::ok)
 		.any(|e| e.file_name().to_string_lossy().starts_with("proj-"));
-	assert!(has_proj_root, "entering the env must create a proj-* GC root");
+	assert!(
+		has_proj_root,
+		"entering the env must create a proj-* GC root"
+	);
 
 	// Exit-transparency: a nonzero command propagates its *exact* code, not a
 	// blanket failure (false → 1; `exit 3` → 3).
@@ -569,7 +631,9 @@ fn new_register_non_copy_runs_the_referenced_shell() {
 		return;
 	}
 	let p = Project::new();
-	p.clinix(&["env", "init", "src", "-p", "ripgrep"]).assert().success();
+	p.clinix(&["env", "init", "src", "-p", "ripgrep"])
+		.assert()
+		.success();
 	p.clinix(&["env", "new", "tools", "--from", "src"])
 		.assert()
 		.success()
@@ -589,7 +653,9 @@ fn new_register_member_runs_sharing_the_namespace_pin() {
 		return;
 	}
 	let p = Project::new();
-	p.clinix(&["env", "init", "src", "-p", "ripgrep"]).assert().success();
+	p.clinix(&["env", "init", "src", "-p", "ripgrep"])
+		.assert()
+		.success();
 	p.clinix(&["env", "new", "proj:dev", "--from", "src"])
 		.assert()
 		.success()

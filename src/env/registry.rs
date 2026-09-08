@@ -173,6 +173,9 @@ mod tests {
 		assert!(validate_name("..").is_err());
 		assert!(validate_name("a/b").is_err());
 		assert!(validate_name("2fast").is_err(), "no leading digit");
-		assert!(validate_name("ns:member").is_err(), "`:` is the member separator");
+		assert!(
+			validate_name("ns:member").is_err(),
+			"`:` is the member separator"
+		);
 	}
 }

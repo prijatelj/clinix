@@ -13,7 +13,10 @@ pub fn clean(target: Target, context: &Context) -> Result<()> {
 	if registry::clean(&context.config, &env)? {
 		println!("clinix: released GC root for `{}`", target.name);
 	} else {
-		println!("clinix: `{}` had no GC root (nothing to release)", target.name);
+		println!(
+			"clinix: `{}` had no GC root (nothing to release)",
+			target.name
+		);
 	}
 	Ok(())
 }

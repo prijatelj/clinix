@@ -458,10 +458,14 @@ fn flake_rm(name: &str, input: &str, context: &Context) -> Result<()> {
 	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
 	require_flake_lock(&project.env, "env flake rm")?;
 	if !project.lock.remove_input(input) {
-		return Err(ClinixError::Resolve(format!("no input `{input}` in this env")));
+		return Err(ClinixError::Resolve(format!(
+			"no input `{input}` in this env"
+		)));
 	}
 	if input == "nixpkgs" {
-		eprintln!("clinix: warning: removed `nixpkgs` — this env's shell.nix almost certainly needs it");
+		eprintln!(
+			"clinix: warning: removed `nixpkgs` — this env's shell.nix almost certainly needs it"
+		);
 	}
 	project.save_lock()?;
 	println!("removed input `{input}`");

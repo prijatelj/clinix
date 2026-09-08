@@ -1,15 +1,14 @@
-//! Top-level command tree and dispatch.
+//! Command Line Interface: command tree and dispatch.
 //!
-//! Grammar (decided 2026-08-27):
-//! - Canonical, verb-first: `clinix env <verb> [names…] [args]`.
-//! - System: `clinix sys <verb> …`.
+//! ## Grammar:
+//! - top level commands: sys, env, info, config, completions, man
+//! - Verb-first: `clinix env <verb> [names…] [args]`.
 //! - Sugar (the common case): a bare name list `clinix <names…>` is captured by
 //!   clap's `external_subcommand` and routed to `env shell <names…>`. This form
 //!   is *terminal* — no verb may follow the names — which is why it is
 //!   unambiguous despite the variadic name list.
-//! - `clinix` with no args prints help — it does **not** enter the cwd project
-//!   (that one case breaks the `clinix X` ≡ `env shell X` shorthand deliberately).
-//!   Enter the cwd project explicitly with `clinix .` or `clinix env shell`.
+//! 	- `clinix` with no args prints help — it does **not** enter the cwd
+//!			project, unlike `clinix env shell`. Use `clinix .` at top level.
 //!
 //! Global flags (`-o`, `-r`, `-v`) are declared once here and read by whichever
 //! command needs them, so the sugar form can still pass the common options that
@@ -163,7 +162,10 @@ impl Cli {
 					Ok(())
 				}
 				ConfigVerb::Path => {
-					println!("{}", context.config.config_dir.join("config.toml").display());
+					println!(
+						"{}",
+						context.config.config_dir.join("config.toml").display()
+					);
 					Ok(())
 				}
 				ConfigVerb::State => {

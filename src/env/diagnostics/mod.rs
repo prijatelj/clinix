@@ -187,9 +187,7 @@ fn report_active(context: &Context) -> Result<()> {
 				}
 				.run(context)
 			} else {
-				println!(
-					"not in a nix shell, and no project (shell.nix/flake.lock) in the cwd"
-				);
+				println!("not in a nix shell, and no project (shell.nix/flake.lock) in the cwd");
 				Ok(())
 			}
 		}
@@ -232,7 +230,10 @@ fn report_active_shell(kind: &ShellKind) {
 	let shadow = if audit.shadowing.is_empty() {
 		String::new()
 	} else {
-		format!(" — {} host dir(s) shadow pinned tools (clinix info check)", audit.shadowing.len())
+		format!(
+			" — {} host dir(s) shadow pinned tools (clinix info check)",
+			audit.shadowing.len()
+		)
 	};
 	println!(
 		"  PATH        {} store / {} host entries{shadow}",
@@ -248,7 +249,9 @@ fn provided_packages() -> Vec<String> {
 	let mut seen = BTreeSet::new();
 	let mut out = Vec::new();
 	for var in ["buildInputs", "nativeBuildInputs", "propagatedBuildInputs"] {
-		let Ok(val) = std::env::var(var) else { continue };
+		let Ok(val) = std::env::var(var) else {
+			continue;
+		};
 		for path in val.split_whitespace() {
 			let label = store_label(path);
 			if seen.insert(label.clone()) {

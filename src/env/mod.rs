@@ -29,12 +29,12 @@ pub mod project;
 pub mod registry;
 pub mod seeds;
 
-pub(crate) use env::{compose_nodes, launch};
+pub use diagnostics::{Deps, Info, InfoVerb, context_report};
 pub use env::{
 	Cmd, Context, Env, EnvArgs, Kind, OptionalTarget, Rename, RunCmd, ShellOptions, Target,
 	Targets, resolve,
 };
-pub use diagnostics::{Deps, Info, InfoVerb, context_report};
+pub(crate) use env::{compose_nodes, launch};
 pub use execution::{Run, Shell};
 pub use export::{Export, ExportTarget};
 pub use import::Import;

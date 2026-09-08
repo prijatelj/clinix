@@ -244,11 +244,15 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 		}
 		[Node::File { path }] => {
 			let slug = path.to_string_lossy().replace('/', "_");
-			let lock = path.parent().map(|d| d.join("flake.lock")).filter(|l| l.is_file());
+			let lock = path
+				.parent()
+				.map(|d| d.join("flake.lock"))
+				.filter(|l| l.is_file());
 			return Ok(Composition {
 				shell_file: path.clone(),
 				label: file_label(path),
-				root: registry::roots_dir(cfg).join(format!("file-{}", slug.trim_start_matches('_'))),
+				root: registry::roots_dir(cfg)
+					.join(format!("file-{}", slug.trim_start_matches('_'))),
 				lock,
 			});
 		}
@@ -500,7 +504,9 @@ pub(crate) fn seed_lock(cfg: &Config, settings: &crate::env::config::Settings) -
 /// `allowUnfree` predicate), expanded and validated to exist. `None` when unset —
 /// clinix then passes no explicit config, so nixpkgs uses its default
 /// (`~/.config/nixpkgs/config.nix`).
-pub(crate) fn nixpkgs_config_path(settings: &crate::env::config::Settings) -> Result<Option<PathBuf>> {
+pub(crate) fn nixpkgs_config_path(
+	settings: &crate::env::config::Settings,
+) -> Result<Option<PathBuf>> {
 	match &settings.env.nixpkgs_config {
 		Some(p) => {
 			let path = crate::env::config::expand_tilde(p);

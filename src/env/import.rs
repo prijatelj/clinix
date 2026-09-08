@@ -72,7 +72,9 @@ impl RunCmd for Import {
 						"clinix: warning: nix refused the closure import \
 						 (multi-user store, untrusted user)."
 					);
-					eprintln!("  the env is still registered; finish the store load with vanilla nix:");
+					eprintln!(
+						"  the env is still registered; finish the store load with vanilla nix:"
+					);
 					eprintln!("    sudo nix-store --import < {}", self.source.display());
 				} else {
 					return Err(e);

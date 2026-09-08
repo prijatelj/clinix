@@ -81,7 +81,10 @@ mod tests {
 	fn slug_variants_cover_filename_image_and_key_segment() {
 		// Filename slug (export closure): trim + "env" fallback, `.`→`_`.
 		assert_eq!(slug("python", false, false, Some("env")), "python");
-		assert_eq!(slug("rust claude", false, false, Some("env")), "rust_claude");
+		assert_eq!(
+			slug("rust claude", false, false, Some("env")),
+			"rust_claude"
+		);
 		assert_eq!(slug("my.proj", false, false, Some("env")), "my_proj");
 		assert_eq!(slug("///", false, false, Some("env")), "env");
 		// Docker image name: lowercased, `.` kept.

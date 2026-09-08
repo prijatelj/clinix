@@ -25,7 +25,11 @@ pub fn check(target: OptionalTarget, context: &Context) -> Result<()> {
 		"  derivation  {}",
 		std::env::var("name").unwrap_or_else(|_| "<unset>".into())
 	);
-	println!("  env         {} ({})", env.root.display(), kind_str(env.kind));
+	println!(
+		"  env         {} ({})",
+		env.root.display(),
+		kind_str(env.kind)
+	);
 
 	println!("\n== pinned sources (flake.lock)");
 	match Project::load(env.clone()) {

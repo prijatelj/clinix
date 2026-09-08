@@ -14,7 +14,9 @@ use super::{kind_str, nixpkgs_pin};
 /// `nix-instantiate --eval` — clinix owns no version-list file (plan decision 4 /
 /// `version-pinning.md` D2). `--json` emits the machine-readable form.
 #[derive(Args, Debug)]
-#[command(after_help = "See `clinix env list` for the environment registry (registered envs + seeds).")]
+#[command(
+	after_help = "See `clinix env list` for the environment registry (registered envs + seeds)."
+)]
 pub struct Info {
 	/// Env to summarize (name, path, or `.`); defaults to the cwd project.
 	pub name: Option<String>,

@@ -70,12 +70,7 @@ impl Config {
 /// `$HOME/<home_rel>/clinix` → a cwd-local fallback. A direct override
 /// (`flag`/`CLINIX_*`) *is* the clinix dir; an XDG/HOME base gets `clinix`
 /// appended. Empty env vars are ignored (treated as unset, per the XDG spec).
-fn resolve_root(
-	flag: Option<PathBuf>,
-	direct_var: &str,
-	xdg_var: &str,
-	home_rel: &str,
-) -> PathBuf {
+fn resolve_root(flag: Option<PathBuf>, direct_var: &str, xdg_var: &str, home_rel: &str) -> PathBuf {
 	if let Some(dir) = flag {
 		return dir;
 	}
@@ -215,7 +210,10 @@ impl<'de> Deserialize<'de> for SeedSource {
 		}
 		use serde::de::Error;
 		Ok(match Repr::deserialize(deserializer)? {
-			Repr::Path(path) => SeedSource { path, namespace: None },
+			Repr::Path(path) => SeedSource {
+				path,
+				namespace: None,
+			},
 			Repr::Table { path, namespace } => {
 				if let Some(ns) = &namespace {
 					crate::env::naming::validate_namespace(ns).map_err(D::Error::custom)?;
@@ -369,10 +367,10 @@ fn load_config_file(path: &Path, stack: &mut Vec<PathBuf>) -> Result<Settings> {
 			path.display()
 		)));
 	}
-	let text =
-		fs::read_to_string(path).map_err(|e| ClinixError::Config(format!("{}: {e}", path.display())))?;
-	let this: Settings =
-		toml::from_str(&text).map_err(|e| ClinixError::Config(format!("{}: {e}", path.display())))?;
+	let text = fs::read_to_string(path)
+		.map_err(|e| ClinixError::Config(format!("{}: {e}", path.display())))?;
+	let this: Settings = toml::from_str(&text)
+		.map_err(|e| ClinixError::Config(format!("{}: {e}", path.display())))?;
 
 	stack.push(canon);
 	// Imports are the base, merged left→right (later `use` wins); the local file
@@ -407,7 +405,9 @@ fn resolve_import(from: &Path, target: &Path) -> PathBuf {
 	if expanded.is_absolute() {
 		expanded
 	} else {
-		from.parent().unwrap_or_else(|| Path::new(".")).join(expanded)
+		from.parent()
+			.unwrap_or_else(|| Path::new("."))
+			.join(expanded)
 	}
 }
 
@@ -512,16 +512,29 @@ sources = [ "~/a/shells", { path = "~/b/seeds", namespace = "bee" }, "/abs/one.n
 		};
 		// Absent and `false` are the same — None (no namespace).
 		assert_eq!(
-			load("[env.seeds]\nsources = []\n").unwrap().env.seeds.namespace,
+			load("[env.seeds]\nsources = []\n")
+				.unwrap()
+				.env
+				.seeds
+				.namespace,
 			None
 		);
 		assert_eq!(
-			load("[env.seeds]\nnamespace = false\n").unwrap().env.seeds.namespace,
+			load("[env.seeds]\nnamespace = false\n")
+				.unwrap()
+				.env
+				.seeds
+				.namespace,
 			None
 		);
 		// A custom string is validated and used.
 		assert_eq!(
-			load("[env.seeds]\nnamespace = \"mine\"\n").unwrap().env.seeds.namespace.as_deref(),
+			load("[env.seeds]\nnamespace = \"mine\"\n")
+				.unwrap()
+				.env
+				.seeds
+				.namespace
+				.as_deref(),
 			Some("mine")
 		);
 		// An invalid namespace (leading digit / `:`) is a load error.
@@ -587,7 +600,12 @@ sources = [ { path = "/local/b" } ]
 		] {
 			write(dir.path(), "config.toml", local);
 			assert_eq!(
-				Settings::load(dir.path()).unwrap().env.seeds.namespace.as_deref(),
+				Settings::load(dir.path())
+					.unwrap()
+					.env
+					.seeds
+					.namespace
+					.as_deref(),
 				Some("base"),
 				"None (unset/false) inherits base"
 			);
@@ -598,7 +616,12 @@ sources = [ { path = "/local/b" } ]
 			"use = [\"base.toml\"]\n[env.seeds]\nnamespace = \"local\"\nsources = []\n",
 		);
 		assert_eq!(
-			Settings::load(dir.path()).unwrap().env.seeds.namespace.as_deref(),
+			Settings::load(dir.path())
+				.unwrap()
+				.env
+				.seeds
+				.namespace
+				.as_deref(),
 			Some("local"),
 			"a local string overrides base"
 		);
@@ -637,7 +660,10 @@ sources = [ { path = "/local/b" } ]
 	#[test]
 	fn expand_tilde_expands_leading_tilde_only() {
 		if let Some(home) = std::env::var_os("HOME") {
-			assert_eq!(expand_tilde(Path::new("~/x")), PathBuf::from(home).join("x"));
+			assert_eq!(
+				expand_tilde(Path::new("~/x")),
+				PathBuf::from(home).join("x")
+			);
 		}
 		assert_eq!(expand_tilde(Path::new("/abs")), Path::new("/abs"));
 		assert_eq!(expand_tilde(Path::new("rel/x")), Path::new("rel/x"));

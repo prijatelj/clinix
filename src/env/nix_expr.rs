@@ -81,7 +81,13 @@ pkgs.mkShell {
 /// Assemble the `mkShell` composition: [`lock_prelude`] + [`MKSHELL_TAIL`] with the
 /// name/imports/label filled. Shared by seed-stack compose and `new` compose (they
 /// differ only in `lock_ref`/`config_frag` and how each builds `imports`).
-pub fn compose_shell(lock_ref: &str, config_frag: &str, name: &str, imports: &str, label: &str) -> String {
+pub fn compose_shell(
+	lock_ref: &str,
+	config_frag: &str,
+	name: &str,
+	imports: &str,
+	label: &str,
+) -> String {
 	let tail = MKSHELL_TAIL
 		.replace("@NAME@", name)
 		.replace("@IMPORTS@", imports)
@@ -114,11 +120,16 @@ mod tests {
 	fn lock_prelude_substitutes_lock_and_config() {
 		let p = lock_prelude("\"/cfg/flake.lock\"", " config = import \"/c.nix\";");
 		assert!(p.contains("builtins.readFile \"/cfg/flake.lock\""));
-		assert!(p.contains("import sources.nixpkgs { inherit system; config = import \"/c.nix\"; };"));
+		assert!(
+			p.contains("import sources.nixpkgs { inherit system; config = import \"/c.nix\"; };")
+		);
 		// A bare relative lock literal (composed env) is placed verbatim.
 		assert!(lock_prelude("./flake.lock", "").contains("builtins.readFile ./flake.lock"));
 		// Empty config leaves a bare `{ inherit system; }`.
-		assert!(lock_prelude("./flake.lock", "").contains("import sources.nixpkgs { inherit system; };"));
+		assert!(
+			lock_prelude("./flake.lock", "")
+				.contains("import sources.nixpkgs { inherit system; };")
+		);
 	}
 
 	#[test]
@@ -126,8 +137,13 @@ mod tests {
 		let imports = "    (import ./seeds/rust.nix { inherit pkgs; })";
 		let s = compose_shell("./flake.lock", "", "rust-claude", imports, "rust claude");
 		assert!(s.contains("builtins.readFile ./flake.lock"));
-		assert!(s.contains("inputsFrom = [\n    (import ./seeds/rust.nix { inherit pkgs; })\n  ];"));
+		assert!(
+			s.contains("inputsFrom = [\n    (import ./seeds/rust.nix { inherit pkgs; })\n  ];")
+		);
 		assert!(s.contains("name = \"rust-claude\";"));
-		assert!(s.contains("''rust claude''"), "un-sanitized label in the shellHook");
+		assert!(
+			s.contains("''rust claude''"),
+			"un-sanitized label in the shellHook"
+		);
 	}
 }

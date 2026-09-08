@@ -40,7 +40,9 @@ fn env_help_lists_the_command_group_legend() {
 		.assert()
 		.success()
 		.stdout(predicate::str::contains("Command groups:"))
-		.stdout(predicate::str::contains("diagnostics  list info deps shared check"))
+		.stdout(predicate::str::contains(
+			"diagnostics  list info deps shared check",
+		))
 		.stdout(predicate::str::contains("execution    shell run"));
 }
 
@@ -236,8 +238,14 @@ fn new_from_materializes_seeds_into_a_portable_registry_env() {
 	assert!(env.join("seeds/tool.nix").exists(), "seed copied in");
 	assert!(env.join("flake.lock").exists(), "pin lock copied in");
 	let shell = std::fs::read_to_string(env.join("shell.nix")).unwrap();
-	assert!(shell.contains("import ./seeds/tool.nix"), "unions the local copy");
-	assert!(shell.contains("builtins.readFile ./flake.lock"), "reads the local lock");
+	assert!(
+		shell.contains("import ./seeds/tool.nix"),
+		"unions the local copy"
+	);
+	assert!(
+		shell.contains("builtins.readFile ./flake.lock"),
+		"reads the local lock"
+	);
 }
 
 #[test]
@@ -255,8 +263,7 @@ fn new_from_a_non_seed_name_is_rejected() {
 // ---- new: register a single shell (dir/file source) — no nix needed ----------
 
 /// A clinix-style shell that reads its own `./flake.lock` (so lock detection fires).
-const SHELL_READS_LOCK: &str =
-	"{ sources ? (builtins.fromJSON (builtins.readFile ./flake.lock)), pkgs ? import <nixpkgs> {} }: pkgs.mkShell { }\n";
+const SHELL_READS_LOCK: &str = "{ sources ? (builtins.fromJSON (builtins.readFile ./flake.lock)), pkgs ? import <nixpkgs> {} }: pkgs.mkShell { }\n";
 
 /// Write a source project dir (`<name>/shell.nix` + `flake.lock`) under the cwd.
 fn write_source_project(p: &Project, name: &str, lock: &str) {
@@ -281,7 +288,10 @@ fn new_register_non_copy_references_source_and_establishes_pin() {
 	assert!(wrapper.contains("builtins.readFile ./flake.lock"));
 	// The source's lock is established as the namespace pin.
 	assert!(p.env_dir("myenv").join("flake.lock").is_file());
-	assert!(!p.env_dir("myenv").join("source.nix").exists(), "non-copy: no body copy");
+	assert!(
+		!p.env_dir("myenv").join("source.nix").exists(),
+		"non-copy: no body copy"
+	);
 }
 
 #[test]
@@ -292,7 +302,10 @@ fn new_register_copy_copies_the_shell_body() {
 		.assert()
 		.success()
 		.stdout(predicate::str::contains("copied"));
-	assert!(p.env_dir("myenv").join("source.nix").is_file(), "copy: body is copied in");
+	assert!(
+		p.env_dir("myenv").join("source.nix").is_file(),
+		"copy: body is copied in"
+	);
 	let wrapper = std::fs::read_to_string(p.env_dir("myenv").join("shell.nix")).unwrap();
 	assert!(wrapper.contains("import ./source.nix { inherit pkgs; }"));
 }
@@ -310,9 +323,14 @@ fn new_register_member_creates_empty_namespace_and_shares_the_pin() {
 	let member = p.env_dir("proj").join("dev").join("shell.nix");
 	assert!(member.is_file());
 	assert!(
-		std::fs::read_to_string(&member).unwrap().contains("builtins.readFile ../flake.lock")
+		std::fs::read_to_string(&member)
+			.unwrap()
+			.contains("builtins.readFile ../flake.lock")
 	);
-	assert!(p.env_dir("proj").join("flake.lock").is_file(), "shared pin at the namespace root");
+	assert!(
+		p.env_dir("proj").join("flake.lock").is_file(),
+		"shared pin at the namespace root"
+	);
 }
 
 #[test]
@@ -325,8 +343,14 @@ fn new_register_unpinned_source_warns() {
 		.success()
 		.stderr(predicate::str::contains("unpinned"));
 	let wrapper = std::fs::read_to_string(p.env_dir("myenv").join("shell.nix")).unwrap();
-	assert!(wrapper.contains("import ") && wrapper.contains("{ }"), "imported as-is");
-	assert!(!p.env_dir("myenv").join("flake.lock").exists(), "no pin established");
+	assert!(
+		wrapper.contains("import ") && wrapper.contains("{ }"),
+		"imported as-is"
+	);
+	assert!(
+		!p.env_dir("myenv").join("flake.lock").exists(),
+		"no pin established"
+	);
 }
 
 #[test]
@@ -337,16 +361,26 @@ fn new_register_lock_conflict_errors_then_overwrite_repins() {
 	write_source_project(&p, "a", common::MINIMAL_LOCK);
 	write_source_project(&p, "b", &other_lock);
 	// First member establishes the namespace pin.
-	p.clinix(&["env", "new", "proj:one", "--from", "a"]).assert().success();
+	p.clinix(&["env", "new", "proj:one", "--from", "a"])
+		.assert()
+		.success();
 	// Second member with a different lock → conflict error (no flag).
 	p.clinix(&["env", "new", "proj:two", "--from", "b"])
 		.assert()
 		.failure()
-		.stderr(predicate::str::contains("differs from namespace").and(predicate::str::contains("--overwrite")));
+		.stderr(
+			predicate::str::contains("differs from namespace")
+				.and(predicate::str::contains("--overwrite")),
+		);
 	// --overwrite repins the namespace to b's lock.
-	p.clinix(&["env", "new", "proj:two", "--from", "b", "--overwrite"]).assert().success();
+	p.clinix(&["env", "new", "proj:two", "--from", "b", "--overwrite"])
+		.assert()
+		.success();
 	let pin = std::fs::read_to_string(p.env_dir("proj").join("flake.lock")).unwrap();
-	assert!(pin.contains("fff0000000000000"), "namespace repinned to b's lock");
+	assert!(
+		pin.contains("fff0000000000000"),
+		"namespace repinned to b's lock"
+	);
 }
 
 #[test]
@@ -379,7 +413,9 @@ fn union_of_envs_with_differing_locks_is_rejected() {
 	p.clinix(&["env", "run", "a", "b", "--", "true"])
 		.assert()
 		.failure()
-		.stderr(predicate::str::contains("only a shared flake.lock is supported"));
+		.stderr(predicate::str::contains(
+			"only a shared flake.lock is supported",
+		));
 }
 
 #[test]
@@ -636,14 +672,11 @@ fn list_includes_seeds_from_the_catalog() {
 	let p = Project::new();
 	p.seed("codex", "{ pkgs }: pkgs.mkShell { }\n");
 	p.seed("pi", "{ pkgs }: pkgs.mkShell { }\n");
-	p.clinix(&["env", "list"])
-		.assert()
-		.success()
-		.stdout(
-			predicate::str::contains("seeds:")
-				.and(predicate::str::contains("codex"))
-				.and(predicate::str::contains("pi")),
-		);
+	p.clinix(&["env", "list"]).assert().success().stdout(
+		predicate::str::contains("seeds:")
+			.and(predicate::str::contains("codex"))
+			.and(predicate::str::contains("pi")),
+	);
 }
 
 #[test]
@@ -660,7 +693,10 @@ fn rename_moves_the_env_dir_and_its_gc_root() {
 		.stdout(predicate::str::contains("renamed"));
 
 	assert!(!p.env_dir("old").exists(), "old env dir gone");
-	assert!(p.env_dir("new").join("shell.nix").exists(), "new env dir present");
+	assert!(
+		p.env_dir("new").join("shell.nix").exists(),
+		"new env dir present"
+	);
 	// The rename-correctness invariant: the root followed the name.
 	assert!(!p.env_root_link("old").exists(), "old root gone");
 	assert!(p.env_root_link("new").exists(), "root re-keyed to new name");
@@ -722,7 +758,11 @@ fn clean_removes_the_gc_root_and_is_idempotent() {
 #[test]
 fn check_on_a_scaffold_reports_shell_lock_and_path_sections() {
 	let p = Project::new();
-	std::fs::write(p.file("shell.nix"), "pkgs.mkShell { packages = with pkgs; [ ]; }\n").unwrap();
+	std::fs::write(
+		p.file("shell.nix"),
+		"pkgs.mkShell { packages = with pkgs; [ ]; }\n",
+	)
+	.unwrap();
 	std::fs::write(p.file("flake.lock"), FLAKE_LOCK).unwrap();
 	p.clinix(&["env", "check"])
 		.assert()
@@ -836,10 +876,17 @@ fn export_docker_writes_a_base_nix_for_a_registry_env() {
 	let p = Project::new();
 	p.seed_registry_env("web", "{ pkgs }: pkgs.mkShell { }\n");
 	let out = p.path().join("containers");
-	p.clinix(&["env", "export", "docker", "web", "--out", out.to_str().unwrap()])
-		.assert()
-		.success()
-		.stdout(predicate::str::contains("docker-base.nix"));
+	p.clinix(&[
+		"env",
+		"export",
+		"docker",
+		"web",
+		"--out",
+		out.to_str().unwrap(),
+	])
+	.assert()
+	.success()
+	.stdout(predicate::str::contains("docker-base.nix"));
 	let base = std::fs::read_to_string(out.join("docker-base.nix")).unwrap();
 	assert!(base.contains("streamLayeredImage"));
 	assert!(base.contains("name = \"web\";"));

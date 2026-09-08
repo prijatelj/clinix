@@ -61,7 +61,11 @@ pub fn list(context: &Context) -> Result<()> {
 		println!("  {:<nw$}  {:<nsw$}  SOURCE", "NAME", "NAMESPACE");
 		for seed in &catalog.seeds {
 			let namespace = seed.namespace.as_deref().unwrap_or("");
-			println!("  {:<nw$}  {namespace:<nsw$}  {}", seed.name, seed.path.display());
+			println!(
+				"  {:<nw$}  {namespace:<nsw$}  {}",
+				seed.name,
+				seed.path.display()
+			);
 		}
 	}
 	Ok(())
