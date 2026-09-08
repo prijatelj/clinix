@@ -49,7 +49,10 @@ pub fn run(names: &[String], opts: Opts, ctx: &Context) -> Result<()> {
 	}
 
 	let comp = compose_nodes(ctx, names)?;
-	let image = opts.name.clone().unwrap_or_else(|| slug(&comp.label));
+	let image = opts
+		.name
+		.clone()
+		.unwrap_or_else(|| crate::env::naming::slug(&comp.label, true, true, Some("env")));
 	let outdir = opts.out.clone().unwrap_or_else(|| PathBuf::from("containers"));
 	std::fs::create_dir_all(&outdir)?;
 
@@ -243,28 +246,6 @@ fn shell_quote(path: &Path) -> String {
 	format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
-/// A filesystem-safe image name from a label (non-`[a-z0-9_.-]` → `_`, lowercased;
-/// docker image names must be lowercase).
-fn slug(label: &str) -> String {
-	let mapped: String = label
-		.chars()
-		.map(|c| {
-			let c = c.to_ascii_lowercase();
-			if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-				c
-			} else {
-				'_'
-			}
-		})
-		.collect();
-	let trimmed = mapped.trim_matches('_');
-	if trimmed.is_empty() {
-		"env".to_string()
-	} else {
-		trimmed.to_string()
-	}
-}
-
 fn tool_present(name: &str) -> bool {
 	Command::new(name)
 		.arg("--version")
@@ -276,13 +257,6 @@ fn tool_present(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn slug_is_lowercase_and_safe() {
-		assert_eq!(slug("Rust Claude"), "rust_claude");
-		assert_eq!(slug("my.env-1"), "my.env-1");
-		assert_eq!(slug("///"), "env");
-	}
 
 	#[test]
 	fn render_base_nix_wires_lock_shell_and_includes() {

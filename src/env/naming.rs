@@ -41,9 +41,57 @@ pub fn namespace_key(name: &str) -> String {
 	name.replace('-', "_")
 }
 
+/// Map an arbitrary label to a filesystem/identifier-safe **slug**: characters
+/// outside `[A-Za-z0-9_-]` (plus `.` when `dot`) become `_`, and `lowercase` folds
+/// case (Docker image names must be lowercase). With `fallback = Some(s)` the
+/// result is trimmed of surrounding `_` and replaced by `s` when it would be empty
+/// (a whole filename/name); `fallback = None` returns the raw mapping unchanged (a
+/// mid-key segment joined with others). Distinct from [`validate_namespace`], which
+/// *rejects* an ill-formed name rather than rewriting it.
+pub fn slug(label: &str, lowercase: bool, dot: bool, fallback: Option<&str>) -> String {
+	let mapped: String = label
+		.chars()
+		.map(|c| {
+			let c = if lowercase { c.to_ascii_lowercase() } else { c };
+			if c.is_ascii_alphanumeric() || c == '-' || c == '_' || (dot && c == '.') {
+				c
+			} else {
+				'_'
+			}
+		})
+		.collect();
+	match fallback {
+		Some(f) => {
+			let trimmed = mapped.trim_matches('_');
+			if trimmed.is_empty() {
+				f.to_string()
+			} else {
+				trimmed.to_string()
+			}
+		}
+		None => mapped,
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn slug_variants_cover_filename_image_and_key_segment() {
+		// Filename slug (export closure): trim + "env" fallback, `.`→`_`.
+		assert_eq!(slug("python", false, false, Some("env")), "python");
+		assert_eq!(slug("rust claude", false, false, Some("env")), "rust_claude");
+		assert_eq!(slug("my.proj", false, false, Some("env")), "my_proj");
+		assert_eq!(slug("///", false, false, Some("env")), "env");
+		// Docker image name: lowercased, `.` kept.
+		assert_eq!(slug("Rust Claude", true, true, Some("env")), "rust_claude");
+		assert_eq!(slug("my.env-1", true, true, Some("env")), "my.env-1");
+		assert_eq!(slug("///", true, true, Some("env")), "env");
+		// Key segment (compose filename): raw mapping, no trim/fallback.
+		assert_eq!(slug("a b", false, false, None), "a_b");
+		assert_eq!(slug("_x_", false, false, None), "_x_");
+	}
 
 	#[test]
 	fn validate_namespace_enforces_rust_identifier_shape() {

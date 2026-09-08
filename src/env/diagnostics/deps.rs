@@ -4,7 +4,7 @@
 use clap::Args;
 
 use crate::env::{Context, RunCmd, resolve};
-use crate::error::{ClinixError, Result};
+use crate::error::Result;
 
 use super::{human_bytes, kind_str};
 
@@ -22,13 +22,7 @@ pub struct Deps {
 impl RunCmd for Deps {
 	fn run(self, context: &Context) -> Result<()> {
 		let env = resolve(&context.config, self.name.as_deref())?;
-		let shell_nix = env.root.join("shell.nix");
-		if !shell_nix.is_file() {
-			return Err(ClinixError::Resolve(format!(
-				"no shell.nix at {} (run: clinix env init)",
-				env.root.display()
-			)));
-		}
+		let shell_nix = env.require_shell_nix()?;
 		let drv = crate::nix::instantiate(&shell_nix)?;
 		println!("env: {} ({})", env.root.display(), kind_str(env.kind));
 		println!("derivation: {drv}");

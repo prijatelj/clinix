@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::env::{Context, Targets, resolve};
-use crate::error::{ClinixError, Result};
+use crate::error::Result;
 
 use super::human_bytes;
 
@@ -18,13 +18,7 @@ pub fn shared(targets: Targets, context: &Context) -> Result<()> {
 	let mut sets: Vec<(String, BTreeSet<PathBuf>)> = Vec::new();
 	for name in &targets.names {
 		let env = resolve(&context.config, Some(name))?;
-		let shell_nix = env.root.join("shell.nix");
-		if !shell_nix.is_file() {
-			return Err(ClinixError::Resolve(format!(
-				"no shell.nix at {} (run: clinix env init)",
-				env.root.display()
-			)));
-		}
+		let shell_nix = env.require_shell_nix()?;
 		let drv = crate::nix::instantiate(&shell_nix)?;
 		let closure: BTreeSet<PathBuf> = crate::nix::closure(&drv)?
 			.into_iter()

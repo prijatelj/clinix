@@ -148,7 +148,12 @@ fn export_closure(
 		(outputs, "complete env")
 	};
 
-	let out = out.unwrap_or_else(|| PathBuf::from(format!("{}.closure", slug(&comp.label))));
+	let out = out.unwrap_or_else(|| {
+		PathBuf::from(format!(
+			"{}.closure",
+			crate::env::naming::slug(&comp.label, false, false, Some("env"))
+		))
+	});
 	if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
 		fs::create_dir_all(parent)?;
 	}
@@ -180,35 +185,3 @@ fn ensure_built(what: &str, paths: &[String]) -> Result<()> {
 	Ok(())
 }
 
-/// A filesystem-safe slug for an export label (non-`[A-Za-z0-9_-]` → `_`, trimmed).
-fn slug(label: &str) -> String {
-	let mapped: String = label
-		.chars()
-		.map(|c| {
-			if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-				c
-			} else {
-				'_'
-			}
-		})
-		.collect();
-	let trimmed = mapped.trim_matches('_');
-	if trimmed.is_empty() {
-		"env".to_string()
-	} else {
-		trimmed.to_string()
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn slug_makes_filesystem_safe_labels() {
-		assert_eq!(slug("python"), "python");
-		assert_eq!(slug("rust claude"), "rust_claude"); // union label → one token
-		assert_eq!(slug("my.proj"), "my_proj");
-		assert_eq!(slug("///"), "env"); // degenerate → fallback
-	}
-}

@@ -62,6 +62,24 @@ pub struct Env {
 	pub kind: Kind,
 }
 
+impl Env {
+	/// The env's `shell.nix`, or a uniform "not a clinix env" error naming the
+	/// directory and the `init` fix. For the verbs that must instantiate `shell.nix`
+	/// specifically (`add`/`remove`, `deps`, `shared`). Distinct from
+	/// [`env_shell_file`], which also accepts `default.nix` (the launcher's lookup).
+	pub fn require_shell_nix(&self) -> Result<PathBuf> {
+		let shell_nix = self.root.join("shell.nix");
+		if shell_nix.is_file() {
+			Ok(shell_nix)
+		} else {
+			Err(ClinixError::Resolve(format!(
+				"no shell.nix at {} (run: clinix env init)",
+				self.root.display()
+			)))
+		}
+	}
+}
+
 /// The one per-source-divergent seam (plan §resolve). No nix eval, no lock read —
 /// pure name → root-dir resolution against the resolved [`Config`]. Resolves the
 /// *directory-backed* target shapes (the launcher's [`resolve_node`] handles the
@@ -283,7 +301,7 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 		"stack-{}",
 		items
 			.iter()
-			.map(|i| sanitize_key(&i.label))
+			.map(|i| crate::env::naming::slug(&i.label, false, false, None))
 			.collect::<Vec<_>>()
 			.join("-")
 	);
@@ -350,20 +368,6 @@ fn union_item(node: &Node) -> Result<UnionItem> {
 			}
 		}
 	})
-}
-
-/// A label reduced to a filesystem-safe key segment (non-`[A-Za-z0-9_-]` → `_`).
-fn sanitize_key(label: &str) -> String {
-	label
-		.chars()
-		.map(|c| {
-			if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-				c
-			} else {
-				'_'
-			}
-		})
-		.collect()
 }
 
 /// Shared launcher for `shell`/`run`: [`compose_nodes`] the names, GC-root, and

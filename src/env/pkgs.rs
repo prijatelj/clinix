@@ -344,13 +344,7 @@ fn prepare(args: &Pkgs, context: &Context) -> Result<(std::path::PathBuf, Vec<St
 		));
 	}
 	let env = resolve(&context.config, Some(&args.name))?;
-	let shell_nix = env.root.join("shell.nix");
-	if !shell_nix.is_file() {
-		return Err(ClinixError::ShellNix(format!(
-			"no shell.nix at {} (run: clinix env init)",
-			env.root.display()
-		)));
-	}
+	let shell_nix = env.require_shell_nix()?;
 	let names = args.packages.iter().map(|p| p.name.clone()).collect();
 	Ok((shell_nix, names))
 }
