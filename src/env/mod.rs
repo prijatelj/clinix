@@ -14,10 +14,11 @@
 
 mod clean;
 pub mod config;
+mod diagnostics;
 mod env;
+mod execution;
 mod export;
 mod import;
-mod info;
 mod init;
 pub mod naming;
 mod new;
@@ -25,20 +26,17 @@ mod nix_edit;
 mod pkgs;
 pub mod project;
 pub mod registry;
-mod run;
 pub mod seeds;
-mod shell;
 
 pub(crate) use env::{compose_nodes, launch};
 pub use env::{
 	Cmd, Context, Env, EnvArgs, Kind, OptionalTarget, Rename, RunCmd, ShellOptions, Target,
 	Targets, resolve,
 };
+pub use diagnostics::{Deps, Info, InfoVerb, context_report};
+pub use execution::{Run, Shell};
 pub use export::{Export, ExportTarget};
 pub use import::Import;
-pub use info::{Deps, Info, InfoVerb, context_report};
 pub use init::Init;
 pub use new::New;
 pub use pkgs::{Flake, Pkg, Pkgs, Update};
-pub use run::Run;
-pub use shell::Shell;

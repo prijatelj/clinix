@@ -12,15 +12,14 @@ use crate::env::config::Config;
 use crate::env::registry;
 use crate::error::{ClinixError, Result};
 
+use super::diagnostics::{Deps, Info};
+use super::execution::{Run, Shell};
 use super::export::Export;
 use super::import::Import;
-use super::info::{Deps, Info};
 use super::init::Init;
 use super::new::New;
 use super::pkgs::{self, Flake, Pkgs, Update};
-use super::run::Run;
-use super::shell::Shell;
-use super::{clean, info};
+use super::{clean, diagnostics};
 
 /// An environment type resolved to its root directory
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,8 +531,15 @@ fn ensure_seed_lock(cfg: &Config, nixpkgs_ref: &str) -> Result<PathBuf> {
 
 /// The unified verb set. Every verb takes an env name (or several, for the
 /// compositional ones: `shell`, `run`, `shared`).
+///
+/// Declaration order is the help-listing order, so the verbs cluster by the three
+/// groups named in `EnvArgs`'s `after_help` legend — **management**, then
+/// **execution**, then **diagnostics** (clap 4 has no native per-group subcommand
+/// headings; see clap issue #1553). This ordering is presentation only — every
+/// verb is still invoked flat as `clinix env <verb>`.
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
+	// -- management: create, edit, and maintain envs --------------------------
 	/// Scaffold a new **project** env in a directory (adopt via `--from` is a
 	/// later slice; init never overwrites existing project files).
 	Init(Init),
@@ -541,7 +547,6 @@ pub enum Cmd {
 	New(New),
 	/// Rename a registered env.
 	Rename(Rename),
-
 	/// Add packages to an env's `shell.nix`.
 	Add(Pkgs),
 	/// Remove packages from an env's `shell.nix`.
@@ -550,17 +555,20 @@ pub enum Cmd {
 	Flake(Flake),
 	/// Update unpinned packages to the latest the baseline provides.
 	Update(Update),
+	/// Import an env from another format (shell.nix / flake / .deb / OCI / …).
+	Import(Import),
+	/// Export an env to another format.
+	Export(Export),
+	/// Release an env's GC root so its store paths can be collected.
+	Clean(Target),
 
+	// -- execution: instantiate and enter/run a composition -------------------
 	/// Enter an interactive shell for the composed env(s).
 	Shell(Shell),
 	/// Run a command inside the composed env(s), non-interactively.
 	Run(Run),
 
-	/// Import an env from another format (shell.nix / flake / .deb / OCI / …).
-	Import(Import),
-	/// Export an env to another format.
-	Export(Export),
-
+	// -- diagnostics: read-only reports over resolved envs --------------------
 	/// List registered envs.
 	List,
 	/// Summarize a single env (nixpkgs pin + resolved package versions).
@@ -571,8 +579,6 @@ pub enum Cmd {
 	Shared(Targets),
 	/// Environment/PATH audit (the former `envcheck`).
 	Check(OptionalTarget),
-	/// Release an env's GC root so its store paths can be collected.
-	Clean(Target),
 
 	/// Bare name list under `env` → `shell <names…>` (parity with the top-level
 	/// `clinix <names…>` sugar), so `clinix env rust claude` composes those envs.
@@ -606,21 +612,33 @@ impl RunCmd for Cmd {
 			Export(a) => a.run(context),
 
 			// Diagnostic information
-			List => info::list(context),
+			List => diagnostics::list(context),
 			Info(a) => a.run(context),
 			Deps(a) => a.run(context),
-			Shared(a) => info::shared(a, context),
-			Check(a) => info::check(a, context),
+			Shared(a) => diagnostics::shared(a, context),
+			Check(a) => diagnostics::check(a, context),
 			Clean(a) => clean::clean(a, context),
 
-			// Bare-name sugar → the launcher (interactive shell).
-			Compose(names) => super::shell::Shell { names, pure: false }.run(context),
+			// Bare-name sugar → the launcher (interactive shell). Fully qualified
+			// because `use Cmd::*` shadows the `Shell` struct with the `Shell` variant.
+			Compose(names) => super::execution::Shell { names, pure: false }.run(context),
 		}
 	}
 }
 
 /// The arguments for every command.
+///
+/// The `after_help` legend groups the flat verb list into management/execution/
+/// diagnostics — a legend rather than real subcommand headings because clap 4 has
+/// no native per-group subcommand headings (issue #1553). The verbs are declared
+/// in that same group order (see [`Cmd`]) so the "Commands" block and the legend
+/// agree.
 #[derive(Args, Debug)]
+#[command(after_help = "\
+Command groups:
+  management   init new rename add remove flake update import export clean
+  execution    shell run
+  diagnostics  list info deps shared check")]
 pub struct EnvArgs {
 	#[command(subcommand)]
 	pub cmd: Cmd,

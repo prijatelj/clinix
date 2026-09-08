@@ -30,6 +30,30 @@ fn help_and_subcommands_succeed() {
 		.stdout(predicate::str::contains("[PATH]"));
 }
 
+#[test]
+fn env_help_lists_the_command_group_legend() {
+	// clap 4 has no native per-group subcommand headings (issue #1553), so the
+	// grouping is an after_help legend naming the management/execution/diagnostics
+	// verbs. Invocation is unchanged — this is presentation only.
+	Project::new()
+		.clinix(&["env", "--help"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("Command groups:"))
+		.stdout(predicate::str::contains("diagnostics  list info deps shared check"))
+		.stdout(predicate::str::contains("execution    shell run"));
+}
+
+#[test]
+fn env_info_help_cross_references_the_registry() {
+	// `env info --help` points the user at `env list` for the env registry.
+	Project::new()
+		.clinix(&["env", "info", "--help"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("clinix env list"));
+}
+
 // ---- config: template generation & path -------------------------------------
 
 #[test]
@@ -718,6 +742,19 @@ fn check_without_a_lock_still_audits_path() {
 		.success()
 		.stdout(predicate::str::contains("no readable flake.lock"))
 		.stdout(predicate::str::contains("== PATH"));
+}
+
+#[test]
+fn info_without_a_shell_nix_reports_a_clear_error_not_a_raw_io_error() {
+	// A cwd that is not a clinix env: `env info` explains there is no valid
+	// shell.nix and points at `--help`, instead of the bare "No such file" io error.
+	Project::new()
+		.clinix(&["env", "info"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("no valid shell.nix"))
+		.stderr(predicate::str::contains("clinix env info --help"))
+		.stderr(predicate::str::contains("No such file").not());
 }
 
 #[test]
