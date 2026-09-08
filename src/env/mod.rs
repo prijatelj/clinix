@@ -28,6 +28,7 @@ mod pkgs;
 pub mod project;
 pub mod registry;
 pub mod seeds;
+mod wrap_shell;
 
 pub use diagnostics::{Deps, Info, InfoVerb, context_report};
 pub use env::{

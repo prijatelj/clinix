@@ -2,7 +2,7 @@
 //! via `rnix` (a lossless Nix CST). We parse only to **locate** the list and its
 //! element spans, then apply the change as a **string splice** on the original
 //! source — so everything else (comments, formatting, hand edits, and a
-//! single-file env's embedded-lock string) stays byte-identical.
+//! shell-only env's embedded-lock string) stays byte-identical.
 //!
 //! Pure `&str → String`: no nix eval, no I/O — richly unit-testable without nix.
 //! Reused by `pkgs::{add, remove}`; `pin` will reuse the same locator later.
@@ -314,8 +314,8 @@ pkgs.mkShell {
 	}
 
 	#[test]
-	fn single_file_embedded_lock_is_untouched() {
-		// A single-file shell.nix: an embedded-lock string *and* a packages list.
+	fn shell_only_embedded_lock_is_untouched() {
+		// A shell-only shell.nix: an embedded-lock string *and* a packages list.
 		let src = "\
 let lock = builtins.fromJSON ''
 { \"nodes\": { \"nixpkgs\": {} }, \"version\": 7 }

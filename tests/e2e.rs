@@ -60,16 +60,16 @@ fn init_quiet_suppresses_progress() {
 
 #[test]
 #[ignore = "needs nix + network"]
-fn init_single_file_is_self_contained_and_runs() {
+fn init_shell_only_is_self_contained_and_runs() {
 	if !have_nix() {
 		return;
 	}
 	let p = Project::new();
-	p.clinix(&["env", "init", ".", "--single-file", "-p", "ripgrep"])
+	p.clinix(&["env", "init", ".", "--shell-only", "-p", "ripgrep"])
 		.assert()
 		.success();
 	assert!(p.file("shell.nix").exists());
-	assert!(!p.file("flake.lock").exists(), "single-file: no flake.lock");
+	assert!(!p.file("flake.lock").exists(), "shell-only: no flake.lock");
 
 	let out = nix_shell_run(&p.file("shell.nix"), "rg --version");
 	assert!(out.status.success());

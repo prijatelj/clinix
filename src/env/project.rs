@@ -21,7 +21,7 @@ pub struct Project {
 impl Project {
 	/// Load an env's lock into a typed model, from either `flake.lock` (the
 	/// default two-file form) or — when there is no `flake.lock` — the lock
-	/// embedded in `shell.nix` (the single-file form). Both hold the identical
+	/// embedded in `shell.nix` (the shell-only form). Both hold the identical
 	/// `flake.lock` JSON.
 	pub fn load(env: Env) -> Result<Self> {
 		let flake_lock = env.root.join("flake.lock");
@@ -35,7 +35,7 @@ impl Project {
 	}
 
 	/// Write this env's (possibly edited) lock back to its `flake.lock` as canonical
-	/// JSON. For a two-file env only — a single-file env keeps its lock embedded in
+	/// JSON. For a two-file env only — a shell-only env keeps its lock embedded in
 	/// `shell.nix`, so callers that mutate the lock guard that case first (e.g.
 	/// `pkgs::require_flake_lock`) before calling this.
 	pub fn save_lock(&self) -> Result<()> {
@@ -44,9 +44,9 @@ impl Project {
 	}
 }
 
-/// Extract the `flake.lock` JSON embedded in a single-file `shell.nix` — the
+/// Extract the `flake.lock` JSON embedded in a shell-only `shell.nix` — the
 /// `builtins.fromJSON ''<json>''` here-string clinix writes for `init
-/// --single-file` — reversing the nix indented-string escapes.
+/// --shell-only` — reversing the nix indented-string escapes.
 fn extract_embedded_lock(shell_nix: &str) -> Result<String> {
 	const OPEN: &str = "builtins.fromJSON (''";
 	let start = shell_nix
@@ -85,9 +85,9 @@ mod tests {
   "version": 7
 }"#;
 
-	/// A single-file `shell.nix` as `init --single-file` writes it: the lock JSON
+	/// A shell-only `shell.nix` as `init --shell-only` writes it: the lock JSON
 	/// embedded via `builtins.fromJSON (''<json>'')`, with no sibling `flake.lock`.
-	fn single_file_shell_nix(lock_json: &str) -> String {
+	fn shell_only_shell_nix(lock_json: &str) -> String {
 		format!("let lock = builtins.fromJSON (''{lock_json}''); in pkgs.mkShell {{ }}\n")
 	}
 
@@ -101,7 +101,7 @@ mod tests {
 
 	#[test]
 	fn extract_embedded_lock_recovers_the_json() {
-		let shell = single_file_shell_nix(LOCK_JSON);
+		let shell = shell_only_shell_nix(LOCK_JSON);
 		let json = extract_embedded_lock(&shell).unwrap();
 		let lock = FlakeLock::from_json(&json).unwrap();
 		assert!(lock.nodes.contains_key("nixpkgs"));
@@ -117,7 +117,7 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		fs::write(
 			dir.path().join("shell.nix"),
-			single_file_shell_nix(LOCK_JSON),
+			shell_only_shell_nix(LOCK_JSON),
 		)
 		.unwrap();
 		// Deliberately no flake.lock: `load` must fall back to the embedded lock.

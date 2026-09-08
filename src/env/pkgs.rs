@@ -5,6 +5,7 @@
 use clap::Args;
 
 use crate::env::project::Project;
+use crate::env::wrap_shell::WrapShell;
 use crate::env::{Context, Env, RunCmd, resolve};
 use crate::error::{ClinixError, Result, unimplemented};
 use crate::model::lock::{FlakeLock, InputRef, Source};
@@ -72,6 +73,10 @@ pub enum FlakeAction {
 	Freeze,
 	/// Unfreeze the whole env: resume tracking a branch/tag (`--branch`).
 	Unfreeze(FlakeUnfreeze),
+	/// Generate a `flake.nix` wrapping the target's `shell.nix`, so `nix
+	/// develop`/flake users consume it. Wraps clinix envs (reusing/expanding their
+	/// lock) and foreign shells (auto-detecting how to pass `pkgs`).
+	WrapShell(WrapShell),
 }
 
 /// `flake <env> add <github|git> …` — resolve + add one input.
@@ -140,11 +145,11 @@ impl RunCmd for Update {
 		}
 
 		let env = resolve(&context.config, Some(&self.name))?;
-		// A single-file env keeps its lock embedded in shell.nix; writing a
+		// A shell-only env keeps its lock embedded in shell.nix; writing a
 		// flake.lock here would create a second, drifting source of truth.
 		if !env.root.join("flake.lock").exists() {
 			return Err(unimplemented(
-				"env update on a single-file env",
+				"env update on a shell-only env",
 				"the lock is embedded in shell.nix; re-embedding on update is a later slice",
 			));
 		}
@@ -351,7 +356,7 @@ fn prepare(args: &Pkgs, context: &Context) -> Result<(std::path::PathBuf, Vec<St
 
 /// Write atomically (same-dir temp + rename) so a partial write can't corrupt a
 /// hand-edited `shell.nix`.
-fn write_atomic(path: &std::path::Path, content: &str) -> Result<()> {
+pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> Result<()> {
 	let name = path.file_name().unwrap().to_string_lossy();
 	let tmp = path.with_file_name(format!(".{name}.clinix-tmp"));
 	std::fs::write(&tmp, content)?;
@@ -386,6 +391,7 @@ pub fn flake(args: Flake, context: &Context) -> Result<()> {
 		FlakeAction::Rm(rm) => flake_rm(&args.name, &rm.input, context),
 		FlakeAction::Freeze => flake_freeze(&args.name, context),
 		FlakeAction::Unfreeze(u) => flake_unfreeze(&args.name, &u.branch, context),
+		FlakeAction::WrapShell(ws) => crate::env::wrap_shell::wrap_shell(&args.name, ws, context),
 	}
 }
 
@@ -531,7 +537,7 @@ fn flake_unfreeze(name: &str, branch: &str, context: &Context) -> Result<()> {
 	Ok(())
 }
 
-/// The env's `flake.lock` path, or a guarded error for a single-file env (its
+/// The env's `flake.lock` path, or a guarded error for a shell-only env (its
 /// lock is embedded in `shell.nix`; editing a `flake.lock` here would drift).
 fn require_flake_lock(env: &Env, verb: &str) -> Result<std::path::PathBuf> {
 	let path = env.root.join("flake.lock");
@@ -540,7 +546,7 @@ fn require_flake_lock(env: &Env, verb: &str) -> Result<std::path::PathBuf> {
 	} else {
 		Err(unimplemented(
 			verb,
-			"single-file env: the lock is embedded in shell.nix; re-embedding is a later slice",
+			"shell-only env: the lock is embedded in shell.nix; re-embedding is a later slice",
 		))
 	}
 }

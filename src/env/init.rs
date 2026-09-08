@@ -39,8 +39,8 @@ pub struct Init {
 	pub flake: bool,
 	/// Embed the lock inside `shell.nix` (one self-contained file; no separate
 	/// `flake.lock`). Vanilla `nix-shell` only — mutually exclusive with `--flake`.
-	#[arg(long = "single-file", conflicts_with = "flake")]
-	pub single_file: bool,
+	#[arg(long = "shell-only", conflicts_with = "flake")]
+	pub shell_only: bool,
 	/// Adopt an existing spec (`pyproject.toml`, `Cargo.toml`, `shell.nix`, …).
 	#[arg(long = "from")]
 	pub from: Option<PathBuf>,
@@ -82,7 +82,7 @@ impl RunCmd for Init {
 		let flake_lock = root.join("flake.lock");
 		let flake_nix = root.join("flake.nix");
 		ensure_absent(&shell_nix, &root)?;
-		if !self.single_file {
+		if !self.shell_only {
 			ensure_absent(&flake_lock, &root)?;
 		}
 		if self.flake {
@@ -103,14 +103,14 @@ impl RunCmd for Init {
 		let lock = build_nixpkgs_lock(&self.nixpkgs, &progress)?;
 
 		let mut files = vec!["shell.nix"];
-		if !self.single_file {
+		if !self.shell_only {
 			files.push("flake.lock");
 		}
 		if self.flake {
 			files.push("flake.nix");
 		}
 		progress.step(&format!("writing project files ({})", files.join(", ")));
-		if self.single_file {
+		if self.shell_only {
 			// One self-contained file: the lock is embedded in shell.nix, no
 			// flake.lock (like `--flake` adds a file, this removes one).
 			std::fs::write(
@@ -130,7 +130,7 @@ impl RunCmd for Init {
 			root.display(),
 			self.nixpkgs
 		);
-		if self.single_file {
+		if self.shell_only {
 			println!("clinix: single self-contained shell.nix (lock embedded; no flake.lock)");
 		}
 		if self.flake {
@@ -156,7 +156,7 @@ const FLAKE_NIX_TEMPLATE: &str = include_str!("../../templates/project/flake.nix
 const PACKAGES_PLACEHOLDER: &str = "    # project dependencies go here";
 
 /// Fill the `packages` list with the seed package names (or leave the
-/// placeholder comment when there are none), and — for `--single-file` — embed
+/// placeholder comment when there are none), and — for `--shell-only` — embed
 /// the lock in place of the `./flake.lock` read. init *creates* the file from a
 /// known template, so this string splice is sufficient — span-preserving
 /// `rnix-parser` editing (phase 5, `add`) is only needed for existing,
@@ -182,7 +182,7 @@ fn render_shell_nix(packages: &[Pkg], embedded_lock: Option<&str>) -> String {
 	shell
 }
 
-/// The single-file lock source: the `flake.lock` JSON as a nix `''…''`
+/// The shell-only lock source: the `flake.lock` JSON as a nix `''…''`
 /// here-string (identical bytes), escaping the two sequences nix interprets
 /// (`''` and `${`). Replaces `builtins.readFile ./flake.lock` so the env needs no
 /// separate `flake.lock`; [`crate::env::project`] reverses this to read it back.
@@ -285,7 +285,7 @@ pub(crate) fn build_nixpkgs_lock(nixpkgs_ref: &str, progress: &Progress) -> Resu
 
 /// A 40-char lowercase-hex string — the shape Nix records as `original.rev`
 /// (frozen). Matches `pin`'s `is_rev`.
-fn is_rev(s: &str) -> bool {
+pub(crate) fn is_rev(s: &str) -> bool {
 	s.len() == 40
 		&& s.bytes()
 			.all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -323,7 +323,7 @@ mod tests {
 	}
 
 	#[test]
-	fn render_shell_nix_single_file_embeds_lock() {
+	fn render_shell_nix_shell_only_embeds_lock() {
 		let lock = r#"{ "nodes": {}, "root": "root", "version": 7 }"#;
 		let shell = render_shell_nix(&[], Some(lock));
 		// The lock is embedded as a here-string; the file read is gone.

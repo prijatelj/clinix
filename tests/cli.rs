@@ -130,9 +130,9 @@ fn man_prints_roff_to_stdout_and_writes_to_a_dir() {
 // ---- init: argument validation & deferrals ----------------------------------
 
 #[test]
-fn init_single_file_and_flake_are_mutually_exclusive() {
+fn init_shell_only_and_flake_are_mutually_exclusive() {
 	Project::new()
-		.clinix(&["env", "init", "--single-file", "--flake"])
+		.clinix(&["env", "init", "--shell-only", "--flake"])
 		.assert()
 		.failure()
 		.stderr(predicate::str::contains("cannot be used with"));
@@ -172,7 +172,7 @@ fn init_refuses_to_clobber_existing_shell_nix() {
 	assert!(!p.file("flake.lock").exists());
 }
 
-// ---- update: deferrals & the single-file guard ------------------------------
+// ---- update: deferrals & the shell-only guard ------------------------------
 
 #[test]
 fn update_per_package_is_deferred() {
@@ -184,14 +184,14 @@ fn update_per_package_is_deferred() {
 }
 
 #[test]
-fn update_on_single_file_env_is_guarded_and_writes_no_lock() {
+fn update_on_shell_only_env_is_guarded_and_writes_no_lock() {
 	let p = Project::new();
-	// A single-file env: shell.nix present, no flake.lock.
+	// A shell-only env: shell.nix present, no flake.lock.
 	std::fs::write(p.file("shell.nix"), "# lock embedded here").unwrap();
 	p.clinix(&["env", "update", "."])
 		.assert()
 		.failure()
-		.stderr(predicate::str::contains("single-file"));
+		.stderr(predicate::str::contains("shell-only"));
 	// The guard must not create a second, drifting flake.lock.
 	assert!(!p.file("flake.lock").exists());
 }
