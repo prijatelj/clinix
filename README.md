@@ -1,4 +1,4 @@
-# Clinix: Curing Nix Environment Management
+# Clinix: CLI for Nix Environment Management
 
 Clinix cures the confusing Nix ecosystem fragmentation by adding yet another standard that brings together the existing standards! :P
 
@@ -19,7 +19,7 @@ The `flake.lock` can be as exact as desired, with the minimal case being at leas
 
 When clinix is used to provide both a default shell.nix and flake.nix in this way, all the derivatives of Nix can use the environments from this tool, including [Snix](https://github.com/SamNet-dev/snix), [Lix](https://github.com/lix-project/lix), [Determinate Nix](https://github.com/DeterminateSystems/nix-installer), and [Flox](https://github.com/flox/flox).
 Other version Nix package pinning tools, such as [niv](https://github.com/nmattia/niv) and [npins](https://github.com/andir/npins), are only supported if they can import/export their pinned versions from/to a flake.lock.
-[Nix profiles][nix-profile] and [home-manager][home-manager] are not intended to be supported as they can be replaced by a well managed `shell.nix`, which Clinix can manage for you.
+[Nix profiles][nix-profile] and [home-manager][] are not intended to be supported as they can be replaced by a well managed `shell.nix`, which Clinix can manage for you.
 
 ## The CLI
 
