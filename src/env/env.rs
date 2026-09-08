@@ -172,6 +172,16 @@ pub(crate) struct Composition {
 	pub shell_file: PathBuf,
 	pub label: String,
 	pub root: PathBuf,
+	/// The `flake.lock` pinning this composition's nixpkgs, when discoverable (a
+	/// registry env's own lock, a file target's adjacent lock, or the seed pin for
+	/// a stack). `export docker` needs it to pin `dockerTools`.
+	pub lock: Option<PathBuf>,
+}
+
+/// A directory-backed env's own `flake.lock`, if present.
+fn env_lock(env: &Env) -> Option<PathBuf> {
+	let lock = env.root.join("flake.lock");
+	lock.is_file().then_some(lock)
 }
 
 /// Resolve a name list to a single instantiable [`Composition`] — the one place
@@ -195,6 +205,7 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 			shell_file: env_shell_file(&env.root)?,
 			label: env_label(&env),
 			root: registry::root_path(cfg, &env),
+			lock: env_lock(&env),
 		});
 	}
 
@@ -210,14 +221,17 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 				shell_file: env_shell_file(&env.root)?,
 				label: env_label(env),
 				root: registry::root_path(cfg, env),
+				lock: env_lock(env),
 			});
 		}
 		[Node::File { path }] => {
 			let slug = path.to_string_lossy().replace('/', "_");
+			let lock = path.parent().map(|d| d.join("flake.lock")).filter(|l| l.is_file());
 			return Ok(Composition {
 				shell_file: path.clone(),
 				label: file_label(path),
 				root: registry::roots_dir(cfg).join(format!("file-{}", slug.trim_start_matches('_'))),
+				lock,
 			});
 		}
 		_ => {}
@@ -266,6 +280,7 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 		shell_file: compose_file,
 		label,
 		root: registry::roots_dir(cfg).join(&key),
+		lock: Some(lock),
 	})
 }
 

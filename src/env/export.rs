@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 use crate::env::{Context, RunCmd, compose_nodes};
-use crate::error::{ClinixError, Result, unimplemented};
+use crate::error::{ClinixError, Result};
 
 #[derive(Args, Debug)]
 pub struct Export {
@@ -27,10 +27,30 @@ impl RunCmd for Export {
 				out,
 				packages,
 			} => export_closure(&names, out, packages, context),
-			ExportTarget::Docker { .. } => Err(unimplemented(
-				"env export docker",
-				"plan phase 7: docker extension (ADR-6) — next slice",
-			)),
+			ExportTarget::Docker {
+				names,
+				out,
+				name,
+				include,
+				from,
+				pull,
+				build,
+				load,
+				latest_version,
+			} => crate::ext::export_docker::run(
+				&names,
+				crate::ext::export_docker::Opts {
+					out,
+					name,
+					include,
+					from,
+					pull,
+					build,
+					load,
+					latest_version,
+				},
+				context,
+			),
 		}
 	}
 }
@@ -52,13 +72,36 @@ pub enum ExportTarget {
 		#[arg(long)]
 		packages: bool,
 	},
-	/// Emit a reproducible OCI image (or a Dockerfile). [ADR-6 extension, phase 7]
+	/// Emit a reproducible OCI image (or a Dockerfile) of the env (or union).
+	/// [ADR-6 extension — `ext::export_docker`]
 	Docker {
-		/// Env name(s) to image; several compose into a union.
+		/// Env name(s) to image; several compose into a union. (Omit with
+		/// `--latest-version`.)
 		names: Vec<String>,
 		/// Output dir for the generated artifacts (default `./containers`).
 		#[arg(long)]
 		out: Option<PathBuf>,
+		/// Image name (default: the composed env's label).
+		#[arg(long)]
+		name: Option<String>,
+		/// Host path to bake into the image (repeatable).
+		#[arg(long = "include")]
+		include: Vec<PathBuf>,
+		/// External base image to layer on — emitted as a digest-pinned Dockerfile.
+		#[arg(long)]
+		from: Option<String>,
+		/// Resolve a `--from` digest via `docker pull` + inspect (heavy fallback).
+		#[arg(long)]
+		pull: bool,
+		/// Build the image tarball (`nix-build` the streamer).
+		#[arg(long)]
+		build: bool,
+		/// Build **and** `docker load` the image.
+		#[arg(long)]
+		load: bool,
+		/// Resolver-only: print `<img>@sha256:…` for this image and exit (no env).
+		#[arg(long = "latest-version")]
+		latest_version: Option<String>,
 	},
 }
 

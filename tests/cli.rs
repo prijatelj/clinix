@@ -736,6 +736,74 @@ fn export_closure_without_a_shell_nix_errors() {
 }
 
 #[test]
+fn export_docker_requires_names_or_latest_version() {
+	Project::new()
+		.clinix(&["env", "export", "docker"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("give one or more env names"));
+}
+
+#[test]
+fn export_docker_writes_a_base_nix_for_a_registry_env() {
+	// docker-base.nix generation is nix-free (no --build): compose + render only.
+	let p = Project::new();
+	p.seed_registry_env("web", "{ pkgs }: pkgs.mkShell { }\n");
+	let out = p.path().join("containers");
+	p.clinix(&["env", "export", "docker", "web", "--out", out.to_str().unwrap()])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("docker-base.nix"));
+	let base = std::fs::read_to_string(out.join("docker-base.nix")).unwrap();
+	assert!(base.contains("streamLayeredImage"));
+	assert!(base.contains("name = \"web\";"));
+	assert!(base.contains("shell.nix") && base.contains("flake.lock"));
+	// The image contents are the env's own packages.
+	assert!(base.contains("envPackages = (shell.nativeBuildInputs"));
+}
+
+#[test]
+fn export_docker_from_prepinned_base_writes_a_dockerfile() {
+	// An already-`@sha256`-pinned `--from` needs no network.
+	let p = Project::new();
+	p.seed_registry_env("web", "{ pkgs }: pkgs.mkShell { }\n");
+	let out = p.path().join("c");
+	p.clinix(&[
+		"env",
+		"export",
+		"docker",
+		"web",
+		"--from",
+		"ubuntu:24.04@sha256:abc",
+		"--out",
+		out.to_str().unwrap(),
+	])
+	.assert()
+	.success()
+	.stdout(predicate::str::contains("Dockerfile"));
+	let df = std::fs::read_to_string(out.join("Dockerfile")).unwrap();
+	assert!(df.contains("FROM ubuntu:24.04@sha256:abc"));
+}
+
+#[test]
+fn export_docker_latest_version_keeps_a_prepinned_ref() {
+	// The resolver-only mode with an already-pinned ref is offline.
+	Project::new()
+		.clinix(&[
+			"env",
+			"export",
+			"docker",
+			"--latest-version",
+			"nvcr.io/nvidia/pytorch:24.01@sha256:deadbeef",
+		])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains(
+			"nvcr.io/nvidia/pytorch:24.01@sha256:deadbeef",
+		));
+}
+
+#[test]
 fn export_closure_requires_at_least_one_name() {
 	// Target-first grammar: names are required (clap error, before any nix).
 	Project::new()

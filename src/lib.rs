@@ -12,6 +12,7 @@ pub mod cli;
 pub mod disk;
 pub mod env;
 pub mod error;
+pub mod ext;
 pub mod model;
 pub mod nix;
 pub mod progress;

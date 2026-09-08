@@ -383,6 +383,38 @@ fn export_closure_of_a_union_of_seeds() {
 	assert!(archive.is_file() && archive.metadata().unwrap().len() > 0);
 }
 
+/// `export docker <env> --build` renders `docker-base.nix` and nix-builds it into
+/// an image tarball (streamLayeredImage → tar; no docker daemon needed). Proves
+/// the generated expression evaluates and the env's packages become the image.
+#[test]
+#[ignore = "needs nix + network"]
+fn export_docker_nix_base_builds_an_image_tarball() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
+		.assert()
+		.success();
+	let out = p.path().join("containers");
+	p.clinix(&[
+		"env",
+		"export",
+		"docker",
+		".",
+		"--name",
+		"testimg",
+		"--out",
+		out.to_str().unwrap(),
+		"--build",
+	])
+	.assert()
+	.success()
+	.stdout(predicate::str::contains("image tarball"));
+	let tar = out.join("testimg.tar");
+	assert!(tar.is_file() && tar.metadata().unwrap().len() > 0, "image tar produced");
+}
+
 /// `new --from` materializes a seed stack into a **portable** registry env
 /// (copied fragments + local lock + a self-contained `shell.nix`), which then
 /// enters and runs. Verifies Slice 4.
