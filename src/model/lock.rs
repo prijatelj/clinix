@@ -314,39 +314,43 @@ impl LockedKind {
 	}
 }
 
+/// A minimal one-input `flake.lock` fixture — nixpkgs tracking `nixos-26.05`,
+/// locked at `rev`/`nar`. Shared across the lock and `pkgs` unit tests so the same
+/// hand-built lock is written once. Test-only.
+#[cfg(test)]
+pub(crate) fn one_input_lock(rev: &str, nar: &str) -> FlakeLock {
+	let mut nodes = BTreeMap::new();
+	nodes.insert(
+		"nixpkgs".to_string(),
+		Node {
+			locked: Some(Source::github_locked("NixOS", "nixpkgs", rev, nar)),
+			original: Some(Source::github_ref("NixOS", "nixpkgs", "nixos-26.05")),
+			..Node::default()
+		},
+	);
+	let mut inputs = BTreeMap::new();
+	inputs.insert("nixpkgs".to_string(), InputRef::Direct("nixpkgs".to_string()));
+	nodes.insert(
+		"root".to_string(),
+		Node {
+			inputs,
+			..Node::default()
+		},
+	);
+	FlakeLock {
+		nodes,
+		root: "root".to_string(),
+		version: 7,
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	fn one_input_lock() -> FlakeLock {
-		let mut nodes = BTreeMap::new();
-		nodes.insert(
-			"nixpkgs".to_string(),
-			Node {
-				locked: Some(Source::github_locked("NixOS", "nixpkgs", "abc123", "sha256-x")),
-				original: Some(Source::github_ref("NixOS", "nixpkgs", "nixos-26.05")),
-				..Node::default()
-			},
-		);
-		let mut inputs = BTreeMap::new();
-		inputs.insert("nixpkgs".to_string(), InputRef::Direct("nixpkgs".to_string()));
-		nodes.insert(
-			"root".to_string(),
-			Node {
-				inputs,
-				..Node::default()
-			},
-		);
-		FlakeLock {
-			nodes,
-			root: "root".to_string(),
-			version: 7,
-		}
-	}
-
 	#[test]
 	fn add_input_inserts_node_and_root_edge() {
-		let mut lock = one_input_lock();
+		let mut lock = one_input_lock("abc123", "sha256-x");
 		lock.add_input(
 			"helper",
 			Source::github_locked("o", "r", "def456", "sha256-y"),
@@ -369,7 +373,7 @@ mod tests {
 
 	#[test]
 	fn remove_input_drops_edge_and_node() {
-		let mut lock = one_input_lock();
+		let mut lock = one_input_lock("abc123", "sha256-x");
 		lock.add_input(
 			"helper",
 			Source::github_locked("o", "r", "def456", "sha256-y"),
@@ -398,7 +402,7 @@ mod tests {
 
 	#[test]
 	fn add_then_serialize_round_trips() {
-		let mut lock = one_input_lock();
+		let mut lock = one_input_lock("abc123", "sha256-x");
 		lock.add_input(
 			"helper",
 			Source::git_locked("https://x/y.git", "deadbeef", "sha256-z", Some("main")),

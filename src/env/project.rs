@@ -33,6 +33,15 @@ impl Project {
 		let lock = FlakeLock::from_json(&text)?;
 		Ok(Project { env, lock })
 	}
+
+	/// Write this env's (possibly edited) lock back to its `flake.lock` as canonical
+	/// JSON. For a two-file env only — a single-file env keeps its lock embedded in
+	/// `shell.nix`, so callers that mutate the lock guard that case first (e.g.
+	/// `pkgs::require_flake_lock`) before calling this.
+	pub fn save_lock(&self) -> Result<()> {
+		fs::write(self.env.root.join("flake.lock"), self.lock.to_json())?;
+		Ok(())
+	}
 }
 
 /// Extract the `flake.lock` JSON embedded in a single-file `shell.nix` — the

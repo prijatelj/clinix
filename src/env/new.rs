@@ -175,10 +175,10 @@ impl New {
 			std::fs::copy(&source_shell, &copied)?;
 			"./source.nix".to_string()
 		} else {
-			nix_string(&source_shell)
+			crate::env::nix_expr::nix_str(&source_shell)
 		};
 		let wrapper = if inject {
-			render_wrapper_with_lock(target.lock_read, &source_expr, &target.top)
+			render_wrapper_with_lock(target.lock_read, &source_expr)
 		} else {
 			render_wrapper_no_lock(&source_expr)
 		};
@@ -356,26 +356,16 @@ fn files_equal(a: &Path, b: &Path) -> Result<bool> {
 	Ok(std::fs::read(a)? == std::fs::read(b)?)
 }
 
-/// A path as an escaped, double-quoted nix string literal (coerced to a path where
-/// one is expected). Escapes `\`, `"`, and `${`.
-fn nix_string(path: &Path) -> String {
-	let s = path.to_string_lossy();
-	let escaped = s
-		.replace('\\', "\\\\")
-		.replace('"', "\\\"")
-		.replace("${", "\\${");
-	format!("\"{escaped}\"")
-}
-
 /// The `pkgs`-injecting wrapper: reads the namespace pin and passes `pkgs` into the
-/// source shell, so one lock governs the namespace. `@LOCK@` is a bare relative
-/// path (`./flake.lock` or `../flake.lock`); `@SOURCE@` is `./source.nix` (copy) or
-/// a quoted absolute path (non-copy).
-fn render_wrapper_with_lock(lock_read: &str, source_expr: &str, name: &str) -> String {
-	WRAPPER_WITH_LOCK
-		.replace("@LOCK@", lock_read)
-		.replace("@SOURCE@", source_expr)
-		.replace("@NAME@", &name.replace(' ', "-"))
+/// source shell, so one lock governs the namespace. `lock_read` is a bare relative
+/// path (`./flake.lock` or `../flake.lock`); `source_expr` is `./source.nix` (copy)
+/// or a quoted absolute path (non-copy). Assembled from the shared
+/// [`crate::env::nix_expr`] lock-prelude.
+fn render_wrapper_with_lock(lock_read: &str, source_expr: &str) -> String {
+	format!(
+		"{}in\nimport {source_expr} {{ inherit pkgs; }}\n",
+		crate::env::nix_expr::lock_prelude(lock_read, "")
+	)
 }
 
 /// The unpinned wrapper: imports the source as-is (it supplies its own `pkgs`).
@@ -383,65 +373,23 @@ fn render_wrapper_no_lock(source_expr: &str) -> String {
 	format!("import {source_expr} {{ }}\n")
 }
 
-const WRAPPER_WITH_LOCK: &str = r##"{ system ? builtins.currentSystem }:
-let
-  lock = builtins.fromJSON (builtins.readFile @LOCK@);
-  fetch = node:
-    let i = lock.nodes.${node}.locked; in
-    if i.type == "github" then
-      builtins.fetchTarball { url = "https://github.com/${i.owner}/${i.repo}/archive/${i.rev}.tar.gz"; sha256 = i.narHash; }
-    else if i.type == "git" then
-      (builtins.fetchGit { inherit (i) url rev; }).outPath
-    else throw "clinix: unsupported input type '${i.type}'";
-  sources = builtins.mapAttrs (_: fetch) lock.nodes.root.inputs;
-  pkgs = import sources.nixpkgs { inherit system; };
-in
-import @SOURCE@ { inherit pkgs; }
-"##;
-
 /// The self-contained `shell.nix` for a **composed** seed env: reads
 /// `./flake.lock`, imports the pinned nixpkgs, unions the local seed copies via
-/// `inputsFrom`. Portable — no reference to the user's source paths.
+/// `inputsFrom`. Portable — no reference to the user's source paths. Built from the
+/// shared [`crate::env::nix_expr`] compose assembler.
 fn render_composed_shell(seeds: &[(String, PathBuf)], label: &str, with_config: bool) -> String {
 	let imports = seeds
 		.iter()
 		.map(|(n, _)| format!("    (import ./seeds/{n}.nix {{ inherit pkgs; }})"))
 		.collect::<Vec<_>>()
 		.join("\n");
-	let sanitized = label.replace(' ', "-");
 	let config = if with_config {
 		" config = import ./nixpkgs-config.nix;"
 	} else {
 		""
 	};
-	COMPOSED_TEMPLATE
-		.replace("@CONFIG@", config)
-		.replace("@NAME@", &sanitized)
-		.replace("@IMPORTS@", &imports)
-		.replace("@LABEL@", label)
+	crate::env::nix_expr::compose_shell("./flake.lock", config, &label.replace(' ', "-"), &imports, label)
 }
-
-const COMPOSED_TEMPLATE: &str = r##"{ system ? builtins.currentSystem }:
-let
-  lock = builtins.fromJSON (builtins.readFile ./flake.lock);
-  fetch = node:
-    let i = lock.nodes.${node}.locked; in
-    if i.type == "github" then
-      builtins.fetchTarball { url = "https://github.com/${i.owner}/${i.repo}/archive/${i.rev}.tar.gz"; sha256 = i.narHash; }
-    else if i.type == "git" then
-      (builtins.fetchGit { inherit (i) url rev; }).outPath
-    else throw "clinix: unsupported input type '${i.type}'";
-  sources = builtins.mapAttrs (_: fetch) lock.nodes.root.inputs;
-  pkgs = import sources.nixpkgs { inherit system;@CONFIG@ };
-in
-pkgs.mkShell {
-  name = "@NAME@";
-  inputsFrom = [
-@IMPORTS@
-  ];
-  shellHook = "export name=${pkgs.lib.escapeShellArg ''@LABEL@''}\n";
-}
-"##;
 
 #[cfg(test)]
 mod tests {
@@ -474,11 +422,11 @@ mod tests {
 	#[test]
 	fn wrapper_with_lock_injects_pkgs_from_the_pin() {
 		// A member reads the shared `../flake.lock` and injects pkgs into the source.
-		let w = render_wrapper_with_lock("../flake.lock", "\"/abs/dev.nix\"", "proj");
+		let w = render_wrapper_with_lock("../flake.lock", "\"/abs/dev.nix\"");
 		assert!(w.contains("builtins.readFile ../flake.lock"));
 		assert!(w.contains("import \"/abs/dev.nix\" { inherit pkgs; }"));
 		// A runtime env reads its own `./flake.lock`; copy mode imports the copy.
-		let w2 = render_wrapper_with_lock("./flake.lock", "./source.nix", "x");
+		let w2 = render_wrapper_with_lock("./flake.lock", "./source.nix");
 		assert!(w2.contains("builtins.readFile ./flake.lock"));
 		assert!(w2.contains("import ./source.nix { inherit pkgs; }"));
 	}

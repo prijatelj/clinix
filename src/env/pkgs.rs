@@ -214,7 +214,7 @@ impl RunCmd for Update {
 		if changed == 0 {
 			println!("clinix: all inputs up to date");
 		} else {
-			std::fs::write(project.env.root.join("flake.lock"), project.lock.to_json())?;
+			project.save_lock()?;
 		}
 		Ok(())
 	}
@@ -230,8 +230,7 @@ fn required(value: Option<&str>, node: &str, field: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::model::lock::{FlakeLock, Node};
-	use std::collections::BTreeMap;
+	use crate::model::lock::one_input_lock;
 
 	// Network + classic-nix E2E: pin an env to a deliberately stale nixos-26.05
 	// rev, then `update` and assert it advanced. Gated; run with `-- --ignored`.
@@ -239,37 +238,7 @@ mod tests {
 	#[ignore = "requires network + git/nix-prefetch-url/nix-hash"]
 	fn update_advances_a_stale_nixpkgs_pin() {
 		let stale = "2f5a153c270b70cb0f8c11f46d96d6d3bc39f4e3";
-		let mut nodes = BTreeMap::new();
-		nodes.insert(
-			"nixpkgs".to_string(),
-			Node {
-				locked: Some(Source::github_locked(
-					"NixOS",
-					"nixpkgs",
-					stale,
-					"sha256-Yjv0WEg39KRYS0rBdTbu6Fc/or/ihAKk13W9sQ6VWd0=",
-				)),
-				original: Some(Source::github_ref("NixOS", "nixpkgs", "nixos-26.05")),
-				..Node::default()
-			},
-		);
-		let mut root_inputs = BTreeMap::new();
-		root_inputs.insert(
-			"nixpkgs".to_string(),
-			InputRef::Direct("nixpkgs".to_string()),
-		);
-		nodes.insert(
-			"root".to_string(),
-			Node {
-				inputs: root_inputs,
-				..Node::default()
-			},
-		);
-		let lock = FlakeLock {
-			nodes,
-			root: "root".to_string(),
-			version: 7,
-		};
+		let lock = one_input_lock(stale, "sha256-Yjv0WEg39KRYS0rBdTbu6Fc/or/ihAKk13W9sQ6VWd0=");
 
 		let dir = tempfile::tempdir().unwrap();
 		std::fs::write(dir.path().join("flake.lock"), lock.to_json()).unwrap();
@@ -292,39 +261,9 @@ mod tests {
 		assert_eq!(new_rev.len(), 40);
 	}
 
-	/// A one-input lock: nixpkgs tracking `nixos-26.05` at a fixed rev.
-	fn tracked_lock() -> FlakeLock {
-		let mut nodes = BTreeMap::new();
-		nodes.insert(
-			"nixpkgs".to_string(),
-			Node {
-				locked: Some(Source::github_locked("NixOS", "nixpkgs", "abc123", "sha256-x")),
-				original: Some(Source::github_ref("NixOS", "nixpkgs", "nixos-26.05")),
-				..Node::default()
-			},
-		);
-		let mut root_inputs = BTreeMap::new();
-		root_inputs.insert(
-			"nixpkgs".to_string(),
-			InputRef::Direct("nixpkgs".to_string()),
-		);
-		nodes.insert(
-			"root".to_string(),
-			Node {
-				inputs: root_inputs,
-				..Node::default()
-			},
-		);
-		FlakeLock {
-			nodes,
-			root: "root".to_string(),
-			version: 7,
-		}
-	}
-
 	#[test]
 	fn freeze_then_unfreeze_roundtrips_standardly() {
-		let mut lock = tracked_lock();
+		let mut lock = one_input_lock("abc123", "sha256-x");
 
 		let froze = freeze(&mut lock);
 		assert_eq!(froze.len(), 1);
@@ -461,7 +400,7 @@ pub fn flake(args: Flake, context: &Context) -> Result<()> {
 /// tested `resolve_github`; git uses `nix-prefetch-git`.
 fn flake_add(name: &str, add: FlakeAdd, context: &Context) -> Result<()> {
 	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
-	let flake_lock = require_flake_lock(&project.env, "env flake add")?;
+	require_flake_lock(&project.env, "env flake add")?;
 
 	let (node, locked, original, summary) = match add.kind {
 		AddKind::Github {
@@ -514,7 +453,7 @@ fn flake_add(name: &str, add: FlakeAdd, context: &Context) -> Result<()> {
 	};
 
 	project.lock.add_input(&node, locked, original)?;
-	std::fs::write(&flake_lock, project.lock.to_json())?;
+	project.save_lock()?;
 	println!("added input `{node}` ({summary})");
 	Ok(())
 }
@@ -523,14 +462,14 @@ fn flake_add(name: &str, add: FlakeAdd, context: &Context) -> Result<()> {
 /// nothing else references it).
 fn flake_rm(name: &str, input: &str, context: &Context) -> Result<()> {
 	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
-	let flake_lock = require_flake_lock(&project.env, "env flake rm")?;
+	require_flake_lock(&project.env, "env flake rm")?;
 	if !project.lock.remove_input(input) {
 		return Err(ClinixError::Resolve(format!("no input `{input}` in this env")));
 	}
 	if input == "nixpkgs" {
 		eprintln!("clinix: warning: removed `nixpkgs` — this env's shell.nix almost certainly needs it");
 	}
-	std::fs::write(&flake_lock, project.lock.to_json())?;
+	project.save_lock()?;
 	println!("removed input `{input}`");
 	Ok(())
 }
@@ -551,7 +490,7 @@ fn git_basename(url: &str) -> String {
 /// for `--flake` envs. Offline (copies `locked.rev`; no resolve).
 fn flake_freeze(name: &str, context: &Context) -> Result<()> {
 	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
-	let flake_lock = require_flake_lock(&project.env, "env flake freeze")?;
+	require_flake_lock(&project.env, "env flake freeze")?;
 
 	let changes = freeze(&mut project.lock);
 	if changes.is_empty() {
@@ -563,7 +502,7 @@ fn flake_freeze(name: &str, context: &Context) -> Result<()> {
 	if kept.is_empty() {
 		return Ok(());
 	}
-	std::fs::write(&flake_lock, project.lock.to_json())?;
+	project.save_lock()?;
 	println!("frozen:");
 	for c in &kept {
 		println!("\t{} @ {:.9}", c.name, c.to);
@@ -575,7 +514,7 @@ fn flake_freeze(name: &str, context: &Context) -> Result<()> {
 /// input. Requires `--branch` for now (no remembered ref yet).
 fn flake_unfreeze(name: &str, branch: &str, context: &Context) -> Result<()> {
 	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
-	let flake_lock = require_flake_lock(&project.env, "env flake unfreeze")?;
+	require_flake_lock(&project.env, "env flake unfreeze")?;
 
 	let changes = unfreeze(&mut project.lock, branch);
 	if changes.is_empty() {
@@ -586,7 +525,7 @@ fn flake_unfreeze(name: &str, branch: &str, context: &Context) -> Result<()> {
 	if kept.is_empty() {
 		return Ok(());
 	}
-	std::fs::write(&flake_lock, project.lock.to_json())?;
+	project.save_lock()?;
 	println!("tracking {branch}:");
 	for c in &kept {
 		println!("\t{}", c.name);

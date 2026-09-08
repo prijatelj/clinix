@@ -262,65 +262,22 @@ pub fn compose_expr(
 	label: &str,
 	nixpkgs_config: Option<&Path>,
 ) -> String {
+	use crate::env::nix_expr;
 	let imports = imports
 		.iter()
 		.map(|(p, inject)| {
 			let args = if *inject { "{ inherit pkgs; }" } else { "{ }" };
-			format!("    (import {} {args})", nix_str(p))
+			format!("    (import {} {args})", nix_expr::nix_str(p))
 		})
 		.collect::<Vec<_>>()
 		.join("\n");
-	let sanitized = label.replace(' ', "-");
-	COMPOSE_TEMPLATE
-		.replace("@LOCK@", &nix_str(lock))
-		.replace("@CONFIG@", &nixpkgs_config_frag(nixpkgs_config))
-		.replace("@IMPORTS@", &imports)
-		.replace("@NAME@", &sanitized)
-		.replace("@LABEL@", label)
-}
-
-/// The ` config = import "<path>";` fragment for the nixpkgs import, or empty (so
-/// nixpkgs uses its default `~/.config/nixpkgs/config.nix`).
-pub(crate) fn nixpkgs_config_frag(config: Option<&Path>) -> String {
-	match config {
-		Some(p) => format!(" config = import {};", nix_str(p)),
-		None => String::new(),
-	}
-}
-
-/// The compose expression template. Paths are substituted as escaped nix strings
-/// (coerced to paths by `readFile`/`import`); `@LABEL@` is the un-sanitised name.
-const COMPOSE_TEMPLATE: &str = r##"{ system ? builtins.currentSystem }:
-let
-  lock = builtins.fromJSON (builtins.readFile @LOCK@);
-  fetch = node:
-    let i = lock.nodes.${node}.locked; in
-    if i.type == "github" then
-      builtins.fetchTarball { url = "https://github.com/${i.owner}/${i.repo}/archive/${i.rev}.tar.gz"; sha256 = i.narHash; }
-    else if i.type == "git" then
-      (builtins.fetchGit { inherit (i) url rev; }).outPath
-    else throw "clinix compose: unsupported input type '${i.type}'";
-  sources = builtins.mapAttrs (_: fetch) lock.nodes.root.inputs;
-  pkgs = import sources.nixpkgs { inherit system;@CONFIG@ };
-in
-pkgs.mkShell {
-  name = "@NAME@";
-  inputsFrom = [
-@IMPORTS@
-  ];
-  shellHook = "export name=${pkgs.lib.escapeShellArg ''@LABEL@''}\n";
-}
-"##;
-
-/// A path as an escaped, double-quoted nix string literal (nix coerces it to a
-/// path where one is expected). Escapes `\`, `"`, and `${` (interpolation).
-fn nix_str(path: &Path) -> String {
-	let s = path.to_string_lossy();
-	let escaped = s
-		.replace('\\', "\\\\")
-		.replace('"', "\\\"")
-		.replace("${", "\\${");
-	format!("\"{escaped}\"")
+	nix_expr::compose_shell(
+		&nix_expr::nix_str(lock),
+		&nix_expr::nixpkgs_config_frag(nixpkgs_config),
+		&label.replace(' ', "-"),
+		&imports,
+		label,
+	)
 }
 
 #[cfg(test)]

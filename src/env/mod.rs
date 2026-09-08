@@ -23,6 +23,7 @@ mod init;
 pub mod naming;
 mod new;
 mod nix_edit;
+pub mod nix_expr;
 mod pkgs;
 pub mod project;
 pub mod registry;
