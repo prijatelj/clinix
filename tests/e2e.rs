@@ -182,7 +182,7 @@ fn closure_export_writes_a_nonempty_archive() {
 		.success();
 
 	let archive = p.path().join("env.closure");
-	p.clinix(&["env", "export", ".", "closure", archive.to_str().unwrap()])
+	p.clinix(&["env", "export", "closure", "--out", archive.to_str().unwrap(), "."])
 		.assert()
 		.success()
 		.stdout(predicate::str::contains("store paths"));
@@ -212,7 +212,7 @@ fn closure_import_round_trips_into_the_registry() {
 		.assert()
 		.success();
 	let archive = p.path().join("env.closure");
-	p.clinix(&["env", "export", ".", "closure", archive.to_str().unwrap()])
+	p.clinix(&["env", "export", "closure", "--out", archive.to_str().unwrap(), "."])
 		.assert()
 		.success();
 
@@ -259,10 +259,10 @@ fn closure_export_default_is_offline_sufficient_packages_is_the_delta() {
 	// Two exports from the same built env: default (complete) vs --packages (delta).
 	let full = p.path().join("full.closure");
 	let delta = p.path().join("delta.closure");
-	p.clinix(&["env", "export", ".", "closure", full.to_str().unwrap()])
+	p.clinix(&["env", "export", "closure", "--out", full.to_str().unwrap(), "."])
 		.assert()
 		.success();
-	p.clinix(&["env", "export", ".", "closure", delta.to_str().unwrap(), "--packages"])
+	p.clinix(&["env", "export", "closure", "--out", delta.to_str().unwrap(), "--packages", "."])
 		.assert()
 		.success();
 	// The delta is strictly smaller — it omits the base.
@@ -350,6 +350,37 @@ fn seed_catalog_composes_single_and_stacked_seeds() {
 	])
 	.assert()
 	.success();
+}
+
+/// The flipped grammar exports the **union** of several envs: `export closure tool
+/// data` composes both seeds and serializes their combined closure.
+#[test]
+#[ignore = "needs nix + network"]
+fn export_closure_of_a_union_of_seeds() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.seed(
+		"tool",
+		"{ pkgs }: pkgs.mkShell { packages = with pkgs; [ ripgrep ]; }\n",
+	);
+	p.seed(
+		"data",
+		"{ pkgs }: pkgs.mkShell { packages = with pkgs; [ jq ]; }\n",
+	);
+	// Build the composed union first (export refuses an unbuilt env).
+	p.clinix(&["env", "run", "tool", "data", "--", "true"])
+		.assert()
+		.success();
+	let archive = p.path().join("union.closure");
+	p.clinix(&["env", "export", "closure", "--out", archive.to_str().unwrap(), "tool", "data"])
+		.assert()
+		.success()
+		.stdout(
+			predicate::str::contains("tool data").and(predicate::str::contains("store paths")),
+		);
+	assert!(archive.is_file() && archive.metadata().unwrap().len() > 0);
 }
 
 /// `new --from` materializes a seed stack into a **portable** registry env

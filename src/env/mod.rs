@@ -29,7 +29,7 @@ mod run;
 pub mod seeds;
 mod shell;
 
-pub(crate) use env::launch;
+pub(crate) use env::{compose_nodes, launch};
 pub use env::{
 	Cmd, Context, Env, EnvArgs, Kind, OptionalTarget, Rename, RunCmd, ShellOptions, Target,
 	Targets, resolve,

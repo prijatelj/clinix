@@ -3,7 +3,7 @@ name = "clinix"
 version = "0.0.0"
 edition = "2024"
 license = "MIT"
-description = "CLI tool to manage Nix environments (env) and a NixOS system (sys). Pins package versions with a `flake.lock` used by `shell.nix` or `flake.nix`."
+description = "CLI tool to manage Nix environments (env) and a NixOS system (sys) using default nix. Clinx pins package versions with a `flake.lock` used by `shell.nix` or `flake.nix`."
 readme = "README.md"
 authors = [ "Derek Prijatelj <derek.s.prijatelj@gmail.com>" ]
 keywords = ["nix", "NixOS", "flakes", "flake", "cli"]
@@ -27,3 +27,23 @@ rnix = "0.11"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+
+# External binaries clinix depends upon for certain commands.
+# See shell.nix and the accompaning flake.lock for the authoritative versions.
+[package.metadata.external-tools]
+# Required for the corresponding features (absent → that command errors clearly).
+required = [
+  "curl",             # OCI registry digest resolution (export docker --from)
+  "git",              # ls-remote for input resolution (pin/init/update)
+  "nix-instantiate",  # eval + instantiate (info/deps/export/launch)
+  "nix-store",        # closure/export/import/gc-roots
+  "nix-build",        # build (docker image tarball)
+  "nix-shell",        # enter/run
+  "nix-prefetch-url", # narHash for a pinned input
+  "nix-hash",         # SRI conversion
+]
+# Optional: used when present, with a documented fallback or clear error.
+optional = [
+  "docker",           # export docker --load; authenticated --from digest fallback
+  "skopeo",           # daemon-free authenticated --from digest fallback
+]

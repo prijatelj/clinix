@@ -164,19 +164,23 @@ enum Node {
 	Seed { name: String, path: PathBuf },
 }
 
-/// Shared launcher for `shell`/`run`. Resolves the name stack, then either enters
-/// a single project/registry env's `shell.nix`, or **composes a stack of seed
-/// fragments** against the configured nixpkgs pin (lexical order, or the given
-/// order under `-o`) — the `~/dev_env` `compose-dev.nix` behavior. GC-roots the
-/// result and enters it via classic `nix-shell`. Composing a self-contained env
-/// (project/registry) into a multi-node stack is deferred with self-contained
-/// seeds, so a stack must currently be all seeds.
-pub(crate) fn launch(
-	ctx: &Context,
-	names: &[String],
-	pure: bool,
-	command: Option<&str>,
-) -> Result<ExitStatus> {
+/// A resolved composition: the single nix file to instantiate (an env's own
+/// shell, a `*.nix` file, or a written seed-stack compose file), a human `label`,
+/// and the GC-root path keyed for it. Produced by [`compose_nodes`] and consumed
+/// by both `launch` (enter it) and `export` (serialize/image it).
+pub(crate) struct Composition {
+	pub shell_file: PathBuf,
+	pub label: String,
+	pub root: PathBuf,
+}
+
+/// Resolve a name list to a single instantiable [`Composition`] — the one place
+/// the target precedence + seed-stack composition live, shared by `launch` and
+/// `export`. Empty names ⇒ the cwd project. No nix eval or entry here; a stack
+/// writes its compose expression to `state/compose/`. Composing a self-contained
+/// env/file into a multi-node stack is still deferred (seeds-only stacks; a
+/// shared-`flake.lock` project union is the next step).
+pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Composition> {
 	let cfg = &ctx.config;
 	let settings = crate::env::config::Settings::load(&cfg.config_dir)?;
 	let catalog = crate::env::seeds::Catalog::build(&settings.env.seeds);
@@ -184,9 +188,14 @@ pub(crate) fn launch(
 		eprintln!("clinix: {w}");
 	}
 
-	// Empty stack ⇒ the cwd project.
+	// Empty ⇒ the cwd project.
 	if names.is_empty() {
-		return launch_env(cfg, &resolve(cfg, None)?, pure, command);
+		let env = resolve(cfg, None)?;
+		return Ok(Composition {
+			shell_file: env_shell_file(&env.root)?,
+			label: env_label(&env),
+			root: registry::root_path(cfg, &env),
+		});
 	}
 
 	let nodes: Vec<Node> = names
@@ -194,11 +203,23 @@ pub(crate) fn launch(
 		.map(|n| resolve_node(cfg, &catalog, n))
 		.collect::<Result<_>>()?;
 
-	// A single self-contained node enters directly (no composition): a
-	// project/registry env's own shell, or an explicit `*.nix` file.
+	// A single self-contained node: an env's own shell, or an explicit `*.nix` file.
 	match nodes.as_slice() {
-		[Node::Env(env)] => return launch_env(cfg, env, pure, command),
-		[Node::File { path }] => return launch_file(cfg, path, pure, command),
+		[Node::Env(env)] => {
+			return Ok(Composition {
+				shell_file: env_shell_file(&env.root)?,
+				label: env_label(env),
+				root: registry::root_path(cfg, env),
+			});
+		}
+		[Node::File { path }] => {
+			let slug = path.to_string_lossy().replace('/', "_");
+			return Ok(Composition {
+				shell_file: path.clone(),
+				label: file_label(path),
+				root: registry::roots_dir(cfg).join(format!("file-{}", slug.trim_start_matches('_'))),
+			});
+		}
 		_ => {}
 	}
 
@@ -210,8 +231,8 @@ pub(crate) fn launch(
 			Node::Seed { name, path } => seeds.push((name.clone(), path.clone())),
 			Node::Env(_) | Node::File { .. } => {
 				return Err(crate::error::unimplemented(
-					"composing a self-contained env/file into a stack",
-					"seeds-only stacks for now; self-contained seeds are deferred",
+					"composing a self-contained env/file into a union",
+					"seeds-only unions for now; a shared-flake.lock project union is the next step",
 				));
 			}
 		}
@@ -228,7 +249,8 @@ pub(crate) fn launch(
 		.join(" ");
 	let paths: Vec<PathBuf> = seeds.iter().map(|(_, p)| p.clone()).collect();
 
-	// Compose against the configured nixpkgs pin, root by the ordered stack, enter.
+	// Compose against the configured nixpkgs pin; the compose file is keyed by the
+	// ordered stack so re-running the same stack reuses it.
 	let lock = seed_lock(cfg, &settings)?;
 	let nixpkgs_config = nixpkgs_config_path(&settings)?;
 	let expr = crate::env::seeds::compose_expr(&lock, &paths, &label, nixpkgs_config.as_deref());
@@ -240,29 +262,46 @@ pub(crate) fn launch(
 	std::fs::create_dir_all(&compose_dir)?;
 	let compose_file = compose_dir.join(format!("{key}.nix"));
 	std::fs::write(&compose_file, expr)?;
-	let root = registry::roots_dir(cfg).join(&key);
-	let drv = crate::nix::instantiate_rooted(&compose_file, &root)?;
+	Ok(Composition {
+		shell_file: compose_file,
+		label,
+		root: registry::roots_dir(cfg).join(&key),
+	})
+}
+
+/// Shared launcher for `shell`/`run`: [`compose_nodes`] the names, GC-root, and
+/// enter via classic `nix-shell` (`--run <command>` when non-interactive).
+pub(crate) fn launch(
+	ctx: &Context,
+	names: &[String],
+	pure: bool,
+	command: Option<&str>,
+) -> Result<ExitStatus> {
+	let comp = compose_nodes(ctx, names)?;
+	let drv = crate::nix::instantiate_rooted(&comp.shell_file, &comp.root)?;
 	crate::nix::nix_shell(&drv, pure, command)
 }
 
-/// Enter a single env's own shell (project/registry), GC-rooted by its key. The
-/// entry file is `shell.nix`, else `default.nix` — the same fallback `nix-shell`
-/// itself uses.
-fn launch_env(cfg: &Config, env: &Env, pure: bool, command: Option<&str>) -> Result<ExitStatus> {
-	let shell_file = env_shell_file(&env.root)?;
-	let root = registry::root_path(cfg, env);
-	let drv = crate::nix::instantiate_rooted(&shell_file, &root)?;
-	crate::nix::nix_shell(&drv, pure, command)
+/// A resolved env's human label: its registry name, else the resolved directory's
+/// basename (a project/cwd env). Un-slugged — callers that need a filename slug it.
+pub(crate) fn env_label(env: &Env) -> String {
+	env.name
+		.as_deref()
+		.filter(|n| !n.contains('/') && *n != ".")
+		.map(str::to_string)
+		.or_else(|| {
+			env.root
+				.file_name()
+				.map(|s| s.to_string_lossy().into_owned())
+		})
+		.unwrap_or_else(|| "env".to_string())
 }
 
-/// Run an explicit `*.nix` **File** target directly (`clinix env shell dev.nix`),
-/// GC-rooted by a path slug (like a project — the file has no registry name). The
-/// file is a standalone shell expression; it is entered as-is, not composed.
-fn launch_file(cfg: &Config, file: &Path, pure: bool, command: Option<&str>) -> Result<ExitStatus> {
-	let slug = file.to_string_lossy().replace('/', "_");
-	let root = registry::roots_dir(cfg).join(format!("file-{}", slug.trim_start_matches('_')));
-	let drv = crate::nix::instantiate_rooted(file, &root)?;
-	crate::nix::nix_shell(&drv, pure, command)
+/// A `*.nix` file target's label: its file stem (`dev.nix` → `dev`).
+fn file_label(path: &Path) -> String {
+	path.file_stem()
+		.map(|s| s.to_string_lossy().into_owned())
+		.unwrap_or_else(|| "shell".to_string())
 }
 
 /// The entry file for a directory-backed env: `shell.nix` if present, else

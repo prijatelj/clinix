@@ -347,7 +347,7 @@ fn run_mixing_a_project_env_into_a_seed_stack_is_deferred() {
 		.assert()
 		.failure()
 		.stderr(predicate::str::contains(
-			"composing a self-contained env/file into a stack",
+			"composing a self-contained env/file into a union",
 		));
 }
 
@@ -729,10 +729,20 @@ fn shared_with_unknown_env_reports_not_registered() {
 #[test]
 fn export_closure_without_a_shell_nix_errors() {
 	let p = Project::new();
-	p.clinix(&["env", "export", ".", "closure"])
+	p.clinix(&["env", "export", "closure", "."])
 		.assert()
 		.failure()
 		.stderr(predicate::str::contains("no shell.nix"));
+}
+
+#[test]
+fn export_closure_requires_at_least_one_name() {
+	// Target-first grammar: names are required (clap error, before any nix).
+	Project::new()
+		.clinix(&["env", "export", "closure"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("required").or(predicate::str::contains("<NAMES>")));
 }
 
 #[test]
