@@ -247,19 +247,27 @@ fn glob_match(pat: &[u8], s: &[u8]) -> bool {
 }
 
 /// A nix compose expression that imports the pinned nixpkgs (read from `lock`) and
-/// **unions** the `seeds` fragments via `inputsFrom` (the `compose-dev.nix`
-/// mechanism). `seeds` are the fragment files **in composition order**; `label`
-/// is the human name (e.g. `"claude rust"`). All seeds share the one pin, so there
-/// is a single nixpkgs instance (fragments-only, no multi-pin — the design's §5).
+/// **unions** the imported shells via `inputsFrom` (the `compose-dev.nix`
+/// mechanism), in composition order; `label` is the human name (e.g.
+/// `"claude rust"`). One `lock` = a single nixpkgs instance.
+///
+/// Each import is `(shell_file, inject_pkgs)`: a **seed** fragment takes the shared
+/// `pkgs` (`inject_pkgs = true` → `{ inherit pkgs; }`); a **self-contained** env's
+/// shell computes its own `pkgs` from its own (byte-identical, shared) `flake.lock`
+/// (`inject_pkgs = false` → `{ }`), so mixing a project with seeds is coherent when
+/// they share a pin (the shared-`flake.lock` union).
 pub fn compose_expr(
 	lock: &Path,
-	seeds: &[PathBuf],
+	imports: &[(PathBuf, bool)],
 	label: &str,
 	nixpkgs_config: Option<&Path>,
 ) -> String {
-	let imports = seeds
+	let imports = imports
 		.iter()
-		.map(|p| format!("    (import {} {{ inherit pkgs; }})", nix_str(p)))
+		.map(|(p, inject)| {
+			let args = if *inject { "{ inherit pkgs; }" } else { "{ }" };
+			format!("    (import {} {args})", nix_str(p))
+		})
 		.collect::<Vec<_>>()
 		.join("\n");
 	let sanitized = label.replace(' ', "-");
@@ -412,21 +420,25 @@ mod tests {
 	#[test]
 	fn compose_expr_unions_fragments_in_order_against_one_pin() {
 		let lock = PathBuf::from("/cfg/flake.lock");
-		let seeds = vec![PathBuf::from("/s/rust.nix"), PathBuf::from("/s/claude.nix")];
-		let expr = compose_expr(&lock, &seeds, "rust claude", None);
+		// A seed (inject pkgs) and a self-contained project shell (reads its own
+		// shared lock → no injection): the shared-flake.lock union shape.
+		let imports = vec![
+			(PathBuf::from("/s/rust.nix"), true),
+			(PathBuf::from("/proj/shell.nix"), false),
+		];
+		let expr = compose_expr(&lock, &imports, "rust proj", None);
 		assert!(expr.contains("builtins.readFile \"/cfg/flake.lock\""));
 		assert!(expr.contains("import \"/s/rust.nix\" { inherit pkgs; }"));
-		assert!(expr.contains("import \"/s/claude.nix\" { inherit pkgs; }"));
+		assert!(expr.contains("import \"/proj/shell.nix\" { }"), "self-contained: no inject");
 		// composition order preserved (caller sorts lexically or honors -o).
-		assert!(expr.find("/s/rust.nix").unwrap() < expr.find("/s/claude.nix").unwrap());
+		assert!(expr.find("/s/rust.nix").unwrap() < expr.find("/proj/shell.nix").unwrap());
 		assert!(expr.contains("inputsFrom"));
-		assert!(expr.contains("name = \"rust-claude\";"), "sanitized store name");
-		assert!(expr.contains("rust claude"), "un-sanitized label in the hook");
+		assert!(expr.contains("name = \"rust-proj\";"), "sanitized store name");
 		assert!(!expr.contains("config = import"), "no nixpkgs config by default");
 
 		// A nixpkgs config file is applied to the nixpkgs import (allowUnfree etc.).
 		let cfg = PathBuf::from("/cfg/nixpkgs-config.nix");
-		let expr2 = compose_expr(&lock, &seeds, "rust claude", Some(&cfg));
+		let expr2 = compose_expr(&lock, &imports, "rust proj", Some(&cfg));
 		assert!(expr2.contains("config = import \"/cfg/nixpkgs-config.nix\";"));
 	}
 

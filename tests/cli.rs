@@ -338,17 +338,35 @@ fn new_warns_when_the_name_shadows_a_seed() {
 }
 
 #[test]
-fn run_mixing_a_project_env_into_a_seed_stack_is_deferred() {
-	// A stack must be all seeds for now (self-contained composition deferred).
-	// `.` (cwd project) + a seed hits that boundary before any nix call.
+fn union_of_envs_with_differing_locks_is_rejected() {
+	// A union of self-contained envs is allowed only when they share a flake.lock;
+	// two registry envs with *different* locks hit that boundary before any nix.
+	let p = Project::new();
+	p.seed_registry_env("a", "{ pkgs }: pkgs.mkShell { }\n"); // lock = MINIMAL_LOCK
+	// `b` with a byte-different lock (changed rev).
+	let b = p.env_dir("b");
+	std::fs::create_dir_all(&b).unwrap();
+	std::fs::write(b.join("shell.nix"), "{ pkgs }: pkgs.mkShell { }\n").unwrap();
+	std::fs::write(
+		b.join("flake.lock"),
+		common::MINIMAL_LOCK.replace("abc1234567890def", "fff0000000000000"),
+	)
+	.unwrap();
+	p.clinix(&["env", "run", "a", "b", "--", "true"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("only a shared flake.lock is supported"));
+}
+
+#[test]
+fn union_env_without_a_lock_is_rejected() {
+	// `.` (cwd project, no flake.lock) cannot join a union.
 	let p = Project::new();
 	p.seed("dev", "{ pkgs }: pkgs.mkShell { }\n");
 	p.clinix(&["env", "run", ".", "dev", "--", "true"])
 		.assert()
 		.failure()
-		.stderr(predicate::str::contains(
-			"composing a self-contained env/file into a union",
-		));
+		.stderr(predicate::str::contains("has no flake.lock"));
 }
 
 #[test]
@@ -495,10 +513,10 @@ const FLAKE_LOCK: &str = r#"{
 "#;
 
 #[test]
-fn pin_all_freezes_to_a_standard_rev() {
+fn flake_freeze_freezes_to_a_standard_rev() {
 	let p = Project::new();
 	std::fs::write(p.file("flake.lock"), FLAKE_LOCK).unwrap();
-	p.clinix(&["env", "pin", ".", "--all"])
+	p.clinix(&["env", "flake", ".", "freeze"])
 		.assert()
 		.success()
 		.stdout(predicate::str::contains("frozen"));
@@ -509,26 +527,57 @@ fn pin_all_freezes_to_a_standard_rev() {
 }
 
 #[test]
-fn unpin_all_without_branch_is_a_clear_error() {
+fn flake_unfreeze_without_branch_is_a_clear_error() {
 	Project::new()
-		.clinix(&["env", "unpin", ".", "--all"])
+		.clinix(&["env", "flake", ".", "unfreeze"])
 		.assert()
 		.failure()
-		.stderr(predicate::str::contains("--branch"));
+		.stderr(predicate::str::contains("branch"));
 }
 
 #[test]
-fn pin_requires_all_and_defers_per_package() {
+fn flake_requires_a_subcommand() {
 	Project::new()
-		.clinix(&["env", "pin", "."]) // neither --all nor packages
+		.clinix(&["env", "flake", "."]) // no add/rm/freeze/unfreeze
+		.assert()
+		.failure();
+}
+
+/// A two-input lock (nixpkgs + `extra`) for the pure `pin rm` edit.
+const TWO_INPUT_LOCK: &str = r#"{
+  "nodes": {
+    "extra": {
+      "locked": { "narHash": "sha256-y", "owner": "o", "repo": "r", "rev": "def456", "type": "github" },
+      "original": { "owner": "o", "repo": "r", "type": "github" }
+    },
+    "nixpkgs": {
+      "locked": { "narHash": "sha256-x", "owner": "NixOS", "repo": "nixpkgs", "rev": "abc123", "type": "github" },
+      "original": { "owner": "NixOS", "ref": "nixos-26.05", "repo": "nixpkgs", "type": "github" }
+    },
+    "root": { "inputs": { "extra": "extra", "nixpkgs": "nixpkgs" } }
+  },
+  "root": "root",
+  "version": 7
+}
+"#;
+
+#[test]
+fn flake_rm_removes_an_input_and_unknown_errors() {
+	// `pin rm` is a pure lock edit — no nix.
+	let p = Project::new();
+	std::fs::write(p.file("flake.lock"), TWO_INPUT_LOCK).unwrap();
+	p.clinix(&["env", "flake", ".", "rm", "extra"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("removed input `extra`"));
+	let lock = std::fs::read_to_string(p.file("flake.lock")).unwrap();
+	assert!(!lock.contains("def456"), "the extra node is gone");
+	assert!(lock.contains("nixpkgs"), "nixpkgs remains");
+	// Removing a nonexistent input is a clear error.
+	p.clinix(&["env", "flake", ".", "rm", "ghost"])
 		.assert()
 		.failure()
-		.stderr(predicate::str::contains("--all"));
-	Project::new()
-		.clinix(&["env", "pin", ".", "ripgrep"]) // per-package
-		.assert()
-		.failure()
-		.stderr(predicate::str::contains("phase 4"));
+		.stderr(predicate::str::contains("no input `ghost`"));
 }
 
 // ---- registry: list / rename / clean (offline filesystem ops) ---------------

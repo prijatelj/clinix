@@ -51,22 +51,72 @@ pub struct Pkgs {
 	pub sort: bool,
 }
 
-/// Package pin/unpin selection (shared by `pin`/`unpin`).
+/// `flake` — manage the env's `flake.lock` inputs (flake objects): add/remove an
+/// input, or freeze/unfreeze the whole env. So the lock is machine-edited rather
+/// than hand-edited.
 #[derive(Args, Debug)]
-pub struct Pin {
+pub struct Flake {
 	/// Target env name.
 	pub name: String,
-	/// Packages to pin/unpin. Empty with `--all` operates on the whole closure.
-	pub packages: Vec<Pkg>,
-	/// Freeze/unfreeze the whole env: pin every input at its current rev
-	/// (closure-equivalent full pin), or (`unpin`) resume tracking.
+	#[command(subcommand)]
+	pub action: FlakeAction,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum FlakeAction {
+	/// Add a flake input (github or git) to the lock.
+	Add(FlakeAdd),
+	/// Remove a flake input from the lock by node name.
+	Rm(FlakeRm),
+	/// Freeze the whole env: pin every tracked input at its current rev.
+	Freeze,
+	/// Unfreeze the whole env: resume tracking a branch/tag (`--branch`).
+	Unfreeze(FlakeUnfreeze),
+}
+
+/// `flake <env> add <github|git> …` — resolve + add one input.
+#[derive(Args, Debug)]
+pub struct FlakeAdd {
+	#[command(subcommand)]
+	pub kind: AddKind,
+	/// Input node name (default: the github repo, or the git url's basename).
+	#[arg(long = "name")]
+	pub node_name: Option<String>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum AddKind {
+	/// A GitHub input `owner/repo`, tracking `-b <branch>` or frozen `--at <rev>`.
+	Github {
+		owner: String,
+		repo: String,
+		#[arg(short = 'b', long)]
+		branch: Option<String>,
+		#[arg(long = "at")]
+		at: Option<String>,
+	},
+	/// A git input `<url>`, tracking `-b <branch>` (default: the remote's HEAD).
+	Git {
+		url: String,
+		#[arg(short = 'b', long)]
+		branch: Option<String>,
+	},
+}
+
+/// `flake <env> rm <input>`.
+#[derive(Args, Debug)]
+pub struct FlakeRm {
+	/// Input node name to remove.
+	pub input: String,
+}
+
+/// `flake <env> unfreeze --branch <ref>`.
+#[derive(Args, Debug)]
+pub struct FlakeUnfreeze {
+	/// The branch/tag to resume tracking. Required for now (clinix does not yet
+	/// remember the pre-freeze ref — that arrives with `clinixEnv`).
 	#[arg(long)]
-	pub all: bool,
-	/// For `unpin --all`: the branch/tag to track again. Required for now
-	/// (clinix does not yet remember the pre-freeze ref — that arrives with
-	/// `clinixEnv`).
-	#[arg(long)]
-	pub branch: Option<String>,
+	pub branch: String,
 }
 
 #[derive(Args, Debug)]
@@ -396,14 +446,112 @@ fn report(changed_label: &str, skipped_label: &str, edit: &super::nix_edit::Edit
 	}
 }
 
-/// Freeze the whole env: pin every tracked input at its current rev (`--all`).
-/// Ports `pin freeze` — a standard `flake.lock` edit (`original`: drop `ref`, add
-/// `rev`), plus the `flake.nix` URL swap for `--flake` envs. Offline (copies
-/// `locked.rev`; no resolve). Per-package pinning (`pin <pkg>[=<ver>]`) is phase 4.
-pub fn pin(args: Pin, context: &Context) -> Result<()> {
-	require_scope(&args, "env pin")?;
-	let mut project = Project::load(resolve(&context.config, Some(&args.name))?)?;
-	let flake_lock = require_flake_lock(&project.env, "env pin")?;
+/// `flake` dispatch: add/remove a flake input, or freeze/unfreeze the whole env.
+pub fn flake(args: Flake, context: &Context) -> Result<()> {
+	match args.action {
+		FlakeAction::Add(add) => flake_add(&args.name, add, context),
+		FlakeAction::Rm(rm) => flake_rm(&args.name, &rm.input, context),
+		FlakeAction::Freeze => flake_freeze(&args.name, context),
+		FlakeAction::Unfreeze(u) => flake_unfreeze(&args.name, &u.branch, context),
+	}
+}
+
+/// `flake <env> add <github|git> …` — resolve one input and splice it into the lock
+/// (a machine-edited `flake.lock`; the user never hand-edits). github reuses the
+/// tested `resolve_github`; git uses `nix-prefetch-git`.
+fn flake_add(name: &str, add: FlakeAdd, context: &Context) -> Result<()> {
+	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
+	let flake_lock = require_flake_lock(&project.env, "env flake add")?;
+
+	let (node, locked, original, summary) = match add.kind {
+		AddKind::Github {
+			owner,
+			repo,
+			branch,
+			at,
+		} => {
+			let node = add.node_name.unwrap_or_else(|| repo.clone());
+			match (branch, at) {
+				(_, Some(rev)) => {
+					let nar = crate::nix::github_tarball_narhash(&owner, &repo, &rev)?;
+					(
+						node,
+						Source::github_locked(&owner, &repo, &rev, nar.as_str()),
+						Source::github_rev(&owner, &repo, &rev),
+						format!("github:{owner}/{repo} frozen @ {:.9}", rev),
+					)
+				}
+				(Some(b), None) => {
+					let (rev, nar) = crate::nix::resolve_github(&owner, &repo, &b)?;
+					(
+						node,
+						Source::github_locked(&owner, &repo, rev.as_str(), nar.as_str()),
+						Source::github_ref(&owner, &repo, &b),
+						format!("github:{owner}/{repo} tracking {b} @ {:.9}", rev.as_str()),
+					)
+				}
+				(None, None) => {
+					return Err(ClinixError::Resolve(
+						"give `-b <branch>` (track a branch/tag) or `--at <rev>` (freeze)".into(),
+					));
+				}
+			}
+		}
+		AddKind::Git { url, branch } => {
+			let node = add.node_name.unwrap_or_else(|| git_basename(&url));
+			let (rev, nar) = crate::nix::resolve_git(&url, branch.as_deref())?;
+			let summary = match &branch {
+				Some(b) => format!("git {url} tracking {b} @ {:.9}", rev.as_str()),
+				None => format!("git {url} @ {:.9}", rev.as_str()),
+			};
+			(
+				node,
+				Source::git_locked(&url, rev.as_str(), nar.as_str(), branch.as_deref()),
+				Source::git_ref_source(&url, branch.as_deref()),
+				summary,
+			)
+		}
+	};
+
+	project.lock.add_input(&node, locked, original)?;
+	std::fs::write(&flake_lock, project.lock.to_json())?;
+	println!("added input `{node}` ({summary})");
+	Ok(())
+}
+
+/// `flake <env> rm <input>` — drop a flake input's root edge (and its node when
+/// nothing else references it).
+fn flake_rm(name: &str, input: &str, context: &Context) -> Result<()> {
+	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
+	let flake_lock = require_flake_lock(&project.env, "env flake rm")?;
+	if !project.lock.remove_input(input) {
+		return Err(ClinixError::Resolve(format!("no input `{input}` in this env")));
+	}
+	if input == "nixpkgs" {
+		eprintln!("clinix: warning: removed `nixpkgs` — this env's shell.nix almost certainly needs it");
+	}
+	std::fs::write(&flake_lock, project.lock.to_json())?;
+	println!("removed input `{input}`");
+	Ok(())
+}
+
+/// The default node name for a git input: the url's last path segment, minus a
+/// trailing `.git`.
+fn git_basename(url: &str) -> String {
+	url.trim_end_matches('/')
+		.rsplit('/')
+		.next()
+		.unwrap_or("input")
+		.trim_end_matches(".git")
+		.to_string()
+}
+
+/// `flake <env> freeze` — pin every tracked input at its current rev. A standard
+/// `flake.lock` edit (`original`: drop `ref`, add `rev`) + the `flake.nix` URL swap
+/// for `--flake` envs. Offline (copies `locked.rev`; no resolve).
+fn flake_freeze(name: &str, context: &Context) -> Result<()> {
+	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
+	let flake_lock = require_flake_lock(&project.env, "env flake freeze")?;
 
 	let changes = freeze(&mut project.lock);
 	if changes.is_empty() {
@@ -423,19 +571,11 @@ pub fn pin(args: Pin, context: &Context) -> Result<()> {
 	Ok(())
 }
 
-/// Unfreeze the whole env: resume tracking `--branch <ref>` (`unpin --all`).
-/// Ports `pin unfreeze -b`. Requires `--branch` for now (no remembered ref yet).
-pub fn unpin(args: Pin, context: &Context) -> Result<()> {
-	require_scope(&args, "env unpin")?;
-	let Some(branch) = args.branch.as_deref() else {
-		return Err(ClinixError::Resolve(
-			"unpin needs `--branch <ref>` (clinix does not yet remember the pre-freeze branch; \
-			 that arrives with clinixEnv)"
-				.into(),
-		));
-	};
-	let mut project = Project::load(resolve(&context.config, Some(&args.name))?)?;
-	let flake_lock = require_flake_lock(&project.env, "env unpin")?;
+/// `flake <env> unfreeze --branch <ref>` — resume tracking `ref` for every frozen
+/// input. Requires `--branch` for now (no remembered ref yet).
+fn flake_unfreeze(name: &str, branch: &str, context: &Context) -> Result<()> {
+	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
+	let flake_lock = require_flake_lock(&project.env, "env flake unfreeze")?;
 
 	let changes = unfreeze(&mut project.lock, branch);
 	if changes.is_empty() {
@@ -450,22 +590,6 @@ pub fn unpin(args: Pin, context: &Context) -> Result<()> {
 	println!("tracking {branch}:");
 	for c in &kept {
 		println!("\t{}", c.name);
-	}
-	Ok(())
-}
-
-/// Require `--all` (per-package pinning is phase 4).
-fn require_scope(args: &Pin, verb: &str) -> Result<()> {
-	if !args.packages.is_empty() {
-		return Err(unimplemented(
-			verb,
-			"per-package pinning is phase 4 (version index); use `--all` to freeze the whole env",
-		));
-	}
-	if !args.all {
-		return Err(ClinixError::Resolve(format!(
-			"{verb}: give `--all` to freeze/unfreeze the whole env (per-package is phase 4)"
-		)));
 	}
 	Ok(())
 }

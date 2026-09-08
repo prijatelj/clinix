@@ -39,6 +39,6 @@ pub use import::Import;
 pub use info::{Deps, Info, InfoVerb, context_report};
 pub use init::Init;
 pub use new::New;
-pub use pkgs::{Pin, Pkg, Pkgs, Update};
+pub use pkgs::{Flake, Pkg, Pkgs, Update};
 pub use run::Run;
 pub use shell::Shell;

@@ -17,7 +17,7 @@ use super::import::Import;
 use super::info::{Deps, Info};
 use super::init::Init;
 use super::new::New;
-use super::pkgs::{self, Pin, Pkgs, Update};
+use super::pkgs::{self, Flake, Pkgs, Update};
 use super::run::Run;
 use super::shell::Shell;
 use super::{clean, info};
@@ -187,9 +187,10 @@ fn env_lock(env: &Env) -> Option<PathBuf> {
 /// Resolve a name list to a single instantiable [`Composition`] — the one place
 /// the target precedence + seed-stack composition live, shared by `launch` and
 /// `export`. Empty names ⇒ the cwd project. No nix eval or entry here; a stack
-/// writes its compose expression to `state/compose/`. Composing a self-contained
-/// env/file into a multi-node stack is still deferred (seeds-only stacks; a
-/// shared-`flake.lock` project union is the next step).
+/// writes its compose expression to `state/compose/`. A union may mix a
+/// self-contained env (project/registry/file) with seeds **only when all such
+/// envs share a byte-identical `flake.lock`** (the shared-pin union); the general
+/// multi-pin case stays deferred.
 pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Composition> {
 	let cfg = &ctx.config;
 	let settings = crate::env::config::Settings::load(&cfg.config_dir)?;
@@ -237,40 +238,55 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 		_ => {}
 	}
 
-	// Otherwise a stack: v1 composes seeds only. A self-contained node (env or
-	// file) in a multi-node stack needs self-contained composition (deferred).
-	let mut seeds: Vec<(String, PathBuf)> = Vec::with_capacity(nodes.len());
+	// Otherwise a **union** of 2+ nodes. Seeds inject the shared `pkgs`;
+	// self-contained nodes (project/registry env, `*.nix` file) read their own
+	// `flake.lock` — permitted **only when all such locks are byte-identical** (a
+	// shared pin), else the multi-pin case stays deferred.
+	let mut items: Vec<UnionItem> = Vec::with_capacity(nodes.len());
 	for node in &nodes {
-		match node {
-			Node::Seed { name, path } => seeds.push((name.clone(), path.clone())),
-			Node::Env(_) | Node::File { .. } => {
-				return Err(crate::error::unimplemented(
-					"composing a self-contained env/file into a union",
-					"seeds-only unions for now; a shared-flake.lock project union is the next step",
-				));
-			}
-		}
+		items.push(union_item(node)?);
 	}
+
+	// The shared pin: every self-contained node's lock must be identical; else the
+	// seeds compose against the configured seed pin (an all-seeds union).
+	let sc_locks: Vec<&PathBuf> = items.iter().filter_map(|i| i.lock.as_ref()).collect();
+	let lock = match sc_locks.first() {
+		Some(first) => {
+			let first_bytes = std::fs::read(first)?;
+			for other in &sc_locks[1..] {
+				if std::fs::read(other)? != first_bytes {
+					return Err(crate::error::unimplemented(
+						"composing envs with differing flake.locks",
+						"only a shared flake.lock is supported at this time — every env in a \
+						 union must share one pin",
+					));
+				}
+			}
+			(*first).clone()
+		}
+		None => seed_lock(cfg, &settings)?,
+	};
 
 	// Order: lexical by default; `-o` preserves the given order.
 	if !ctx.options.ordered {
-		seeds.sort_by(|a, b| a.0.cmp(&b.0));
+		items.sort_by(|a, b| a.label.cmp(&b.label));
 	}
-	let label = seeds
+	let label = items
 		.iter()
-		.map(|(n, _)| n.as_str())
+		.map(|i| i.label.as_str())
 		.collect::<Vec<_>>()
 		.join(" ");
-	let paths: Vec<PathBuf> = seeds.iter().map(|(_, p)| p.clone()).collect();
+	let imports: Vec<(PathBuf, bool)> = items.iter().map(|i| (i.shell.clone(), i.inject)).collect();
 
-	// Compose against the configured nixpkgs pin; the compose file is keyed by the
-	// ordered stack so re-running the same stack reuses it.
-	let lock = seed_lock(cfg, &settings)?;
 	let nixpkgs_config = nixpkgs_config_path(&settings)?;
-	let expr = crate::env::seeds::compose_expr(&lock, &paths, &label, nixpkgs_config.as_deref());
+	let expr = crate::env::seeds::compose_expr(&lock, &imports, &label, nixpkgs_config.as_deref());
 	let key = format!(
 		"stack-{}",
-		seeds.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join("-")
+		items
+			.iter()
+			.map(|i| sanitize_key(&i.label))
+			.collect::<Vec<_>>()
+			.join("-")
 	);
 	let compose_dir = registry::compose_dir(cfg);
 	std::fs::create_dir_all(&compose_dir)?;
@@ -282,6 +298,73 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 		root: registry::roots_dir(cfg).join(&key),
 		lock: Some(lock),
 	})
+}
+
+/// One node's contribution to a union: the shell file to import, whether to inject
+/// the shared `pkgs` (seeds do; self-contained shells read their own lock), and its
+/// own `flake.lock` for the shared-pin check (self-contained only).
+struct UnionItem {
+	label: String,
+	shell: PathBuf,
+	inject: bool,
+	lock: Option<PathBuf>,
+}
+
+fn union_item(node: &Node) -> Result<UnionItem> {
+	Ok(match node {
+		Node::Seed { name, path } => UnionItem {
+			label: name.clone(),
+			shell: path.clone(),
+			inject: true,
+			lock: None,
+		},
+		Node::Env(env) => {
+			let lock = env_lock(env).ok_or_else(|| {
+				ClinixError::Config(format!(
+					"`{}` has no flake.lock — it cannot join a shared-flake.lock union",
+					env_label(env)
+				))
+			})?;
+			UnionItem {
+				label: env_label(env),
+				shell: env_shell_file(&env.root)?,
+				inject: false,
+				lock: Some(lock),
+			}
+		}
+		Node::File { path } => {
+			let lock = path
+				.parent()
+				.map(|d| d.join("flake.lock"))
+				.filter(|l| l.is_file())
+				.ok_or_else(|| {
+					ClinixError::Config(format!(
+						"`{}` has no adjacent flake.lock — it cannot join a shared-flake.lock union",
+						path.display()
+					))
+				})?;
+			UnionItem {
+				label: file_label(path),
+				shell: path.clone(),
+				inject: false,
+				lock: Some(lock),
+			}
+		}
+	})
+}
+
+/// A label reduced to a filesystem-safe key segment (non-`[A-Za-z0-9_-]` → `_`).
+fn sanitize_key(label: &str) -> String {
+	label
+		.chars()
+		.map(|c| {
+			if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+				c
+			} else {
+				'_'
+			}
+		})
+		.collect()
 }
 
 /// Shared launcher for `shell`/`run`: [`compose_nodes`] the names, GC-root, and
@@ -463,10 +546,8 @@ pub enum Cmd {
 	Add(Pkgs),
 	/// Remove packages from an env's `shell.nix`.
 	Remove(Pkgs),
-	/// Pin package versions in `flake.lock` (`--all` = closure freeze).
-	Pin(Pin),
-	/// Unpin packages back to baseline tracking (`--all` = unfreeze).
-	Unpin(Pin),
+	/// Manage `flake.lock` inputs: `flake <env> add|rm|freeze|unfreeze`.
+	Flake(Flake),
 	/// Update unpinned packages to the latest the baseline provides.
 	Update(Update),
 
@@ -515,8 +596,7 @@ impl RunCmd for Cmd {
 			// Package management
 			Add(a) => pkgs::add(a, context),
 			Remove(a) => pkgs::remove(a, context),
-			Pin(a) => pkgs::pin(a, context),
-			Unpin(a) => pkgs::unpin(a, context),
+			Flake(a) => pkgs::flake(a, context),
 			Update(a) => a.run(context),
 
 			Shell(a) => a.run(context),

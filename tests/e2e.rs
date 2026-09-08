@@ -352,6 +352,67 @@ fn seed_catalog_composes_single_and_stacked_seeds() {
 	.success();
 }
 
+/// `pin add github` resolves a flake input and machine-edits the lock; `pin rm`
+/// removes it. Verifies the input add/remove round-trip against a real registry.
+#[test]
+#[ignore = "needs nix + network"]
+fn flake_add_github_input_then_rm_round_trips() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
+		.assert()
+		.success();
+	// A tiny, stable public repo.
+	p.clinix(&[
+		"env", "flake", ".", "add", "github", "numtide", "flake-utils", "-b", "main",
+	])
+	.assert()
+	.success()
+	.stdout(predicate::str::contains("added input `flake-utils`"));
+	let lock = std::fs::read_to_string(p.file("flake.lock")).unwrap();
+	assert!(lock.contains("\"repo\": \"flake-utils\""), "input added to the lock");
+	// And remove it (pure edit).
+	p.clinix(&["env", "flake", ".", "rm", "flake-utils"])
+		.assert()
+		.success();
+	assert!(!std::fs::read_to_string(p.file("flake.lock")).unwrap().contains("flake-utils"));
+}
+
+/// The **shared-`flake.lock` project ∪ dev union**: the cwd project (its own
+/// `shell.nix` + `flake.lock`) composed with a seed, which builds against the
+/// project's pin. Verifies mixing a self-contained env with seeds when they share
+/// a lock.
+#[test]
+#[ignore = "needs nix + network"]
+fn shared_lock_union_of_project_and_seed_runs() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
+		.assert()
+		.success();
+	p.seed(
+		"extra",
+		"{ pkgs }: pkgs.mkShell { packages = with pkgs; [ jq ]; }\n",
+	);
+	// `.` (project, reads its own lock) ∪ `extra` (seed, injected the shared pkgs).
+	p.clinix(&[
+		"env",
+		"run",
+		".",
+		"extra",
+		"--",
+		"sh",
+		"-c",
+		"rg --version >/dev/null && jq --version >/dev/null",
+	])
+	.assert()
+	.success();
+}
+
 /// The flipped grammar exports the **union** of several envs: `export closure tool
 /// data` composes both seeds and serializes their combined closure.
 #[test]

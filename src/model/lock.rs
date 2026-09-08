@@ -57,6 +57,60 @@ impl FlakeLock {
 	pub fn root_node(&self) -> Option<&Node> {
 		self.nodes.get(&self.root)
 	}
+
+	/// Add a **direct** input `name` to the lock: a new leaf node
+	/// (`{locked, original}`) plus a root `inputs` edge to it. Errors if `name` is
+	/// already an input or collides with an existing node / the root. (`pin add`.)
+	pub fn add_input(&mut self, name: &str, locked: Source, original: Source) -> Result<()> {
+		if name == self.root {
+			return Err(crate::error::ClinixError::Config(format!(
+				"input name `{name}` is reserved (the root node)"
+			)));
+		}
+		if self.nodes.contains_key(name) {
+			return Err(crate::error::ClinixError::Config(format!(
+				"input `{name}` already exists — remove it first (`pin rm {name}`) or use --name"
+			)));
+		}
+		self.nodes.insert(
+			name.to_string(),
+			Node {
+				locked: Some(locked),
+				original: Some(original),
+				..Node::default()
+			},
+		);
+		if let Some(root) = self.nodes.get_mut(&self.root) {
+			root.inputs
+				.insert(name.to_string(), InputRef::Direct(name.to_string()));
+		}
+		Ok(())
+	}
+
+	/// Remove a **direct** input `name`: drop its root edge and, when nothing else
+	/// references the node, the node itself. Returns whether an input was removed.
+	/// (`pin rm`.)
+	pub fn remove_input(&mut self, name: &str) -> bool {
+		let had_edge = self
+			.nodes
+			.get_mut(&self.root)
+			.map(|root| root.inputs.remove(name).is_some())
+			.unwrap_or(false);
+		// Drop the node only if no remaining node references it (direct or follows).
+		let still_referenced = self.nodes.iter().any(|(k, node)| {
+			k != &self.root
+				&& node.inputs.values().any(|edge| match edge {
+					InputRef::Direct(t) => t == name,
+					InputRef::Follows(path) => path.first().map(String::as_str) == Some(name),
+				})
+		});
+		let had_node = if !still_referenced {
+			self.nodes.remove(name).is_some()
+		} else {
+			false
+		};
+		had_edge || had_node
+	}
 }
 
 /// One node in the lock graph. Fields are declared alphabetically (`flake`,
@@ -196,6 +250,31 @@ impl Source {
 			("type", "github"),
 		])
 	}
+
+	/// A `git` **locked** source: `{narHash, ref?, rev, type, url}` (the `ref` is
+	/// included only when tracking a branch/tag).
+	pub fn git_locked(url: &str, rev: &str, nar_hash: &str, git_ref: Option<&str>) -> Source {
+		let mut pairs = vec![("narHash", nar_hash)];
+		if let Some(r) = git_ref {
+			pairs.push(("ref", r));
+		}
+		pairs.push(("rev", rev));
+		pairs.push(("type", "git"));
+		pairs.push(("url", url));
+		Source::from_pairs(&pairs)
+	}
+
+	/// A `git` **original**: `{ref?, type, url}` (branch/tag tracked, or a bare url
+	/// frozen at a rev when `git_ref` is `None`).
+	pub fn git_ref_source(url: &str, git_ref: Option<&str>) -> Source {
+		let mut pairs = Vec::new();
+		if let Some(r) = git_ref {
+			pairs.push(("ref", r));
+		}
+		pairs.push(("type", "git"));
+		pairs.push(("url", url));
+		Source::from_pairs(&pairs)
+	}
 }
 
 /// The recognized source `type`s. `github` and `tarball` are the v0.1 pin paths
@@ -232,5 +311,102 @@ impl LockedKind {
 			Some(other) => Self::Other(other.to_string()),
 			std::option::Option::None => Self::None,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn one_input_lock() -> FlakeLock {
+		let mut nodes = BTreeMap::new();
+		nodes.insert(
+			"nixpkgs".to_string(),
+			Node {
+				locked: Some(Source::github_locked("NixOS", "nixpkgs", "abc123", "sha256-x")),
+				original: Some(Source::github_ref("NixOS", "nixpkgs", "nixos-26.05")),
+				..Node::default()
+			},
+		);
+		let mut inputs = BTreeMap::new();
+		inputs.insert("nixpkgs".to_string(), InputRef::Direct("nixpkgs".to_string()));
+		nodes.insert(
+			"root".to_string(),
+			Node {
+				inputs,
+				..Node::default()
+			},
+		);
+		FlakeLock {
+			nodes,
+			root: "root".to_string(),
+			version: 7,
+		}
+	}
+
+	#[test]
+	fn add_input_inserts_node_and_root_edge() {
+		let mut lock = one_input_lock();
+		lock.add_input(
+			"helper",
+			Source::github_locked("o", "r", "def456", "sha256-y"),
+			Source::github_ref("o", "r", "main"),
+		)
+		.unwrap();
+		assert!(lock.nodes.contains_key("helper"));
+		assert_eq!(
+			lock.root_node().unwrap().inputs.get("helper"),
+			Some(&InputRef::Direct("helper".to_string()))
+		);
+		// A duplicate name is rejected; `root` is reserved.
+		assert!(lock
+			.add_input("helper", Source::github_ref("o", "r", "x"), Source::github_ref("o", "r", "x"))
+			.is_err());
+		assert!(lock
+			.add_input("root", Source::github_ref("o", "r", "x"), Source::github_ref("o", "r", "x"))
+			.is_err());
+	}
+
+	#[test]
+	fn remove_input_drops_edge_and_node() {
+		let mut lock = one_input_lock();
+		lock.add_input(
+			"helper",
+			Source::github_locked("o", "r", "def456", "sha256-y"),
+			Source::github_ref("o", "r", "main"),
+		)
+		.unwrap();
+		assert!(lock.remove_input("helper"));
+		assert!(!lock.nodes.contains_key("helper"));
+		assert!(lock.root_node().unwrap().inputs.get("helper").is_none());
+		// Removing an absent input reports false.
+		assert!(!lock.remove_input("ghost"));
+	}
+
+	#[test]
+	fn git_sources_have_the_expected_shape() {
+		let locked = Source::git_locked("https://x/y.git", "deadbeef", "sha256-z", Some("main"));
+		assert_eq!(locked.source_type(), Some("git"));
+		assert_eq!(locked.url(), Some("https://x/y.git"));
+		assert_eq!(locked.rev(), Some("deadbeef"));
+		assert_eq!(locked.git_ref(), Some("main"));
+		// A frozen git original omits `ref`.
+		let orig = Source::git_ref_source("https://x/y.git", None);
+		assert_eq!(orig.git_ref(), None);
+		assert_eq!(orig.source_type(), Some("git"));
+	}
+
+	#[test]
+	fn add_then_serialize_round_trips() {
+		let mut lock = one_input_lock();
+		lock.add_input(
+			"helper",
+			Source::git_locked("https://x/y.git", "deadbeef", "sha256-z", Some("main")),
+			Source::git_ref_source("https://x/y.git", Some("main")),
+		)
+		.unwrap();
+		let json = lock.to_json();
+		let back = FlakeLock::from_json(&json).unwrap();
+		assert_eq!(back, lock, "lock round-trips byte-losslessly after add");
 	}
 }

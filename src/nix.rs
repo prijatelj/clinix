@@ -119,6 +119,37 @@ pub fn resolve_github(owner: &str, repo: &str, git_ref: &str) -> Result<(Rev, Na
 	Ok((rev, nar_hash))
 }
 
+/// Resolve a **git** input to `(rev, narHash)` via `nix-prefetch-git`, which both
+/// resolves the ref and hashes the checkout in one call. `git_ref` is a branch/tag
+/// (`None` = the remote's default branch). Used by `pin add git`.
+pub fn resolve_git(url: &str, git_ref: Option<&str>) -> Result<(Rev, NarHash)> {
+	let mut cmd = Command::new("nix-prefetch-git");
+	cmd.args(["--url", url, "--quiet"]);
+	if let Some(r) = git_ref {
+		cmd.args(["--rev", r]);
+	}
+	let out = run(cmd)?;
+	let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+		.map_err(|e| ClinixError::Resolve(format!("nix-prefetch-git gave no JSON for {url}: {e}")))?;
+	let rev: Rev = json
+		.get("rev")
+		.and_then(|v| v.as_str())
+		.ok_or_else(|| ClinixError::Resolve(format!("nix-prefetch-git: no rev for {url}")))?
+		.parse()?;
+	// Prefer an SRI `hash` (recent nix-prefetch-git); else convert the base32 `sha256`.
+	let nar_hash = match json.get("hash").and_then(|v| v.as_str()) {
+		Some(h) if h.starts_with("sha256-") => h.parse()?,
+		_ => {
+			let sha = json
+				.get("sha256")
+				.and_then(|v| v.as_str())
+				.ok_or_else(|| ClinixError::Resolve(format!("nix-prefetch-git: no sha256 for {url}")))?;
+			to_sri(sha)?
+		}
+	};
+	Ok((rev, nar_hash))
+}
+
 /// GC-root a nix file's derivation and return its `.drv` store path:
 /// `nix-instantiate <file> --add-root <root> --indirect`. Rooting is why a shell
 /// entered through clinix survives `nix-collect-garbage` (plain `nix-shell` does
