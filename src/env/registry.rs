@@ -3,6 +3,13 @@
 //! registry) the **filesystem *is* the index** — there is no database, so `list`
 //! is a `readdir`, `rename` is a `mv`, and there is nothing to keep in sync.
 //!
+//! **Two indirect roots per entered env** ([`root_path`] + its [`rt_root`] sibling):
+//! `roots/<key>` points at the env's `.drv` (its eval/source graph → offline
+//! re-eval), while `roots/<key>.rt` points at the realized output of the shell's
+//! `inputDerivation` (its *complete* build closure → the retention guarantee, which
+//! holds regardless of `keep-outputs`; see [`crate::nix::root_input_closure`]).
+//! [`release_root`] drops both; [`rename`] moves both.
+//!
 //! This module also owns **GC-root path keying**, the rename-correctness fix:
 //! registry envs key their root by **name** (`env-<name>`, so a rename is `mv` +
 //! one symlink rename, O(1)), while projects key by **path slug** (`proj-<slug>`,
@@ -53,10 +60,27 @@ pub fn root_key(env: &Env) -> String {
 	}
 }
 
-/// The full GC-root path for an env: `state/roots/<key>`. One indirect root per
-/// env; re-entering after an `update` overwrites it, unrooting the previous drv.
+/// The full GC-root path for an env: `state/roots/<key>` (the `.drv` root).
+/// Re-entering after an `update` overwrites it, unrooting the previous drv.
 pub fn root_path(cfg: &Config, env: &Env) -> PathBuf {
 	roots_dir(cfg).join(root_key(env))
+}
+
+/// The `state/roots/<key>` GC-root path for a **File** target (`*.nix` run directly):
+/// `file-<path-slug>` (`/`→`_`). Shared by the launcher and `clean` so both agree on
+/// the key.
+pub fn file_root(cfg: &Config, path: &std::path::Path) -> PathBuf {
+	let slug = path.to_string_lossy().replace('/', "_");
+	roots_dir(cfg).join(format!("file-{}", slug.trim_start_matches('_')))
+}
+
+/// The **`.rt` sibling** of a `.drv` root (`roots/<key>` → `roots/<key>.rt`): the
+/// indirect root on the env's `inputDerivation` output. Appends `.rt` to the file
+/// name (not `with_extension`, which would clobber a `.`-containing path slug).
+pub fn rt_root(root: &std::path::Path) -> PathBuf {
+	let mut name = root.as_os_str().to_os_string();
+	name.push(".rt");
+	PathBuf::from(name)
 }
 
 /// Enumerate registry env names (sorted). An absent `envs/` dir means "no
@@ -95,26 +119,36 @@ pub fn rename(cfg: &Config, old: &str, new: &str) -> Result<()> {
 	}
 	fs::rename(&src, &dst)?;
 
-	// Keep the GC root aligned with the new name (env-<name> keying). Absent root
-	// = the env was never entered; nothing to move.
+	// Keep both GC roots aligned with the new name (env-<name> keying). Absent root
+	// = the env was never entered; nothing to move. The `.rt` sibling moves too.
 	let roots = roots_dir(cfg);
-	let old_root = roots.join(format!("env-{old}"));
-	if old_root.symlink_metadata().is_ok() {
-		fs::rename(old_root, roots.join(format!("env-{new}")))?;
+	let old_drv = roots.join(format!("env-{old}"));
+	let new_drv = roots.join(format!("env-{new}"));
+	for (from, to) in [
+		(old_drv.clone(), new_drv.clone()),
+		(rt_root(&old_drv), rt_root(&new_drv)),
+	] {
+		if from.symlink_metadata().is_ok() {
+			fs::rename(from, to)?;
+		}
 	}
 	Ok(())
 }
 
-/// Release an env's GC root so `nix-collect-garbage` can reap its store paths.
-/// Returns whether a root was present (so callers can report accurately). Removes
-/// the symlink only — the env's `shell.nix`/`flake.lock` are untouched.
-pub fn clean(cfg: &Config, env: &Env) -> Result<bool> {
-	let path = root_path(cfg, env);
-	match fs::remove_file(&path) {
-		Ok(()) => Ok(true),
-		Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-		Err(e) => Err(e.into()),
+/// Release a GC root **and its `.rt` sibling** so `nix-collect-garbage` can reap the
+/// env's store paths. Returns whether *either* was present (so callers can report a
+/// no-op accurately). Removes the symlinks only — the env's `shell.nix`/`flake.lock`
+/// are untouched.
+pub fn release_root(root: &std::path::Path) -> Result<bool> {
+	let mut released = false;
+	for p in [root.to_path_buf(), rt_root(root)] {
+		match fs::remove_file(&p) {
+			Ok(()) => released = true,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+			Err(e) => return Err(e.into()),
+		}
 	}
+	Ok(released)
 }
 
 /// A registry name is a **namespace** (it can hold `namespace:member` subshells),
@@ -132,7 +166,7 @@ pub fn validate_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use std::path::PathBuf;
+	use std::path::{Path, PathBuf};
 
 	fn env(name: Option<&str>, kind: Kind, root: &str) -> Env {
 		Env {
@@ -162,6 +196,49 @@ mod tests {
 		let after = env(Some("new"), Kind::Registry, "/state/envs/new");
 		assert_eq!(root_key(&before), "env-old");
 		assert_eq!(root_key(&after), "env-new");
+	}
+
+	#[test]
+	fn rt_root_appends_suffix_without_clobbering_a_dotted_slug() {
+		// `with_extension` would turn `…my.proj` into `…my.rt`; we must keep the slug.
+		assert_eq!(rt_root(Path::new("/s/roots/env-python")), Path::new("/s/roots/env-python.rt"));
+		assert_eq!(
+			rt_root(Path::new("/s/roots/proj-home_u_my.proj")),
+			Path::new("/s/roots/proj-home_u_my.proj.rt")
+		);
+	}
+
+	#[test]
+	fn file_root_slugs_the_path() {
+		let cfg = Config {
+			config_dir: PathBuf::from("/c"),
+			state_dir: PathBuf::from("/s"),
+		};
+		assert_eq!(
+			file_root(&cfg, Path::new("/home/u/dev.nix")),
+			PathBuf::from("/s/roots/file-home_u_dev.nix")
+		);
+	}
+
+	#[test]
+	fn release_root_removes_both_roots_and_is_a_noop_the_second_time() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path().join("env-x");
+		let rt = rt_root(&root);
+		std::fs::write(&root, "").unwrap();
+		std::fs::write(&rt, "").unwrap();
+
+		assert!(release_root(&root).unwrap(), "first release removes the roots");
+		assert!(!root.exists() && !rt.exists());
+		assert!(!release_root(&root).unwrap(), "second release is a no-op");
+	}
+
+	#[test]
+	fn release_root_reports_true_when_only_the_rt_sibling_is_present() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path().join("env-y");
+		std::fs::write(rt_root(&root), "").unwrap();
+		assert!(release_root(&root).unwrap());
 	}
 
 	#[test]

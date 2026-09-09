@@ -683,9 +683,11 @@ fn list_includes_seeds_from_the_catalog() {
 fn rename_moves_the_env_dir_and_its_gc_root() {
 	let p = Project::new();
 	p.seed_registry_env("old", REG_SHELL_NIX);
-	// Simulate an entered env: a name-keyed GC root exists.
-	std::fs::create_dir_all(p.state().join("roots")).unwrap();
+	// Simulate an entered env: both name-keyed GC roots exist (`.drv` + `.rt`).
+	let roots = p.state().join("roots");
+	std::fs::create_dir_all(&roots).unwrap();
 	std::fs::write(p.env_root_link("old"), "drv").unwrap();
+	std::fs::write(roots.join("env-old.rt"), "rt").unwrap();
 
 	p.clinix(&["env", "rename", "old", "new"])
 		.assert()
@@ -697,9 +699,11 @@ fn rename_moves_the_env_dir_and_its_gc_root() {
 		p.env_dir("new").join("shell.nix").exists(),
 		"new env dir present"
 	);
-	// The rename-correctness invariant: the root followed the name.
-	assert!(!p.env_root_link("old").exists(), "old root gone");
-	assert!(p.env_root_link("new").exists(), "root re-keyed to new name");
+	// The rename-correctness invariant: both roots followed the name.
+	assert!(!p.env_root_link("old").exists(), "old drv root gone");
+	assert!(p.env_root_link("new").exists(), "drv root re-keyed to new name");
+	assert!(!roots.join("env-old.rt").exists(), "old rt root gone");
+	assert!(roots.join("env-new.rt").exists(), "rt root re-keyed to new name");
 }
 
 #[test]
@@ -734,23 +738,69 @@ fn rename_to_invalid_name_is_rejected() {
 }
 
 #[test]
-fn clean_removes_the_gc_root_and_is_idempotent() {
+fn clean_removes_both_gc_roots_and_is_idempotent() {
 	let p = Project::new();
 	p.seed_registry_env("web", REG_SHELL_NIX);
-	std::fs::create_dir_all(p.state().join("roots")).unwrap();
+	let roots = p.state().join("roots");
+	std::fs::create_dir_all(&roots).unwrap();
+	// Simulate an entered env: both the `.drv` root and its `.rt` (inputDerivation) sibling.
 	std::fs::write(p.env_root_link("web"), "drv").unwrap();
+	std::fs::write(roots.join("env-web.rt"), "rt").unwrap();
 
 	p.clinix(&["env", "clean", "web"])
 		.assert()
 		.success()
 		.stdout(predicate::str::contains("released GC root"));
-	assert!(!p.env_root_link("web").exists(), "root removed");
+	assert!(!p.env_root_link("web").exists(), "drv root removed");
+	assert!(!roots.join("env-web.rt").exists(), "rt root removed");
 
 	// A second clean is a no-op success, not an error.
 	p.clinix(&["env", "clean", "web"])
 		.assert()
 		.success()
 		.stdout(predicate::str::contains("no GC root"));
+}
+
+#[test]
+fn clean_releases_several_envs_independently() {
+	// `clean a b c` frees each named env's roots in turn (not a `stack-a_b_c` union).
+	let p = Project::new();
+	let roots = p.state().join("roots");
+	std::fs::create_dir_all(&roots).unwrap();
+	for name in ["a", "b"] {
+		p.seed_registry_env(name, REG_SHELL_NIX);
+		std::fs::write(p.env_root_link(name), "drv").unwrap();
+	}
+	// `c` is registered but never entered (no root) → reported as a no-op.
+	p.seed_registry_env("c", REG_SHELL_NIX);
+
+	p.clinix(&["env", "clean", "a", "b", "c"])
+		.assert()
+		.success()
+		.stdout(
+			predicate::str::contains("released GC root(s) for `a`")
+				.and(predicate::str::contains("released GC root(s) for `b`"))
+				.and(predicate::str::contains("`c` had no GC root")),
+		);
+	assert!(!p.env_root_link("a").exists());
+	assert!(!p.env_root_link("b").exists());
+}
+
+#[test]
+fn clean_reports_unknown_names_and_exits_nonzero() {
+	// An unknown name is reported per-name; the command still processes the rest,
+	// then exits nonzero so scripts detect the typo.
+	let p = Project::new();
+	std::fs::create_dir_all(p.state().join("roots")).unwrap();
+	p.seed_registry_env("real", REG_SHELL_NIX);
+	std::fs::write(p.env_root_link("real"), "drv").unwrap();
+
+	p.clinix(&["env", "clean", "ghost", "real"])
+		.assert()
+		.failure()
+		.stdout(predicate::str::contains("released GC root(s) for `real`"))
+		.stderr(predicate::str::contains("ghost"));
+	assert!(!p.env_root_link("real").exists(), "the real env is still cleaned");
 }
 
 // ---- check / info (contextual reporting; offline PATH+lock audit) -----------

@@ -243,7 +243,6 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 			});
 		}
 		[Node::File { path }] => {
-			let slug = path.to_string_lossy().replace('/', "_");
 			let lock = path
 				.parent()
 				.map(|d| d.join("flake.lock"))
@@ -251,8 +250,7 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 			return Ok(Composition {
 				shell_file: path.clone(),
 				label: file_label(path),
-				root: registry::roots_dir(cfg)
-					.join(format!("file-{}", slug.trim_start_matches('_'))),
+				root: registry::file_root(cfg, path),
 				lock,
 			});
 		}
@@ -301,14 +299,7 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 
 	let nixpkgs_config = nixpkgs_config_path(&settings)?;
 	let expr = crate::env::seeds::compose_expr(&lock, &imports, &label, nixpkgs_config.as_deref());
-	let key = format!(
-		"stack-{}",
-		items
-			.iter()
-			.map(|i| crate::env::naming::slug(&i.label, false, false, None))
-			.collect::<Vec<_>>()
-			.join("-")
-	);
+	let key = stack_key(items.iter().map(|i| i.label.as_str()));
 	let compose_dir = registry::compose_dir(cfg);
 	std::fs::create_dir_all(&compose_dir)?;
 	let compose_file = compose_dir.join(format!("{key}.nix"));
@@ -384,6 +375,17 @@ pub(crate) fn launch(
 ) -> Result<ExitStatus> {
 	let comp = compose_nodes(ctx, names)?;
 	let drv = crate::nix::instantiate_rooted(&comp.shell_file, &comp.root)?;
+	// The retention guarantee: root the complete build closure via `inputDerivation`
+	// (independent of `keep-outputs`). Non-fatal if the shell isn't an mkDerivation —
+	// the `.drv` root still stands, so we warn and enter anyway.
+	let rt = registry::rt_root(&comp.root);
+	if let Err(e) = crate::nix::root_input_closure(&comp.shell_file, &rt) {
+		eprintln!(
+			"clinix: warning: could not root `{}`'s full closure ({e}); \
+			 packages may be collected unless `keep-outputs = true`",
+			comp.label
+		);
+	}
 	crate::nix::nix_shell(&drv, pure, command)
 }
 
@@ -478,6 +480,38 @@ fn resolve_node(cfg: &Config, catalog: &crate::env::seeds::Catalog, name: &str) 
 	}
 }
 
+/// The `stack-<labels>` GC-root key for a seed/union composition: each label
+/// slugged and joined by `-`. One source of truth shared by [`compose_nodes`] (all
+/// members) and [`node_root`] (a single seed → `stack-<label>`, since the join of
+/// one element is itself).
+fn stack_key<'a>(labels: impl Iterator<Item = &'a str>) -> String {
+	format!(
+		"stack-{}",
+		labels
+			.map(|l| crate::env::naming::slug(l, false, false, None))
+			.collect::<Vec<_>>()
+			.join("-")
+	)
+}
+
+/// The GC-root path a single target *would* have been rooted under, computed with
+/// **no side effects** (no compose-file write, no lazy locking, no network) — so
+/// `clean` can locate an env/seed/file/project root offline. Mirrors
+/// [`compose_nodes`]' single-target keying exactly: a registry/project env →
+/// [`registry::root_path`], a `*.nix` file → [`registry::file_root`], a single seed
+/// → `stack-<label>` (the union branch's key for one member).
+pub(crate) fn node_root(
+	cfg: &Config,
+	catalog: &crate::env::seeds::Catalog,
+	name: &str,
+) -> Result<PathBuf> {
+	Ok(match resolve_node(cfg, catalog, name)? {
+		Node::Env(env) => registry::root_path(cfg, &env),
+		Node::File { path } => registry::file_root(cfg, &path),
+		Node::Seed { name, .. } => registry::roots_dir(cfg).join(stack_key(std::iter::once(name.as_str()))),
+	})
+}
+
 /// The lockfile providing the seed catalog's nixpkgs pin: a configured
 /// `flake_lock` path, or a ref clinix lazily locks into `<config>/flake.lock`
 /// (default `nixos-26.05`). Never a channel (the design's §0).
@@ -569,8 +603,8 @@ pub enum Cmd {
 	Import(Import),
 	/// Export an env to another format.
 	Export(Export),
-	/// Release an env's GC root so its store paths can be collected.
-	Clean(Target),
+	/// Release one or more envs' GC roots so their store paths can be collected.
+	Clean(Targets),
 
 	// -- execution: instantiate and enter/run a composition -------------------
 	/// Enter an interactive shell for the composed env(s).
@@ -693,6 +727,14 @@ pub struct Targets {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn stack_key_joins_slugged_labels_and_a_single_label_is_itself() {
+		// One source of truth for the union key and node_root's single-seed key: the
+		// join of one element equals that element, so a lone seed keys `stack-<label>`.
+		assert_eq!(stack_key(std::iter::once("rust")), "stack-rust");
+		assert_eq!(stack_key(["rust", "claude"].into_iter()), "stack-rust-claude");
+	}
 
 	#[test]
 	fn env_shell_file_prefers_shell_nix_then_default_nix() {

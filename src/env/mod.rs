@@ -35,7 +35,7 @@ pub use env::{
 	Cmd, Context, Env, EnvArgs, Kind, OptionalTarget, Rename, RunCmd, ShellOptions, Target,
 	Targets, resolve,
 };
-pub(crate) use env::{compose_nodes, launch};
+pub(crate) use env::{compose_nodes, launch, node_root};
 pub use execution::{Run, Shell};
 pub use export::{Export, ExportTarget};
 pub use import::Import;

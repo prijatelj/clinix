@@ -561,6 +561,13 @@ fn new_from_materializes_a_portable_env_that_composes_and_runs() {
 /// `run` is **exit-transparent** (mirrors the command's exact code, like the
 /// `~/dev_env` `exec nix-shell` prototype) and **GC-roots** the env on entry, so
 /// `nix-collect-garbage` cannot reap a shell you just entered. (Gaps A + B.)
+///
+/// Also asserts the **two-root** retention design: a `proj-*` `.drv` root *and* its
+/// `.rt` sibling — the indirect root on the shell's `inputDerivation` output, whose
+/// closure is the complete build environment (retained regardless of `keep-outputs`)
+/// — and that `clean .` releases both. (We do **not** run `nix-collect-garbage`: it
+/// acts on the shared store, so retention is proven by the root existing and
+/// resolving into `/nix/store`, which is what nix's GC honors.)
 #[test]
 #[ignore = "needs nix + network"]
 fn run_is_exit_transparent_and_roots_the_env_on_entry() {
@@ -581,11 +588,36 @@ fn run_is_exit_transparent_and_roots_the_env_on_entry() {
 	let has_proj_root = std::fs::read_dir(&roots)
 		.expect("roots dir should exist after entering an env")
 		.filter_map(Result::ok)
-		.any(|e| e.file_name().to_string_lossy().starts_with("proj-"));
+		.any(|e| {
+			let n = e.file_name();
+			let n = n.to_string_lossy();
+			n.starts_with("proj-") && !n.ends_with(".rt")
+		});
 	assert!(
 		has_proj_root,
 		"entering the env must create a proj-* GC root"
 	);
+
+	// The retention guarantee: a `.rt` inputDerivation root exists and is a real
+	// indirect root resolving into the store (its closure = the full build env).
+	let rt = std::fs::read_dir(&roots)
+		.unwrap()
+		.filter_map(Result::ok)
+		.find(|e| e.file_name().to_string_lossy().ends_with(".rt"))
+		.expect("entering the env must create a .rt inputDerivation GC root");
+	let target = std::fs::read_link(rt.path()).expect("the .rt root is a symlink");
+	assert!(
+		target.starts_with("/nix/store/"),
+		"the .rt root must resolve into the store, got {target:?}"
+	);
+
+	// `clean .` releases *both* roots so `nix-collect-garbage` can later reap them.
+	p.clinix(&["env", "clean", "."]).assert().success();
+	let remaining = std::fs::read_dir(&roots)
+		.unwrap()
+		.filter_map(Result::ok)
+		.count();
+	assert_eq!(remaining, 0, "clean must remove both the proj-* and .rt roots");
 
 	// Exit-transparency: a nonzero command propagates its *exact* code, not a
 	// blanket failure (false → 1; `exit 3` → 3).

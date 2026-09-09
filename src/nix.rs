@@ -166,6 +166,43 @@ pub fn instantiate_rooted(nix_file: &Path, root: &Path) -> Result<String> {
 	Ok(stdout_string(&run(cmd)?).trim().to_string())
 }
 
+/// GC-root an env's **complete realized build closure** via `mkShell`'s hidden
+/// `inputDerivation` attribute ([nixpkgs#95536]): a derivation whose *runtime*
+/// dependencies are the shell's *build-time* dependencies, so realizing and rooting
+/// its output keeps `stdenv`, `bash`, the setup hooks, and every `buildInput` (with
+/// their transitive closures) alive — **independent of `keep-outputs`**. This is the
+/// retention guarantee; [`instantiate_rooted`]'s `.drv` root only covers the
+/// eval/source graph (offline re-eval), not the built outputs.
+///
+/// Two classic steps: `nix-instantiate --expr '(import <shell> {}).inputDerivation'`
+/// for the drv, then `nix-store --realise <drv> --add-root <root> --indirect` to
+/// build it and register its output as an indirect root. Errors if the shell is not
+/// an `mkDerivation`/`mkShell` (no `inputDerivation`) — callers treat that as a
+/// non-fatal "no complete root" and keep the `.drv` root.
+///
+/// [nixpkgs#95536]: https://github.com/NixOS/nixpkgs/pull/95536
+pub fn root_input_closure(shell_nix: &Path, root: &Path) -> Result<()> {
+	if let Some(parent) = root.parent() {
+		std::fs::create_dir_all(parent)?;
+	}
+	let expr = format!(
+		"(import {} {{}}).inputDerivation",
+		crate::env::nix_expr::nix_str(shell_nix)
+	);
+	let mut inst = Command::new("nix-instantiate");
+	inst.arg("--expr").arg(&expr);
+	let drv = stdout_string(&run(inst)?).trim().to_string();
+
+	let mut real = Command::new("nix-store");
+	real.arg("--realise")
+		.arg(&drv)
+		.arg("--add-root")
+		.arg(root)
+		.arg("--indirect");
+	run(real)?;
+	Ok(())
+}
+
 /// Enter `nix-shell <drv>`, inheriting stdio: interactive, unless `command` is
 /// given (then `--run <command>`); `--pure` for a pure shell. Returns the child
 /// exit status (this is the one nix invocation that does not capture output).

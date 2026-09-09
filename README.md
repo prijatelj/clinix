@@ -52,64 +52,63 @@ The CLI will simply help maintain them or get started with broad strokes for com
 Intriciate configurations will require modifying the `*.nix` files directly.
 
 
-
-### Use Case for direnv and nix-direnv
-
-When you want to `cd` into a directory and have the shell auto-load in and out based on entry and exist of a directory, the pair makes this fast.
-
-However, using the `enter_shell` script where it symlinks gcroots into home presevers them from garbage collection and so these two are unnecessary for that end.
-They accomplish that goal as part of caching for efficient entry/exit of the shell.
-
-The direnv tools are also unnecessary for efficient caching.
-You can add mtime-based short-circuiting to the script if the path exists and is newer than `default.nix`, `shells/*.nix`, and `npins/sources.json`.
-
 ### Garbage Collection
 
-First, exit the nix-shell.
+A plain `nix-shell` does not register a GC root, so `nix-collect-garbage` deletes a project environment's closure the moment you leave it, which forces a redownload/rebuild on the next entry.
+To preserve an environment with clinix, you create a new environment from that project or shell.nix using `clinix env new YourProejct --from ./path/to/project/dir/or/shell.nix`.
+After you register and enter the env, its packages are saved.
+`clinix env clean` releases them, and then `nix-collect-garbage` reaps what nothing else keeps.
+No global `nix.conf` changes required.
 
-Running `nix-collect-garbage` without direnv results in deleting the dev environment's closure, requiring a redownload/rebuild.
-To enable persistent dev envs, we use `direnv` and `nix-direnv` for caching, which symlinks the shell derivation into your gcroots.
+#### The two root files clinix writes
 
-Diagnostics:
+Entering an env with `clinix env shell`/`run`, or the bare-name sugar, writes two
+indirect GC roots into the state dir's `roots/`, defaulting to `~/.local/state/clinix/roots/`.
+The key is the env's identity:
+- `env-<name>` for a registry env,
+- `proj-<slug>` for a project directory,
+- `file-<slug>` for a `*.nix` file target,
+- `stack-<names>` for a seed/union composition.
+
+-`roots/<key>`
+    - points at the env's `.drv`
+    - Pins the **evaluation/source graph** (e.g. the pinned nixpkgs), so the env can be re-evaluated and rebuilt from source offline.
+- `roots/<key>.rt`
+    - points at the realized output of the shell's [`inputDerivation`](https://github.com/NixOS/nixpkgs/pull/95536)
+    - Pins the **complete built closure**: `stdenv`, `bash`, and every package with their transitive dependencies. This is the retention guarantee, and it holds **regardless of the `keep-outputs` setting**.
+
+Both are *indirect* roots where Nix registers a matching entry under
+`/nix/var/nix/gcroots/auto/` pointing back at these files, so removing the file in
+`roots/` is all it takes to release the env.
+The `.rt` root is why clinix does **not** need `keep-outputs = true`: `inputDerivation`'s runtime dependencies *are* the shell's build-time dependencies, so rooting it keeps the whole environment alive by ordinary closure-based GC.
+
+> **Accumulation:** each `.rt` root pins a full `stdenv`. Envs and seeds you keep
+> re-entering after updates leave older closures rooted until you `clean` them, so
+> `/nix/store` grows over time — by design (nothing you saved is deleted behind your
+> back). Release what you no longer need.
+
+In the future, this will be further configurable.
+
+#### Releasing envs and collecting
+
 ```sh
-nix-store --gc --print-roots    # every root and what it points to
-nix-store --gc --print-dead     # dry run: what would be freed
-nix-store -q --roots /nix/store/PATH    # why is this specific path retained?
+clinix env clean web            # release the `web` env's roots (both files)
+clinix env clean rust python a  # release several envs, each resolved independently
+nix-collect-garbage             # now reap every store path no root keeps
+nix-store --optimise            # optional: hardlink-dedup identical files
+```
+
+`clinix env clean a b c` releases **each** name's own roots in turn (it does *not*
+target a `stack-a_b_c` union — that root only exists if you launched that exact
+union). Releasing touches only the symlinks; the env's `shell.nix`/`flake.lock` are untouched, and a name with no root is a warning rather than error.
+
+Diagnostics for reasoning about the store:
+```sh
+nix-store --gc --print-roots         # every root and what it points to
+nix-store --gc --print-dead          # dry run: what would be freed
+nix-store -q --roots /nix/store/PATH # why is this specific path retained?
 du -sh /nix/store
 ```
-
-Garbage collection commands
-```sh
-nix-collect-garbage         # unreachable paths only
-nix-collect-garbage -d      # + delete old genereations of your profiles
-sudo nix-collect-garbage -d # + system profile / NixOS generations
-nix-store --optimise        # hardlink-dedup identical files
-```
-
-To delete a dev env:
-- `rm -rf .direnv/` if using direnv or
-- rm ~/.local/state/clinix/proj-<slug>`
-
-`nix-collect-garbage` frees the closure.
-
-`keep-outputs = true` and `keep-derivations = true` make garbage collection more conservative.
-A rooted `.drv` keeps its outputs alive.
-Be aware of this when trying to clean up space or old projects.
-
-
-Nix packages for shells are symlinked within a chosen directory, defaulting to `~/.local/state/clinix`.
-These symlinks ensure the packages of those environments are not removed from `nix-collect-garbage`.
-You have to delete those symlinks for the environment's packages to be released for deletion by `nix-collect-garbage`.
-The `clinix` CLI can help with that.
-
-Also, the following are necessary to keep user derivations alive, regardless of the script or these direnv tools.
-```
-nix.settings = {
-    keep-outputs = true; # rooted .drv keeps its outputs alive
-    keep-derivations = true;
-}
-```
-
 
 ## Design
 
@@ -172,7 +171,7 @@ Here documentation includes a properly informative --help in the CLI itself alon
     - Automate a regular fetching of package information such that the user can be informed when updates exist or vulnerabilites are found in the packages they use.
     - Similarly, offer this for general git repository tracking
         - fetch revisions, references, tags, and maybe releases
-    - Nix package searching, possibly shelling out to [nh](https://github.com/nix-community/nh)
+    - Nix package searching, possibly shelling out to [nh][]
         - Search should provide ease of finding packages or their nixpkg names (fuzzy search) as well as browsing by tags and traversing the dependency graph.
         - Ideally, this supports both offline and online setups, favoring local cache when up-to-date and available.
 2. **User home environment management**
@@ -195,3 +194,4 @@ Here documentation includes a properly informative --help in the CLI itself alon
 
 [home-manager]: https://github.com/nix-community/home-manager
 [nix-profile]: https://nix.dev/manual/nix/2.34/command-ref/new-cli/nix3-profile.html
+[nh]: https://github.com/nix-community/nh
