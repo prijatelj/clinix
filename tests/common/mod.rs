@@ -67,9 +67,18 @@ impl Project {
 		self.state().join("envs").join(name)
 	}
 
-	/// A registry env's GC-root symlink path (name-keyed): `state/clinix/roots/env-<name>`.
+	/// A registry env's GC-root **base** path (name-keyed): `state/clinix/roots/env-<name>`.
+	/// The real roots are versioned siblings — see [`Self::env_root_version`].
 	pub fn env_root_link(&self, name: &str) -> PathBuf {
 		self.state().join("roots").join(format!("env-{name}"))
+	}
+
+	/// A registry env's versioned `.drv` GC-root path: `roots/env-<name>@<seq>`. Its
+	/// package-closure sibling is the same path with `.rt` appended.
+	pub fn env_root_version(&self, name: &str, seq: u64) -> PathBuf {
+		self.state()
+			.join("roots")
+			.join(format!("env-{name}@{seq}"))
 	}
 
 	/// Configure a seed catalog: write `config.toml` pointing at a seeds dir and

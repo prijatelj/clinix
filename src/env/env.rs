@@ -372,21 +372,56 @@ pub(crate) fn launch(
 	names: &[String],
 	pure: bool,
 	command: Option<&str>,
+	version: registry::VersionSelect,
 ) -> Result<ExitStatus> {
 	let comp = compose_nodes(ctx, names)?;
-	let drv = crate::nix::instantiate_rooted(&comp.shell_file, &comp.root)?;
-	// The retention guarantee: root the complete build closure via `inputDerivation`
-	// (independent of `keep-outputs`). Non-fatal if the shell isn't an mkDerivation —
-	// the `.drv` root still stands, so we warn and enter anyway.
-	let rt = registry::rt_root(&comp.root);
-	if let Err(e) = crate::nix::root_input_closure(&comp.shell_file, &rt) {
+	let drv = match version {
+		// Current: mint a new version iff the derivation changed, else reuse.
+		registry::VersionSelect::Current => mint_current(ctx, &comp)?,
+		// A prior/exact version: enter its stored `.drv` directly — no eval, no mint,
+		// no prune (offline-capable, since the recipe + closure are already rooted).
+		sel => {
+			let vpath = registry::resolve_version(&comp.root, sel)?;
+			std::fs::read_link(&vpath)?.to_string_lossy().into_owned()
+		}
+	};
+	crate::nix::nix_shell(&drv, pure, command)
+}
+
+/// Root the current composition as a new version **iff its derivation differs** from
+/// the current version (else reuse — idempotent re-entry does no work), then prune to
+/// `keep_n_prior_roots + 1`. Returns the `.drv` to enter. Each minted version is a
+/// `.drv` root (`registry::version_path`) plus its `inputDerivation` `.rt` sibling —
+/// the complete build closure, retained regardless of `keep-outputs`.
+fn mint_current(ctx: &Context, comp: &Composition) -> Result<String> {
+	let settings = crate::env::config::Settings::load(&ctx.config.config_dir)?;
+	let keep_n = settings.env.keep_n_prior_roots();
+	let base = &comp.root;
+
+	// Reuse the current version when the derivation is unchanged.
+	let versions = registry::list_versions(base)?;
+	if let Some(cur) = versions.last() {
+		let new_drv = crate::nix::instantiate(&comp.shell_file)?;
+		if std::fs::read_link(&cur.drv_root)
+			.map(|t| t == Path::new(&new_drv))
+			.unwrap_or(false)
+		{
+			return Ok(new_drv);
+		}
+	}
+
+	// Mint the next version (a real replacement, or the first entry).
+	let vpath = registry::version_path(base, registry::next_seq(base)?);
+	let drv = crate::nix::instantiate_rooted(&comp.shell_file, &vpath)?;
+	if let Err(e) = crate::nix::root_input_closure(&comp.shell_file, &registry::rt_root(&vpath)) {
 		eprintln!(
 			"clinix: warning: could not root `{}`'s full closure ({e}); \
 			 packages may be collected unless `keep-outputs = true`",
 			comp.label
 		);
 	}
-	crate::nix::nix_shell(&drv, pure, command)
+	registry::prune_versions(base, keep_n + 1)?;
+	Ok(drv)
 }
 
 /// A resolved env's human label: its registry name, else the resolved directory's
@@ -603,8 +638,9 @@ pub enum Cmd {
 	Import(Import),
 	/// Export an env to another format.
 	Export(Export),
-	/// Release one or more envs' GC roots so their store paths can be collected.
-	Clean(Targets),
+	/// Release one or more envs' GC roots so their store paths can be collected
+	/// (whole-env, or version-targeted via `--root-version`/`--oldest`).
+	Clean(clean::Clean),
 
 	// -- execution: instantiate and enter/run a composition -------------------
 	/// Enter an interactive shell for the composed env(s).
@@ -623,6 +659,8 @@ pub enum Cmd {
 	Shared(Targets),
 	/// Environment/PATH audit (the former `envcheck`).
 	Check(OptionalTarget),
+	/// List an env's GC-root versions (current + retained priors).
+	Roots(Target),
 
 	/// Bare name list under `env` → `shell <names…>` (parity with the top-level
 	/// `clinix <names…>` sugar), so `clinix env rust claude` composes those envs.
@@ -661,11 +699,18 @@ impl RunCmd for Cmd {
 			Deps(a) => a.run(context),
 			Shared(a) => diagnostics::shared(a, context),
 			Check(a) => diagnostics::check(a, context),
+			Roots(a) => diagnostics::roots(a, context),
 			Clean(a) => clean::clean(a, context),
 
 			// Bare-name sugar → the launcher (interactive shell). Fully qualified
 			// because `use Cmd::*` shadows the `Shell` struct with the `Shell` variant.
-			Compose(names) => super::execution::Shell { names, pure: false }.run(context),
+			Compose(names) => super::execution::Shell {
+				names,
+				pure: false,
+				prior: None,
+				root_version: None,
+			}
+			.run(context),
 		}
 	}
 }
@@ -682,7 +727,7 @@ impl RunCmd for Cmd {
 Command groups:
   management   init new rename add remove flake update import export clean
   execution    shell run
-  diagnostics  list info deps shared check")]
+  diagnostics  list info deps shared check roots")]
 pub struct EnvArgs {
 	#[command(subcommand)]
 	pub cmd: Cmd,

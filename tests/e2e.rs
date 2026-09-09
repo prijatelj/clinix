@@ -629,6 +629,70 @@ fn run_is_exit_transparent_and_roots_the_env_on_entry() {
 		.code(3);
 }
 
+/// With `[env.gc] keep_n_prior_roots = 1`, changing an env's derivation mints a new
+/// **version** while retaining the previous one as a **prior**, and the prior is
+/// enterable directly from its stored `.drv` (`--prior 1`) — the offline-capable
+/// path (no eval). Versions are minted only on a real derivation change, and
+/// entering a prior mints nothing.
+#[test]
+#[ignore = "needs nix + network"]
+fn prior_root_versions_are_kept_and_enterable() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	std::fs::create_dir_all(p.config_dir()).unwrap();
+	std::fs::write(
+		p.config_dir().join("config.toml"),
+		"[env.gc]\nkeep_n_prior_roots = 1\n",
+	)
+	.unwrap();
+
+	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
+		.assert()
+		.success();
+
+	// A helper counting `proj-*` `.drv` versions (excluding `.rt` siblings).
+	let roots = p.state().join("roots");
+	let count_versions = || {
+		std::fs::read_dir(&roots)
+			.map(|rd| {
+				rd.filter_map(Result::ok)
+					.filter(|e| {
+						let n = e.file_name();
+						let n = n.to_string_lossy();
+						n.starts_with("proj-") && !n.ends_with(".rt")
+					})
+					.count()
+			})
+			.unwrap_or(0)
+	};
+
+	// v1.
+	p.clinix(&["env", "run", ".", "--", "true"]).assert().success();
+	assert_eq!(count_versions(), 1, "first entry mints v1");
+
+	// Re-entering unchanged mints nothing (idempotent).
+	p.clinix(&["env", "run", ".", "--", "true"]).assert().success();
+	assert_eq!(count_versions(), 1, "unchanged re-entry mints no new version");
+
+	// Change the derivation (add a package) → v2 minted, v1 kept as prior.
+	p.clinix(&["env", "add", ".", "jq"]).assert().success();
+	p.clinix(&["env", "run", ".", "--", "true"]).assert().success();
+	assert_eq!(count_versions(), 2, "a derivation change mints a prior + current");
+
+	// `env roots .` lists current + prior 1.
+	p.clinix(&["env", "roots", "."]).assert().success().stdout(
+		predicate::str::contains("current").and(predicate::str::contains("prior 1")),
+	);
+
+	// Enter the prior directly from its stored drv (offline path: no eval, no mint).
+	p.clinix(&["env", "run", ".", "--prior", "1", "--", "true"])
+		.assert()
+		.success();
+	assert_eq!(count_versions(), 2, "entering a prior mints nothing");
+}
+
 /// A **File target** — an explicit `*.nix` path — is entered directly (not
 /// composed), so `clinix env run ./shell.nix -- …` runs that file's shell.
 #[test]

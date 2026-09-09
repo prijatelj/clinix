@@ -4,8 +4,17 @@
 
 mod common;
 
+use std::path::{Path, PathBuf};
+
 use common::Project;
 use predicates::prelude::*;
+
+/// The `.rt` (package-closure) sibling of a versioned `.drv` root path.
+fn rt_sibling(drv_root: &Path) -> PathBuf {
+	let mut s = drv_root.as_os_str().to_os_string();
+	s.push(".rt");
+	PathBuf::from(s)
+}
 
 // ---- help / grammar ---------------------------------------------------------
 
@@ -683,11 +692,12 @@ fn list_includes_seeds_from_the_catalog() {
 fn rename_moves_the_env_dir_and_its_gc_root() {
 	let p = Project::new();
 	p.seed_registry_env("old", REG_SHELL_NIX);
-	// Simulate an entered env: both name-keyed GC roots exist (`.drv` + `.rt`).
+	// Simulate an entered env: a versioned root pair (`@1` .drv + its `.rt`).
 	let roots = p.state().join("roots");
 	std::fs::create_dir_all(&roots).unwrap();
-	std::fs::write(p.env_root_link("old"), "drv").unwrap();
-	std::fs::write(roots.join("env-old.rt"), "rt").unwrap();
+	let old_v = p.env_root_version("old", 1);
+	std::fs::write(&old_v, "drv").unwrap();
+	std::fs::write(rt_sibling(&old_v), "rt").unwrap();
 
 	p.clinix(&["env", "rename", "old", "new"])
 		.assert()
@@ -699,11 +709,12 @@ fn rename_moves_the_env_dir_and_its_gc_root() {
 		p.env_dir("new").join("shell.nix").exists(),
 		"new env dir present"
 	);
-	// The rename-correctness invariant: both roots followed the name.
-	assert!(!p.env_root_link("old").exists(), "old drv root gone");
-	assert!(p.env_root_link("new").exists(), "drv root re-keyed to new name");
-	assert!(!roots.join("env-old.rt").exists(), "old rt root gone");
-	assert!(roots.join("env-new.rt").exists(), "rt root re-keyed to new name");
+	// The rename-correctness invariant: every version re-keyed to the new name.
+	assert!(!old_v.exists(), "old drv version gone");
+	assert!(!rt_sibling(&old_v).exists(), "old rt version gone");
+	let new_v = p.env_root_version("new", 1);
+	assert!(new_v.exists(), "drv version re-keyed to new name");
+	assert!(rt_sibling(&new_v).exists(), "rt version re-keyed to new name");
 }
 
 #[test]
@@ -738,21 +749,25 @@ fn rename_to_invalid_name_is_rejected() {
 }
 
 #[test]
-fn clean_removes_both_gc_roots_and_is_idempotent() {
+fn clean_removes_all_versions_and_is_idempotent() {
 	let p = Project::new();
 	p.seed_registry_env("web", REG_SHELL_NIX);
-	let roots = p.state().join("roots");
-	std::fs::create_dir_all(&roots).unwrap();
-	// Simulate an entered env: both the `.drv` root and its `.rt` (inputDerivation) sibling.
-	std::fs::write(p.env_root_link("web"), "drv").unwrap();
-	std::fs::write(roots.join("env-web.rt"), "rt").unwrap();
+	std::fs::create_dir_all(p.state().join("roots")).unwrap();
+	// Simulate an entered env with a prior: two versions, each a `.drv` + `.rt` pair.
+	for seq in [1, 2] {
+		let v = p.env_root_version("web", seq);
+		std::fs::write(&v, "drv").unwrap();
+		std::fs::write(rt_sibling(&v), "rt").unwrap();
+	}
 
 	p.clinix(&["env", "clean", "web"])
 		.assert()
 		.success()
 		.stdout(predicate::str::contains("released GC root"));
-	assert!(!p.env_root_link("web").exists(), "drv root removed");
-	assert!(!roots.join("env-web.rt").exists(), "rt root removed");
+	for seq in [1, 2] {
+		let v = p.env_root_version("web", seq);
+		assert!(!v.exists() && !rt_sibling(&v).exists(), "version {seq} removed");
+	}
 
 	// A second clean is a no-op success, not an error.
 	p.clinix(&["env", "clean", "web"])
@@ -765,11 +780,10 @@ fn clean_removes_both_gc_roots_and_is_idempotent() {
 fn clean_releases_several_envs_independently() {
 	// `clean a b c` frees each named env's roots in turn (not a `stack-a_b_c` union).
 	let p = Project::new();
-	let roots = p.state().join("roots");
-	std::fs::create_dir_all(&roots).unwrap();
+	std::fs::create_dir_all(p.state().join("roots")).unwrap();
 	for name in ["a", "b"] {
 		p.seed_registry_env(name, REG_SHELL_NIX);
-		std::fs::write(p.env_root_link(name), "drv").unwrap();
+		std::fs::write(p.env_root_version(name, 1), "drv").unwrap();
 	}
 	// `c` is registered but never entered (no root) → reported as a no-op.
 	p.seed_registry_env("c", REG_SHELL_NIX);
@@ -782,8 +796,8 @@ fn clean_releases_several_envs_independently() {
 				.and(predicate::str::contains("released GC root(s) for `b`"))
 				.and(predicate::str::contains("`c` had no GC root")),
 		);
-	assert!(!p.env_root_link("a").exists());
-	assert!(!p.env_root_link("b").exists());
+	assert!(!p.env_root_version("a", 1).exists());
+	assert!(!p.env_root_version("b", 1).exists());
 }
 
 #[test]
@@ -793,14 +807,119 @@ fn clean_reports_unknown_names_and_exits_nonzero() {
 	let p = Project::new();
 	std::fs::create_dir_all(p.state().join("roots")).unwrap();
 	p.seed_registry_env("real", REG_SHELL_NIX);
-	std::fs::write(p.env_root_link("real"), "drv").unwrap();
+	std::fs::write(p.env_root_version("real", 1), "drv").unwrap();
 
 	p.clinix(&["env", "clean", "ghost", "real"])
 		.assert()
 		.failure()
 		.stdout(predicate::str::contains("released GC root(s) for `real`"))
 		.stderr(predicate::str::contains("ghost"));
-	assert!(!p.env_root_link("real").exists(), "the real env is still cleaned");
+	assert!(
+		!p.env_root_version("real", 1).exists(),
+		"the real env is still cleaned"
+	);
+}
+
+#[test]
+fn clean_root_version_releases_only_that_version() {
+	let p = Project::new();
+	p.seed_registry_env("api", REG_SHELL_NIX);
+	std::fs::create_dir_all(p.state().join("roots")).unwrap();
+	for seq in [1, 2, 3] {
+		let v = p.env_root_version("api", seq);
+		std::fs::write(&v, "drv").unwrap();
+		std::fs::write(rt_sibling(&v), "rt").unwrap();
+	}
+
+	p.clinix(&["env", "clean", "api", "--root-version", "2"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("root version @2"));
+	assert!(!p.env_root_version("api", 2).exists(), "targeted version gone");
+	assert!(
+		p.env_root_version("api", 1).exists() && p.env_root_version("api", 3).exists(),
+		"other versions untouched"
+	);
+
+	// An absent id is a reported no-op, not an error.
+	p.clinix(&["env", "clean", "api", "--root-version", "9"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("no root version @9"));
+}
+
+#[test]
+fn clean_oldest_releases_the_n_oldest_versions() {
+	let p = Project::new();
+	p.seed_registry_env("api", REG_SHELL_NIX);
+	std::fs::create_dir_all(p.state().join("roots")).unwrap();
+	for seq in [1, 2, 3] {
+		std::fs::write(p.env_root_version("api", seq), "drv").unwrap();
+	}
+
+	p.clinix(&["env", "clean", "api", "--oldest", "2"])
+		.assert()
+		.success()
+		.stdout(
+			predicate::str::contains("released 2 oldest")
+				.and(predicate::str::contains("@1"))
+				.and(predicate::str::contains("@2")),
+		);
+	assert!(!p.env_root_version("api", 1).exists() && !p.env_root_version("api", 2).exists());
+	assert!(p.env_root_version("api", 3).exists(), "the newest survives");
+}
+
+#[test]
+fn clean_version_flags_require_a_single_name() {
+	Project::new()
+		.clinix(&["env", "clean", "a", "b", "--oldest", "1"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("single env"));
+}
+
+#[test]
+fn roots_lists_versions_newest_first_with_current_and_prior_labels() {
+	// `env roots <name>` lists versions offline: highest id = current, lower = priors.
+	let p = Project::new();
+	p.seed_registry_env("api", REG_SHELL_NIX);
+	std::fs::create_dir_all(p.state().join("roots")).unwrap();
+	for seq in [1, 2, 3] {
+		let v = p.env_root_version("api", seq);
+		std::fs::write(&v, format!("drv{seq}")).unwrap();
+		std::fs::write(rt_sibling(&v), "rt").unwrap();
+	}
+
+	p.clinix(&["env", "roots", "api"])
+		.assert()
+		.success()
+		.stdout(
+			predicate::str::contains("@3")
+				.and(predicate::str::contains("current"))
+				.and(predicate::str::contains("@1"))
+				.and(predicate::str::contains("prior 2"))
+				.and(predicate::str::contains("+pkgs")),
+		);
+}
+
+#[test]
+fn roots_on_a_never_entered_env_reports_no_versions() {
+	let p = Project::new();
+	p.seed_registry_env("fresh", REG_SHELL_NIX);
+	p.clinix(&["env", "roots", "fresh"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("no root versions"));
+}
+
+#[test]
+fn shell_prior_and_root_version_flags_conflict() {
+	// The two version selectors are mutually exclusive (clap `conflicts_with`).
+	Project::new()
+		.clinix(&["env", "shell", "x", "--prior", "1", "--root-version", "2"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("cannot be used with"));
 }
 
 // ---- check / info (contextual reporting; offline PATH+lock audit) -----------

@@ -19,12 +19,14 @@ mod check;
 mod deps;
 mod info;
 mod list;
+mod roots;
 mod shared;
 
 pub use check::check;
 pub use deps::Deps;
 pub use info::Info;
 pub use list::list;
+pub use roots::roots;
 pub use shared::shared;
 
 // ---- helpers shared across the diagnostics verbs ----------------------------

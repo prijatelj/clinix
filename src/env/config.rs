@@ -135,6 +135,31 @@ pub struct EnvSettings {
 	/// config, so nixpkgs uses its default (`~/.config/nixpkgs/config.nix`).
 	pub nixpkgs_config: Option<PathBuf>,
 	pub seeds: SeedSettings,
+	/// `[env.gc]` — GC-root retention policy.
+	pub gc: GcSettings,
+}
+
+impl EnvSettings {
+	/// How many prior root versions to keep on replacement (default `0` = release
+	/// the outgoing version immediately). See [`GcSettings`].
+	pub fn keep_n_prior_roots(&self) -> usize {
+		self.gc.keep_n_prior_roots.unwrap_or(0)
+	}
+}
+
+/// `[env.gc]` — garbage-collection root retention policy.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct GcSettings {
+	/// How many **prior root versions** to keep when a new version replaces the
+	/// current one, *in addition* to the current version. `0` (the default) releases
+	/// the outgoing version immediately, so `nix-collect-garbage` can reap its
+	/// closure; a higher value keeps that many previous versions rooted (each is a
+	/// `.drv` + `.rt` pair, so the recipe *and* the built packages survive — a prior
+	/// stays enterable **offline** via `env shell --prior N`), pruning the oldest
+	/// beyond the limit. Versions are minted only when the derivation actually
+	/// changes (see `crate::env::launch`).
+	pub keep_n_prior_roots: Option<usize>,
 }
 
 /// `[env.seeds]` — the seed catalog sources.
@@ -282,6 +307,14 @@ nixpkgs = "nixos-26.05"
 # If unset, nixpkgs uses its default (~/.config/nixpkgs/config.nix).
 # nixpkgs_config = "~/dev_env/nixpkgs-config.nix"
 
+[env.gc]
+# How many PRIOR root versions to keep when a new version replaces the current one,
+# in addition to the current. 0 (default) releases the outgoing version immediately
+# so `nix-collect-garbage` can reap it; a higher value keeps that many previous
+# versions rooted (recipe + packages) for fast, OFFLINE switch-back via
+# `clinix env shell <name> --prior N`. List versions with `clinix env roots <name>`.
+# keep_n_prior_roots = 0
+
 [env.seeds]
 # Seed shells, read in place. Each source is a directory (scanned RECURSIVELY for
 # *.nix, each a seed named by basename) or an exact *.nix file. A per-source
@@ -339,6 +372,13 @@ impl Settings {
 					sources: concat_first(other.env.seeds.sources, self.env.seeds.sources),
 					ignore: concat_first(other.env.seeds.ignore, self.env.seeds.ignore),
 					namespace: other.env.seeds.namespace.or(self.env.seeds.namespace),
+				},
+				gc: GcSettings {
+					keep_n_prior_roots: other
+						.env
+						.gc
+						.keep_n_prior_roots
+						.or(self.env.gc.keep_n_prior_roots),
 				},
 			},
 		}

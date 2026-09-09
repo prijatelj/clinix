@@ -214,7 +214,13 @@ impl Cli {
 					}
 				}
 			}
-			Some(Command::Shell(names)) => Shell { names, pure: false }.run(&context),
+			Some(Command::Shell(names)) => Shell {
+				names,
+				pure: false,
+				prior: None,
+				root_version: None,
+			}
+			.run(&context),
 			// Bare `clinix` (or only global flags) → print help, rather than
 			// silently entering the cwd project. Enter the project explicitly with
 			// `clinix .` or `clinix env shell`.

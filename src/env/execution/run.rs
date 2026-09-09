@@ -10,6 +10,14 @@ pub struct Run {
 	/// Envs to compose, as a stack — same rules as [`super::shell::Shell`]
 	/// (`.` = cwd project, empty ⇒ `[.]`).
 	pub names: Vec<String>,
+	/// Run inside the Nth **prior** root version instead of the current (`1` = the
+	/// version immediately before current); enters the stored recipe directly
+	/// (offline-capable) and mints nothing. See `env roots <name>`.
+	#[arg(long, conflicts_with = "root_version")]
+	pub prior: Option<usize>,
+	/// Run inside an **exact** root version by its id (as shown by `env roots <name>`).
+	#[arg(long = "root-version", conflicts_with = "prior")]
+	pub root_version: Option<u64>,
 	/// The command (and its args) to run inside the env; after `--`.
 	#[arg(last = true, required = true)]
 	pub command: Vec<String>,
@@ -21,7 +29,8 @@ impl RunCmd for Run {
 	/// `exec nix-shell` prototype), so `run` composes in scripts and CI.
 	fn run(self, context: &Context) -> Result<()> {
 		let command = shell_join(&self.command);
-		let status = launch(context, &self.names, false, Some(&command))?;
+		let version = super::version_select(self.prior, self.root_version);
+		let status = launch(context, &self.names, false, Some(&command), version)?;
 		if status.success() {
 			Ok(())
 		} else {

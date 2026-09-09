@@ -55,52 +55,82 @@ Intriciate configurations will require modifying the `*.nix` files directly.
 ### Garbage Collection
 
 A plain `nix-shell` does not register a GC root, so `nix-collect-garbage` deletes a project environment's closure the moment you leave it, which forces a redownload/rebuild on the next entry.
-To preserve an environment with clinix, you create a new environment from that project or shell.nix using `clinix env new YourProejct --from ./path/to/project/dir/or/shell.nix`.
+To preserve an environment with clinix, you create a new environment from that project or shell.nix using `clinix env new YourProject --from ./path/to/project/dir/or/shell.nix`.
 After you register and enter the env, its packages are saved.
 `clinix env clean` releases them, and then `nix-collect-garbage` reaps what nothing else keeps.
 No global `nix.conf` changes required.
 
-#### The two root files clinix writes
+#### The versioned root pairs clinix writes
 
-Entering an env with `clinix env shell`/`run`, or the bare-name sugar, writes two
-indirect GC roots into the state dir's `roots/`, defaulting to `~/.local/state/clinix/roots/`.
-The key is the env's identity:
+Entering an env with `clinix env shell`/`run`, or the bare-name sugar, writes GC roots
+into the state dir's `roots/`, defaulting to `~/.local/state/clinix/roots/`.
+Each root is keyed by the env's identity:
 - `env-<name>` for a registry env,
 - `proj-<slug>` for a project directory,
 - `file-<slug>` for a `*.nix` file target,
 - `stack-<names>` for a seed/union composition.
 
--`roots/<key>`
-    - points at the env's `.drv`
-    - Pins the **evaluation/source graph** (e.g. the pinned nixpkgs), so the env can be re-evaluated and rebuilt from source offline.
-- `roots/<key>.rt`
+Roots are **versioned**. Each entry that changes the derivation mints the next version
+`@<seq>` as a **pair** of indirect roots; the highest `<seq>` is the *current* version:
+
+- `roots/<key>@<seq>`
+    - points at that version's `.drv`
+    - Pins the **evaluation/source graph** (e.g. the pinned nixpkgs), so the env can be re-evaluated and rebuilt from source.
+- `roots/<key>@<seq>.rt`
     - points at the realized output of the shell's [`inputDerivation`](https://github.com/NixOS/nixpkgs/pull/95536)
     - Pins the **complete built closure**: `stdenv`, `bash`, and every package with their transitive dependencies. This is the retention guarantee, and it holds **regardless of the `keep-outputs` setting**.
 
 Both are *indirect* roots where Nix registers a matching entry under
 `/nix/var/nix/gcroots/auto/` pointing back at these files, so removing the file in
-`roots/` is all it takes to release the env.
+`roots/` is all it takes to release that version.
 The `.rt` root is why clinix does **not** need `keep-outputs = true`: `inputDerivation`'s runtime dependencies *are* the shell's build-time dependencies, so rooting it keeps the whole environment alive by ordinary closure-based GC.
+Versions are minted **only when the derivation actually changes** — re-entering an unchanged env reuses the current version and does no work.
 
-> **Accumulation:** each `.rt` root pins a full `stdenv`. Envs and seeds you keep
-> re-entering after updates leave older closures rooted until you `clean` them, so
-> `/nix/store` grows over time — by design (nothing you saved is deleted behind your
-> back). Release what you no longer need.
+#### Keeping prior versions: `keep_n_prior_roots`
 
-In the future, this will be further configurable.
+By default (`0`), when a new version replaces the current one the old version is
+released immediately, so `nix-collect-garbage` can reap its closure. To keep previous
+versions around for fast — and **offline** — switch-back, set in `config.toml`:
+
+```toml
+[env.gc]
+keep_n_prior_roots = 2   # keep the current version + 2 priors; default 0
+```
+
+Because each version keeps both its `.drv` *and* its `.rt`, a prior retains the recipe
+**and** the built packages, so it can be re-entered offline straight from its stored
+derivation (no evaluation). List and enter them:
+
+```sh
+clinix env roots web                 # list versions: current + retained priors, with ids
+clinix env shell web --prior 1       # enter the version just before current (offset)
+clinix env shell web --root-version 4  # enter an exact version by its id
+```
+
+> **Accumulation:** each retained version pins a full `stdenv`. Higher
+> `keep_n_prior_roots` (and envs you keep changing) leave older closures rooted until
+> pruned or `clean`ed, so `/nix/store` grows — by design (nothing you saved is deleted
+> behind your back). Keep the limit modest and release what you no longer need.
 
 #### Releasing envs and collecting
 
 ```sh
-clinix env clean web            # release the `web` env's roots (both files)
-clinix env clean rust python a  # release several envs, each resolved independently
-nix-collect-garbage             # now reap every store path no root keeps
-nix-store --optimise            # optional: hardlink-dedup identical files
+clinix env clean web                     # release ALL of the `web` env's versions
+clinix env clean rust python a           # release several envs, each resolved independently
+clinix env clean web --root-version 4    # release only version @4 (exact, from `env roots`)
+clinix env clean web --oldest 2          # release only the 2 oldest versions, keep the rest
+nix-collect-garbage                      # now reap every store path no root keeps
+nix-store --optimise                     # optional: hardlink-dedup identical files
 ```
 
-`clinix env clean a b c` releases **each** name's own roots in turn (it does *not*
-target a `stack-a_b_c` union — that root only exists if you launched that exact
-union). Releasing touches only the symlinks; the env's `shell.nix`/`flake.lock` are untouched, and a name with no root is a warning rather than error.
+`clinix env clean a b c` releases **each** name's own versions in turn (it does *not*
+target a `stack-a_b_c` union — that root only exists if you launched that exact union).
+The version-targeted flags give finer control over a **single** env's history:
+`--root-version <id>` releases one exact version (the id shown by `clinix env roots
+<name>`), and `--oldest <N>` releases the N oldest versions while keeping the newer ones
+(both require exactly one name). Releasing touches only the symlinks; the env's
+`shell.nix`/`flake.lock` are untouched, and a name/version with no root is a reported
+no-op rather than an error.
 
 Diagnostics for reasoning about the store:
 ```sh
