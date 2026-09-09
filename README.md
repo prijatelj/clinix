@@ -17,9 +17,9 @@ A project environment consists of
 This cross-support is achieved by `shell.nix` parsing the `flake.lock` package versions and using them to build the environment.
 The `flake.lock` can be as exact as desired, with the minimal case being at least pinning the NixOS version to pull packages from when used by the `shell.nix`.
 
-When clinix is used to provide both a default shell.nix and flake.nix in this way, all the derivatives of Nix can use the environments from this tool, including [Snix](https://github.com/SamNet-dev/snix), [Lix](https://github.com/lix-project/lix), [Determinate Nix](https://github.com/DeterminateSystems/nix-installer), and [Flox](https://github.com/flox/flox).
-Other version Nix package pinning tools, such as [niv](https://github.com/nmattia/niv) and [npins](https://github.com/andir/npins), are only supported if they can import/export their pinned versions from/to a flake.lock.
-[Nix profiles][nix-profile] and [home-manager][] are not intended to be supported as they can be replaced by a well managed `shell.nix`, which Clinix can manage for you.
+When clinix is used to provide both a default shell.nix and flake.nix in this way, all the derivatives of Nix can use the environments from this tool, including [Snix](https://github.com/SamNet-dev/snix), [Lix](https://github.com/lix-project/lix), [Determinate Nix](https://github.com/DeterminateSystems/nix-installer), and [Flox][].
+Other version Nix package pinning tools, such as [niv](https://github.com/nmattia/niv) and [npins](https://github.com/andir/npins), are not currently supported.
+[Nix profiles][nix-profile] and [home-manager][] are not intended to be supported as they can be replaced by a well managed `shell.nix`, which Clinix ~~can~~ will eventually manage for you.
 
 ## The CLI
 
@@ -28,23 +28,7 @@ Clinix consists of multiple sub-commands
     - to manage development environments
     - to manage a project's runtime or test environment
     - **Unimplemented**: user's home environment (replaces HomeManager)
-- **Unimplemented** `clinix sys`: to manage a NixOS configuration using the 2026-05 introduced feature `system.nix` isntead of nix-channels, letting your configuration be entirely declarative in isolation.
-
-Each subcommand includes the following
-
-- `init` to initialize an environment's configuration
-- `add` and `remove` to add or remove packages to an environment
-- `pin` and `unpin` to pin or unpin package versions
-- `update` to update the unpinned packages to their latest versions (`--dry-run` previews the re-lock without writing).
-- `outdated` to report tracked inputs whose upstream rev is newer than the lock, and `verify` to re-check every locked input still hashes correctly (both read-only, no writes).
-- `import` and `export` the environment from/to other configuration specifications or container objects, such as Dockerfiles or images.
-    - Import or export a nix closure of an environment
-    - Import an existing shell.nix to be a wrapped by a flake.
-    - generate a shell.nix from a flake.nix and its flake.lock
-- `info` for information on an environment's packages or other diagnostic tools
-    - shared packages between a set of shells.
-    - environment check
-    - `list`, `roots`, and `deps` accept `--json` for machine-readable output; `roots --size` reports each version's retained closure on disk.
+- **Unimplemented** `clinix sys`: to manage a NixOS configuration using the 2026-05 introduced feature `system.nix` instead of nix-channels, letting your configuration be entirely declarative in isolation.
 
 ### Limitations of the CLI
 
@@ -208,12 +192,12 @@ Here documentation includes a properly informative --help in the CLI itself alon
 
 ## Road Map
 
-0. **v0.0.0**: Basic functionality for daily driving environment management and use, project initialization, and export of environments to Nix closure and Docker images.
+0. **v0.0.0**: Basic functionality for (my personal) daily driving environment management and use, project initialization, and export of environments to Nix closure and Docker images.
     - Generalized the shell script prototype into the initial Rust project structure.
     - No system tools, no user home helper tools yet.
 1. **Package Dependency Resolution**
     - We want to be able to give `clinix` a versioned package manifest (e.g., TOML) and it finds the best nixpkg version to use for the flake.lock.
-        - Today, this is best achieved by [Flox](git@github.com:flox/flox.git).
+        - Today, this is best achieved by [Flox][].
     - We also want that package dependency resolution to be informed by vulnerabilities (CVEs) and weaknesses (CWEs), such that the user is informed about the risks of using certain package version configurations, and are guided to the latest informaiton on how to resolve those issues.
     - Automate a regular fetching of package information such that the user can be informed when updates exist or vulnerabilites are found in the packages they use.
     - Similarly, offer this for general git repository tracking
@@ -226,20 +210,27 @@ Here documentation includes a properly informative --help in the CLI itself alon
         - Some of this may just be documentation, e.g., "run `clinix env shell your-home-env` in shell rc, or xinit, or whatever is Desktop Environment's equivalent for initial scripts at login."
     - Why not [home-manager](https://github.com/nix-community/home-manager)?
         - Because what home-manager provides is achievable with a just `shell.nix` launched at login.
-        - It introduces another standard that drifts from both NixOS and nixpkgs.
+        - In my experience, it introduces another standard that drifts from both NixOS and nixpkgs.
         - We want to focus on as few extra standards as possible while maintaining the beneficial features they provide.
-    - "Profile roll-back": It may be useful to implement the saving of drvs similar to profiles or like for NixOS, but the environments only get deleted when the user chooses garbage collect and the environments are meant to be stored in version control systems (point here is to avoid re-building). So a better answer may be more nuanced and more easily controlled / configured garbage collection CLI.
-        - We do not and do not intend to support [nix profiles][nix-profile].
+    - We do not and do not intend to support [nix profiles][nix-profile].
 3. **System environment helper tools**
     - Clinix prioritizes `system.nix` use for fully declarative NixOS configurations, and thus do not use nix-channels.
+        - Given this and the existence of [nh][]'s os rebuild alternative, clinix will probably be convenience tools to help update, but not necessarily fully automate the process. We'll see how the user environment feature set translates to NixOS.
     - A clean separation of concerns.
     - Help the user separate their system from their user environments.
         - So their system doesn't have unnecessary system-wide packages or dependencies
-        - So their user environments are portable for NixOS nix use.
+        - So their user environments are portable beyond NixOS (nix on other systems).
         - So their user environments inform their requirements of the system across this clean separation.
-    - Export closures and to Docker images using NixOS.
+    - Export closures and to Docker images using the configured NixOS.
+4. Optimization
+5. Extention Interface for easily adding extensions to the CLI, such as
+    - npins and niv import/export
+    - different version control upstream repository support
+
+Around 4 or 5, if the intended feature set is properly done and polished, I'll consider incrementing the Major version from 0 to 1.
 
 
 [home-manager]: https://github.com/nix-community/home-manager
 [nix-profile]: https://nix.dev/manual/nix/2.34/command-ref/new-cli/nix3-profile.html
 [nh]: https://github.com/nix-community/nh
+[Flox]: https://github.com/flox/flox.git
