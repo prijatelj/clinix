@@ -674,6 +674,10 @@ pub enum Cmd {
 	Flake(Flake),
 	/// Update unpinned packages to the latest the baseline provides.
 	Update(Update),
+	/// Report tracked inputs whose upstream rev is newer than the lock (no writes).
+	Outdated(Target),
+	/// Re-check every locked input still hashes correctly.
+	Verify(Target),
 	/// Import an env from another format (shell.nix / flake / .deb / OCI / …).
 	Import(Import),
 	/// Export an env to another format.
@@ -690,7 +694,7 @@ pub enum Cmd {
 
 	// -- diagnostics: read-only reports over resolved envs --------------------
 	/// List registered envs.
-	List,
+	List(diagnostics::List),
 	/// Summarize a single env (nixpkgs pin + resolved package versions).
 	Info(Info),
 	/// Dependency/closure report for an env.
@@ -700,8 +704,8 @@ pub enum Cmd {
 	/// Environment/PATH audit (the former `envcheck`).
 	Check(OptionalTarget),
 	/// List GC-root versions — one env's (`roots <name>`) or, with no name, a grouped
-	/// listing of every root family.
-	Roots(OptionalTarget),
+	/// listing of every root family (`--size` for disk, `--json` for machine output).
+	Roots(diagnostics::Roots),
 
 	/// Bare name list under `env` → `shell <names…>` (parity with the top-level
 	/// `clinix <names…>` sugar), so `clinix env rust claude` composes those envs.
@@ -727,6 +731,8 @@ impl RunCmd for Cmd {
 			Remove(a) => pkgs::remove(a, context),
 			Flake(a) => pkgs::flake(a, context),
 			Update(a) => a.run(context),
+			Outdated(a) => pkgs::outdated(a, context),
+			Verify(a) => pkgs::verify(a, context),
 
 			Shell(a) => a.run(context),
 			Run(a) => a.run(context),
@@ -735,7 +741,7 @@ impl RunCmd for Cmd {
 			Export(a) => a.run(context),
 
 			// Diagnostic information
-			List => diagnostics::list(context),
+			List(a) => diagnostics::list(a, context),
 			Info(a) => a.run(context),
 			Deps(a) => a.run(context),
 			Shared(a) => diagnostics::shared(a, context),
@@ -766,7 +772,7 @@ impl RunCmd for Cmd {
 #[derive(Args, Debug)]
 #[command(after_help = "\
 Command groups:
-  management   init new rename add remove flake update import export clean
+  management   init new rename add remove flake update outdated verify import export clean
   execution    shell run
   diagnostics  list info deps shared check roots")]
 pub struct EnvArgs {

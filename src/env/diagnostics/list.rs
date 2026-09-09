@@ -1,22 +1,55 @@
 //! `list`: enumerate what `clinix env <name>` can enter — registry envs and seeds.
 
+use clap::Args;
+
 use crate::env::project::Project;
 use crate::env::{Context, resolve};
 use crate::error::Result;
 
 use super::nixpkgs_pin;
 
+/// `env list [--json]`.
+#[derive(Args, Debug)]
+pub struct List {
+	/// Emit machine-readable JSON instead of a table.
+	#[arg(long)]
+	pub json: bool,
+}
+
 /// List what `clinix env <name>` can enter: **registry** envs
 /// (`state/envs/<name>`, each enriched with its nixpkgs pin from `flake.lock`) and
 /// **seeds** (the in-place `*.nix` fragments discovered from `[env.seeds].sources`).
 /// The filesystem *is* the registry index; the catalog is rebuilt from config —
 /// nothing to keep in sync. Empty of both prints a hint.
-pub fn list(context: &Context) -> Result<()> {
+pub fn list(args: List, context: &Context) -> Result<()> {
 	let names = crate::env::registry::list_names(&context.config)?;
 	let settings = crate::env::config::Settings::load(&context.config.config_dir)?;
 	let catalog = crate::env::seeds::Catalog::build(&settings.env.seeds);
 	for w in &catalog.warnings {
 		eprintln!("clinix: {w}");
+	}
+
+	if args.json {
+		let envs: Vec<_> = names
+			.iter()
+			.map(|n| serde_json::json!({ "name": n, "nixpkgs": registry_pin(context, n) }))
+			.collect();
+		let seeds: Vec<_> = catalog
+			.seeds
+			.iter()
+			.map(|s| {
+				serde_json::json!({
+					"name": s.name,
+					"namespace": s.namespace,
+					"source": s.path.to_string_lossy(),
+				})
+			})
+			.collect();
+		println!(
+			"{}",
+			serde_json::to_string_pretty(&serde_json::json!({ "registry_envs": envs, "seeds": seeds }))?
+		);
+		return Ok(());
 	}
 
 	if names.is_empty() && catalog.seeds.is_empty() {

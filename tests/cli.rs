@@ -988,6 +988,56 @@ fn roots_lists_versions_newest_first_with_current_and_prior_labels() {
 }
 
 #[test]
+fn clean_dry_run_previews_without_deleting() {
+	let p = Project::new();
+	p.seed_registry_env("web", REG_SHELL_NIX);
+	std::fs::create_dir_all(p.state().join("roots")).unwrap();
+	for seq in [1, 2] {
+		let v = p.env_root_version("web", seq);
+		std::fs::write(&v, "drv").unwrap();
+		std::fs::write(rt_sibling(&v), "rt").unwrap();
+	}
+
+	p.clinix(&["env", "clean", "web", "--dry-run"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("would release all 2 version"));
+	// Nothing was actually removed.
+	assert!(p.env_root_version("web", 1).exists() && p.env_root_version("web", 2).exists());
+}
+
+#[test]
+fn list_json_emits_registry_envs() {
+	let p = Project::new();
+	p.seed_registry_env("api", REG_SHELL_NIX);
+	p.clinix(&["env", "list", "--json"])
+		.assert()
+		.success()
+		.stdout(
+			predicate::str::contains("\"registry_envs\"")
+				.and(predicate::str::contains("\"api\""))
+				.and(predicate::str::contains("\"seeds\"")),
+		);
+}
+
+#[test]
+fn roots_json_emits_versions() {
+	let p = Project::new();
+	p.seed_registry_env("api", REG_SHELL_NIX);
+	std::fs::create_dir_all(p.state().join("roots")).unwrap();
+	std::fs::write(p.env_root_version("api", 1), "drv").unwrap();
+
+	p.clinix(&["env", "roots", "api", "--json"])
+		.assert()
+		.success()
+		.stdout(
+			predicate::str::contains("\"env\": \"api\"")
+				.and(predicate::str::contains("\"versions\""))
+				.and(predicate::str::contains("\"seq\": 1")),
+		);
+}
+
+#[test]
 fn roots_on_a_never_entered_env_reports_no_versions() {
 	let p = Project::new();
 	p.seed_registry_env("fresh", REG_SHELL_NIX);

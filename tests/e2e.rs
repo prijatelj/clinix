@@ -761,6 +761,41 @@ fn new_adopts_an_entered_projects_build_and_clean_releases_source() {
 	assert_eq!(count("env-"), 2, "both registry envs rooted");
 }
 
+/// The read-only inspection verbs on real nix: `verify` re-hashes the locked input
+/// (matches a fresh `init`), `outdated` resolves the tracked ref vs the lock, and
+/// `update --dry-run` previews without writing.
+#[test]
+#[ignore = "needs nix + network"]
+fn verify_outdated_and_update_dry_run_smoke() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
+		.assert()
+		.success();
+
+	// A freshly-locked input re-hashes to its recorded narHash.
+	p.clinix(&["env", "verify", "."])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("verified"));
+
+	// `outdated` resolves the tracked ref against the lock without error.
+	p.clinix(&["env", "outdated", "."]).assert().success();
+
+	// `update --dry-run` previews and writes nothing.
+	let before = std::fs::read(p.file("flake.lock")).unwrap();
+	p.clinix(&["env", "update", ".", "--dry-run"])
+		.assert()
+		.success();
+	assert_eq!(
+		std::fs::read(p.file("flake.lock")).unwrap(),
+		before,
+		"dry-run must not write the lock"
+	);
+}
+
 /// A **File target** — an explicit `*.nix` path — is entered directly (not
 /// composed), so `clinix env run ./shell.nix -- …` runs that file's shell.
 #[test]

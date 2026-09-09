@@ -40,6 +40,9 @@ pub struct Clean {
 	/// Bulk: release every root whose key matches this `*`-glob (e.g. `*-rust*`).
 	#[arg(long = "match")]
 	pub match_glob: Option<String>,
+	/// Show what would be released without deleting anything (a preview).
+	#[arg(long)]
+	pub dry_run: bool,
 }
 
 /// Release GC roots. Only the root symlinks are touched — an env's
@@ -137,7 +140,37 @@ fn select_bulk(cfg: &crate::env::config::Config, args: &Clean) -> Result<Vec<(St
 }
 
 /// Apply the release scope (exact version / oldest N / all) to one target base.
+/// With `--dry-run`, report what *would* be released without deleting anything.
 fn release_one(label: &str, base: &std::path::Path, args: &Clean) -> Result<()> {
+	if args.dry_run {
+		let versions = registry::list_versions(base)?;
+		if let Some(seq) = args.root_version {
+			if versions.iter().any(|v| v.seq == seq) {
+				println!("clinix: would release `{label}` root version @{seq}");
+			} else {
+				println!("clinix: `{label}` has no root version @{seq}");
+			}
+		} else if let Some(n) = args.oldest {
+			let ids: Vec<String> = versions.iter().take(n).map(|v| format!("@{}", v.seq)).collect();
+			if ids.is_empty() {
+				println!("clinix: `{label}` had no versions to release");
+			} else {
+				println!(
+					"clinix: would release {} oldest version(s) of `{label}`: {}",
+					ids.len(),
+					ids.join(" ")
+				);
+			}
+		} else if versions.is_empty() {
+			println!("clinix: `{label}` had no GC root (nothing to release)");
+		} else {
+			println!(
+				"clinix: would release all {} version(s) of `{label}`",
+				versions.len()
+			);
+		}
+		return Ok(());
+	}
 	if let Some(seq) = args.root_version {
 		if registry::release_version(base, seq)? {
 			println!("clinix: released `{label}` root version @{seq}");

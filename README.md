@@ -35,7 +35,8 @@ Each subcommand includes the following
 - `init` to initialize an environment's configuration
 - `add` and `remove` to add or remove packages to an environment
 - `pin` and `unpin` to pin or unpin package versions
-- `update` to update the unpinned packages to their latest versions.
+- `update` to update the unpinned packages to their latest versions (`--dry-run` previews the re-lock without writing).
+- `outdated` to report tracked inputs whose upstream rev is newer than the lock, and `verify` to re-check every locked input still hashes correctly (both read-only, no writes).
 - `import` and `export` the environment from/to other configuration specifications or container objects, such as Dockerfiles or images.
     - Import or export a nix closure of an environment
     - Import an existing shell.nix to be a wrapped by a flake.
@@ -43,6 +44,7 @@ Each subcommand includes the following
 - `info` for information on an environment's packages or other diagnostic tools
     - shared packages between a set of shells.
     - environment check
+    - `list`, `roots`, and `deps` accept `--json` for machine-readable output; `roots --size` reports each version's retained closure on disk.
 
 ### Limitations of the CLI
 
@@ -216,7 +218,7 @@ Here documentation includes a properly informative --help in the CLI itself alon
     - Automate a regular fetching of package information such that the user can be informed when updates exist or vulnerabilites are found in the packages they use.
     - Similarly, offer this for general git repository tracking
         - fetch revisions, references, tags, and maybe releases
-    - Nix package searching, possibly shelling out to [nh][]
+    - Nix package searching. For now, [nh][] or nix-search is best.
         - Search should provide ease of finding packages or their nixpkg names (fuzzy search) as well as browsing by tags and traversing the dependency graph.
         - Ideally, this supports both offline and online setups, favoring local cache when up-to-date and available.
 2. **User home environment management**
@@ -234,6 +236,7 @@ Here documentation includes a properly informative --help in the CLI itself alon
     - Help the user separate their system from their user environments.
         - So their system doesn't have unnecessary system-wide packages or dependencies
         - So their user environments are portable for NixOS nix use.
+        - So their user environments inform their requirements of the system across this clean separation.
     - Export closures and to Docker images using NixOS.
 
 

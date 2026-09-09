@@ -25,8 +25,8 @@ mod shared;
 pub use check::check;
 pub use deps::Deps;
 pub use info::Info;
-pub use list::list;
-pub use roots::roots;
+pub use list::{List, list};
+pub use roots::{Roots, roots};
 pub use shared::shared;
 
 // ---- helpers shared across the diagnostics verbs ----------------------------
@@ -169,6 +169,7 @@ pub fn context_report(verb: Option<InfoVerb>, context: &Context) -> Result<()> {
 		Some(InfoVerb::Deps) => Deps {
 			name: None,
 			size: false,
+			json: false,
 		}
 		.run(context),
 	}
