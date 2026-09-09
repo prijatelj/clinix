@@ -878,6 +878,91 @@ fn clean_version_flags_require_a_single_name() {
 		.stderr(predicate::str::contains("single env"));
 }
 
+/// Write a fake versioned root pair under `roots/` for the bulk/union tests.
+fn fake_root(p: &Project, key: &str, seq: u64) {
+	let roots = p.state().join("roots");
+	std::fs::create_dir_all(&roots).unwrap();
+	let v = roots.join(format!("{key}@{seq}"));
+	std::fs::write(&v, "drv").unwrap();
+	std::fs::write(rt_sibling(&v), "rt").unwrap();
+}
+
+#[test]
+fn clean_projects_releases_all_project_roots_only() {
+	let p = Project::new();
+	fake_root(&p, "proj-home_u_a", 1);
+	fake_root(&p, "proj-home_u_b", 1);
+	fake_root(&p, "env-keep", 1);
+
+	p.clinix(&["env", "clean", "--projects"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("proj-home_u_a").and(predicate::str::contains("proj-home_u_b")));
+	let roots = p.state().join("roots");
+	assert!(!roots.join("proj-home_u_a@1").exists());
+	assert!(!roots.join("proj-home_u_b@1").exists());
+	assert!(roots.join("env-keep@1").exists(), "named env untouched");
+}
+
+#[test]
+fn clean_match_glob_releases_matching_keys_across_kinds() {
+	let p = Project::new();
+	fake_root(&p, "env-rust", 1);
+	fake_root(&p, "proj-x_rust", 1);
+	fake_root(&p, "env-python", 1);
+
+	p.clinix(&["env", "clean", "--match", "*rust*"])
+		.assert()
+		.success();
+	let roots = p.state().join("roots");
+	assert!(!roots.join("env-rust@1").exists() && !roots.join("proj-x_rust@1").exists());
+	assert!(roots.join("env-python@1").exists(), "non-matching kept");
+}
+
+#[test]
+fn clean_union_targets_the_composed_stack_root() {
+	// `--union a b` releases the sorted `stack-a-b` root those seeds compose into.
+	let p = Project::new();
+	p.seed("a", "{ pkgs }: pkgs.mkShell { }\n");
+	p.seed("b", "{ pkgs }: pkgs.mkShell { }\n");
+	fake_root(&p, "stack-a-b", 1);
+
+	p.clinix(&["env", "clean", "--union", "a", "b"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("stack-a-b"));
+	assert!(!p.state().join("roots").join("stack-a-b@1").exists());
+}
+
+#[test]
+fn clean_bulk_selectors_reject_names() {
+	Project::new()
+		.clinix(&["env", "clean", "web", "--projects"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("take no names"));
+}
+
+#[test]
+fn roots_no_arg_lists_all_families_grouped() {
+	let p = Project::new();
+	fake_root(&p, "env-py", 1);
+	fake_root(&p, "proj-home_u_x", 1);
+	fake_root(&p, "stack-a-b", 1);
+
+	p.clinix(&["env", "roots"])
+		.assert()
+		.success()
+		.stdout(
+			predicate::str::contains("registry envs")
+				.and(predicate::str::contains("env-py"))
+				.and(predicate::str::contains("projects"))
+				.and(predicate::str::contains("proj-home_u_x"))
+				.and(predicate::str::contains("stacks"))
+				.and(predicate::str::contains("stack-a-b")),
+		);
+}
+
 #[test]
 fn roots_lists_versions_newest_first_with_current_and_prior_labels() {
 	// `env roots <name>` lists versions offline: highest id = current, lower = priors.

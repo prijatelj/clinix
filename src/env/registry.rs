@@ -149,6 +149,32 @@ pub fn list_versions(base: &std::path::Path) -> Result<Vec<RootVersion>> {
 	Ok(versions)
 }
 
+/// Every distinct root **base key** present under `roots/` (sorted, de-duplicated) —
+/// e.g. `env-python`, `proj-home_u_x`, `stack-rust-claude`. Strips the `.rt` sibling
+/// suffix and the `@<seq>` version suffix from each entry. Powers the global `env
+/// roots` listing and `clean`'s bulk selectors. An absent roots dir ⇒ empty.
+pub fn list_root_keys(cfg: &Config) -> Result<Vec<String>> {
+	let dir = roots_dir(cfg);
+	let read = match fs::read_dir(&dir) {
+		Ok(r) => r,
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(e) => return Err(e.into()),
+	};
+	let mut keys = std::collections::BTreeSet::new();
+	for entry in read {
+		let name = entry?.file_name().to_string_lossy().into_owned();
+		// `<key>@<seq>[.rt]` → `<key>`: drop a trailing `.rt`, then a trailing
+		// `@<digits>` (only when the suffix after the last `@` is all digits).
+		let stem = name.strip_suffix(".rt").unwrap_or(&name);
+		let base = match stem.rsplit_once('@') {
+			Some((head, seq)) if !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()) => head,
+			_ => stem,
+		};
+		keys.insert(base.to_string());
+	}
+	Ok(keys.into_iter().collect())
+}
+
 /// The next version `seq` for a base key: one past the current max, or `1`.
 pub fn next_seq(base: &std::path::Path) -> Result<u64> {
 	Ok(list_versions(base)?.last().map(|v| v.seq + 1).unwrap_or(1))
@@ -433,6 +459,33 @@ mod tests {
 	fn next_seq_is_one_for_a_fresh_key() {
 		let dir = tempfile::tempdir().unwrap();
 		assert_eq!(next_seq(&dir.path().join("env-fresh")).unwrap(), 1);
+	}
+
+	#[test]
+	fn list_root_keys_strips_version_and_rt_suffixes_and_dedups() {
+		let dir = tempfile::tempdir().unwrap();
+		let cfg = Config {
+			config_dir: dir.path().join("c"),
+			state_dir: dir.path().to_path_buf(),
+		};
+		let roots = roots_dir(&cfg);
+		std::fs::create_dir_all(&roots).unwrap();
+		for f in [
+			"env-py@1",
+			"env-py@1.rt",
+			"env-py@2",
+			"env-py@2.rt",
+			"proj-a_b@1",
+			"stack-x-y@3",
+			"stack-x-y@3.rt",
+			"file-c@1",
+		] {
+			std::fs::write(roots.join(f), "").unwrap();
+		}
+		assert_eq!(
+			list_root_keys(&cfg).unwrap(),
+			vec!["env-py", "file-c", "proj-a_b", "stack-x-y"], // sorted, de-duplicated
+		);
 	}
 
 	#[test]

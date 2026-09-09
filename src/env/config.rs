@@ -145,6 +145,34 @@ impl EnvSettings {
 	pub fn keep_n_prior_roots(&self) -> usize {
 		self.gc.keep_n_prior_roots.unwrap_or(0)
 	}
+
+	/// Prior root versions to keep for **project** (`proj-*`) roots (default `0`;
+	/// negative = don't root projects at all). See [`GcSettings`].
+	pub fn keep_n_prior_project_roots(&self) -> i64 {
+		self.gc.keep_n_prior_project_roots.unwrap_or(0)
+	}
+
+	/// Prior root versions to keep for **stack/union** (`stack-*`) roots (default `0`;
+	/// negative = don't root composed unions at all). See [`GcSettings`].
+	pub fn keep_n_prior_stack_roots(&self) -> i64 {
+		self.gc.keep_n_prior_stack_roots.unwrap_or(0)
+	}
+
+	/// The retention policy for a root **base key**: `None` = do not root it at all
+	/// (reachable for projects/stacks with a negative setting), else `Some(total)` =
+	/// keep that many versions (current + priors). Projects (`proj-*`) use the project
+	/// setting, stacks (`stack-*`) the stack setting; named registry (`env-`) and file
+	/// (`file-`) roots use [`Self::keep_n_prior_roots`]. Pure — unit-testable.
+	pub fn root_retention(&self, base_key: &str) -> Option<usize> {
+		let signed = |n: i64| (n >= 0).then(|| n as usize + 1);
+		if base_key.starts_with("proj-") {
+			signed(self.keep_n_prior_project_roots())
+		} else if base_key.starts_with("stack-") {
+			signed(self.keep_n_prior_stack_roots())
+		} else {
+			Some(self.keep_n_prior_roots() + 1)
+		}
+	}
 }
 
 /// `[env.gc]` — garbage-collection root retention policy.
@@ -160,6 +188,15 @@ pub struct GcSettings {
 	/// beyond the limit. Versions are minted only when the derivation actually
 	/// changes (see `crate::env::launch`).
 	pub keep_n_prior_roots: Option<usize>,
+	/// Prior versions to keep for **project** (`proj-*`) roots (default `0`). Negative
+	/// = **don't root projects at all** (plain `nix-shell` GC behavior). Projects are
+	/// entered by path, not registered, so they may warrant a different policy than
+	/// named envs.
+	pub keep_n_prior_project_roots: Option<i64>,
+	/// Prior versions to keep for **stack/union** (`stack-*`) roots (default `0`).
+	/// Negative = **don't root composed unions at all** — set this if you don't want
+	/// transient `shell a b`/`shell -o a b` compositions retained.
+	pub keep_n_prior_stack_roots: Option<i64>,
 }
 
 /// `[env.seeds]` — the seed catalog sources.
@@ -313,7 +350,16 @@ nixpkgs = "nixos-26.05"
 # so `nix-collect-garbage` can reap it; a higher value keeps that many previous
 # versions rooted (recipe + packages) for fast, OFFLINE switch-back via
 # `clinix env shell <name> --prior N`. List versions with `clinix env roots <name>`.
+# Applies to named registry (env-*) and file (file-*) roots.
 # keep_n_prior_roots = 0
+#
+# Same, for PROJECT (proj-*) roots (entered by path). Negative = don't root projects
+# at all (plain nix-shell GC behavior). Default 0 (keep the current version only).
+# keep_n_prior_project_roots = 0
+#
+# Same, for STACK/UNION (stack-*) roots (composed `shell a b` / `shell -o a b`).
+# Negative = don't root composed unions at all. Default 0.
+# keep_n_prior_stack_roots = 0
 
 [env.seeds]
 # Seed shells, read in place. Each source is a directory (scanned RECURSIVELY for
@@ -379,6 +425,16 @@ impl Settings {
 						.gc
 						.keep_n_prior_roots
 						.or(self.env.gc.keep_n_prior_roots),
+					keep_n_prior_project_roots: other
+						.env
+						.gc
+						.keep_n_prior_project_roots
+						.or(self.env.gc.keep_n_prior_project_roots),
+					keep_n_prior_stack_roots: other
+						.env
+						.gc
+						.keep_n_prior_stack_roots
+						.or(self.env.gc.keep_n_prior_stack_roots),
 				},
 			},
 		}
@@ -485,6 +541,32 @@ mod tests {
 
 	fn write(dir: &Path, name: &str, body: &str) {
 		std::fs::write(dir.join(name), body).unwrap();
+	}
+
+	#[test]
+	fn root_retention_branches_by_kind_and_honors_negative() {
+		let dir = tempfile::tempdir().unwrap();
+		write(
+			dir.path(),
+			"config.toml",
+			"[env.gc]\nkeep_n_prior_roots = 2\nkeep_n_prior_project_roots = -1\nkeep_n_prior_stack_roots = 0\n",
+		);
+		let s = Settings::load(dir.path()).unwrap();
+		// env-/file- use keep_n_prior_roots (+1 for the current version).
+		assert_eq!(s.env.root_retention("env-x"), Some(3));
+		assert_eq!(s.env.root_retention("file-home_u_x"), Some(3));
+		// A negative project setting disables project rooting entirely.
+		assert_eq!(s.env.root_retention("proj-home_u_x"), None);
+		// Stacks at 0 keep only the current version.
+		assert_eq!(s.env.root_retention("stack-a-b"), Some(1));
+	}
+
+	#[test]
+	fn root_retention_defaults_keep_one_of_each_kind() {
+		let s = Settings::default();
+		for key in ["env-x", "proj-x", "file-x", "stack-x"] {
+			assert_eq!(s.env.root_retention(key), Some(1), "{key}");
+		}
 	}
 
 	#[test]

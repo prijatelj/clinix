@@ -22,7 +22,7 @@ use rnix::SyntaxKind;
 
 use crate::env::config::Settings;
 use crate::env::seeds::{Catalog, Resolved};
-use crate::env::{Context, RunCmd, registry};
+use crate::env::{Context, Env, Kind, RunCmd, node_root, registry};
 use crate::error::{ClinixError, Result};
 
 /// Create a new **registry** env. Distinct from [`super::init::Init`] (which
@@ -48,6 +48,11 @@ pub struct New {
 	/// On a lock conflict, keep the namespace's existing pin (this shell conforms).
 	#[arg(long = "use-prior")]
 	pub use_prior: bool,
+	/// After registering, also release the **source project's** GC roots (only
+	/// meaningful when registering from a local dir/file that was entered before).
+	/// Without this, clinix just notes how to release them.
+	#[arg(long)]
+	pub clean: bool,
 }
 
 impl RunCmd for New {
@@ -191,7 +196,51 @@ impl New {
 			self.name,
 			source_shell.display()
 		);
-		println!("  enter: clinix env {}", self.name);
+
+		// Adopt the source project's already-built closure so no re-entry/rebuild is
+		// needed, and handle the source's own roots (--clean, or a note).
+		self.adopt_and_note(ctx, &src, &source_shell)?;
+		Ok(())
+	}
+
+	/// If the `--from` source (a local dir/`*.nix`) was entered before and its
+	/// **current build matches** the newly-registered env's derivation, root the
+	/// registry env now — reusing the built closure, so there is **no re-entry and no
+	/// rebuild** (the registry key `env-<name>`, not the source's `proj-`/`file-`
+	/// key). Then either release the source's roots (`--clean`) or note how to.
+	fn adopt_and_note(&self, ctx: &Context, src: &Path, source_shell: &Path) -> Result<()> {
+		let cfg = &ctx.config;
+		let src_base = source_root_base(cfg, src, source_shell)?;
+		let src_versions = registry::list_versions(&src_base)?;
+
+		let settings = Settings::load(&cfg.config_dir)?;
+		let catalog = Catalog::build(&settings.env.seeds);
+		let reg_shell = Dest::parse(cfg, &self.name)?.dir.join("shell.nix");
+
+		let adopted = if src_versions.is_empty() {
+			false
+		} else {
+			try_adopt(cfg, &catalog, &self.name, &reg_shell, &src_versions, &settings)?
+		};
+		if adopted {
+			println!("  adopted the source's existing build — no rebuild, no re-entry needed");
+		} else {
+			println!("  enter to build + root it: clinix env {}", self.name);
+		}
+
+		if !src_versions.is_empty() {
+			let src_token = src.display();
+			if self.clean {
+				if registry::release_root(&src_base)? {
+					println!("  released the source project's GC roots ({})", src_token);
+				}
+			} else {
+				println!(
+					"  note: the source still holds GC roots; release them with \
+					 `clinix env clean {src_token}` (or re-run with --clean)"
+				);
+			}
+		}
 		Ok(())
 	}
 
@@ -354,6 +403,70 @@ fn source_flake_lock(src: &str, shell_dir: &Path) -> Option<PathBuf> {
 /// same-rev compare is a future refinement).
 fn files_equal(a: &Path, b: &Path) -> Result<bool> {
 	Ok(std::fs::read(a)? == std::fs::read(b)?)
+}
+
+/// The `--from` source's own GC-root **base key**: `proj-<slug>` for a directory,
+/// `file-<slug>` for a `*.nix` file — the key that entering the source directly would
+/// have rooted, so `new` can find its prior build.
+fn source_root_base(
+	cfg: &crate::env::config::Config,
+	src: &Path,
+	source_shell: &Path,
+) -> Result<PathBuf> {
+	if src.is_dir() {
+		let dir = std::fs::canonicalize(src)?;
+		Ok(registry::root_path(
+			cfg,
+			&Env {
+				name: None,
+				root: dir,
+				kind: Kind::Project,
+			},
+		))
+	} else {
+		Ok(registry::file_root(cfg, &std::fs::canonicalize(source_shell)?))
+	}
+}
+
+/// Root the freshly-registered env from an already-built **matching** source version
+/// — reusing its closure, so no rebuild and no re-entry. Adopt happens only when the
+/// registry env's derivation equals a source version whose `.rt` (built closure) is
+/// present. The new roots are keyed by the registry name (`env-<name>`), not the
+/// source's `proj-`/`file-` key. Returns whether a match was adopted.
+fn try_adopt(
+	cfg: &crate::env::config::Config,
+	catalog: &Catalog,
+	name: &str,
+	reg_shell: &Path,
+	src_versions: &[registry::RootVersion],
+	settings: &Settings,
+) -> Result<bool> {
+	let reg_drv = crate::nix::instantiate(reg_shell)?;
+	let matched = src_versions.iter().any(|v| {
+		std::fs::read_link(&v.drv_root)
+			.map(|t| t == Path::new(&reg_drv))
+			.unwrap_or(false)
+			&& registry::rt_root(&v.drv_root).symlink_metadata().is_ok()
+	});
+	if !matched {
+		return Ok(false);
+	}
+	// Reuse: re-instantiating the wrapper yields the same drv (already built), and
+	// re-realising its `inputDerivation` reuses the present closure — no build.
+	let env_base = node_root(cfg, catalog, name)?;
+	let vpath = registry::version_path(&env_base, registry::next_seq(&env_base)?);
+	crate::nix::instantiate_rooted(reg_shell, &vpath)?;
+	if let Err(e) = crate::nix::root_input_closure(reg_shell, &registry::rt_root(&vpath)) {
+		eprintln!("clinix: warning: adopted the drv but could not root its closure ({e})");
+	}
+	let key = env_base
+		.file_name()
+		.map(|n| n.to_string_lossy().into_owned())
+		.unwrap_or_default();
+	if let Some(keep) = settings.env.root_retention(&key) {
+		registry::prune_versions(&env_base, keep)?;
+	}
+	Ok(true)
 }
 
 /// The `pkgs`-injecting wrapper: reads the namespace pin and passes `pkgs` into the

@@ -395,8 +395,17 @@ pub(crate) fn launch(
 /// the complete build closure, retained regardless of `keep-outputs`.
 fn mint_current(ctx: &Context, comp: &Composition) -> Result<String> {
 	let settings = crate::env::config::Settings::load(&ctx.config.config_dir)?;
-	let keep_n = settings.env.keep_n_prior_roots();
 	let base = &comp.root;
+	let base_key = base
+		.file_name()
+		.map(|n| n.to_string_lossy().into_owned())
+		.unwrap_or_default();
+
+	// Rooting may be disabled for this kind (negative project/stack retention): then
+	// just evaluate and enter unrooted (plain `nix-shell`, GC-collectible).
+	let Some(keep_total) = settings.env.root_retention(&base_key) else {
+		return crate::nix::instantiate(&comp.shell_file);
+	};
 
 	// Reuse the current version when the derivation is unchanged.
 	let versions = registry::list_versions(base)?;
@@ -420,7 +429,7 @@ fn mint_current(ctx: &Context, comp: &Composition) -> Result<String> {
 			comp.label
 		);
 	}
-	registry::prune_versions(base, keep_n + 1)?;
+	registry::prune_versions(base, keep_total)?;
 	Ok(drv)
 }
 
@@ -513,6 +522,37 @@ fn resolve_node(cfg: &Config, catalog: &crate::env::seeds::Catalog, name: &str) 
 		},
 		Err(e) => Err(e),
 	}
+}
+
+/// A resolved node's composition label — a seed's name, a registry/project env's
+/// [`env_label`], or a `*.nix` file's [`file_label`]. Shared by [`union_item`] (the
+/// composed shell) and [`resolve_stack_key`] (the offline key) so both agree.
+fn node_label(node: &Node) -> String {
+	match node {
+		Node::Env(env) => env_label(env),
+		Node::File { path } => file_label(path),
+		Node::Seed { name, .. } => name.clone(),
+	}
+}
+
+/// The `stack-<labels>` key that composing `names` would produce (sorted unless
+/// `ordered`), computed **offline** — label resolution only, no lock/eval/compose
+/// write. Lets `clean --union` / `clean -o` target the exact stack root a
+/// `shell`/`run` composition created.
+pub(crate) fn resolve_stack_key(
+	cfg: &Config,
+	catalog: &crate::env::seeds::Catalog,
+	names: &[String],
+	ordered: bool,
+) -> Result<String> {
+	let mut labels: Vec<String> = names
+		.iter()
+		.map(|n| resolve_node(cfg, catalog, n).map(|node| node_label(&node)))
+		.collect::<Result<_>>()?;
+	if !ordered {
+		labels.sort();
+	}
+	Ok(stack_key(labels.iter().map(String::as_str)))
 }
 
 /// The `stack-<labels>` GC-root key for a seed/union composition: each label
@@ -659,8 +699,9 @@ pub enum Cmd {
 	Shared(Targets),
 	/// Environment/PATH audit (the former `envcheck`).
 	Check(OptionalTarget),
-	/// List an env's GC-root versions (current + retained priors).
-	Roots(Target),
+	/// List GC-root versions — one env's (`roots <name>`) or, with no name, a grouped
+	/// listing of every root family.
+	Roots(OptionalTarget),
 
 	/// Bare name list under `env` → `shell <names…>` (parity with the top-level
 	/// `clinix <names…>` sugar), so `clinix env rust claude` composes those envs.

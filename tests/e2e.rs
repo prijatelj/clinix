@@ -644,7 +644,8 @@ fn prior_root_versions_are_kept_and_enterable() {
 	std::fs::create_dir_all(p.config_dir()).unwrap();
 	std::fs::write(
 		p.config_dir().join("config.toml"),
-		"[env.gc]\nkeep_n_prior_roots = 1\n",
+		// The target here is the cwd *project*, so set the project-specific retention.
+		"[env.gc]\nkeep_n_prior_project_roots = 1\n",
 	)
 	.unwrap();
 
@@ -691,6 +692,73 @@ fn prior_root_versions_are_kept_and_enterable() {
 		.assert()
 		.success();
 	assert_eq!(count_versions(), 2, "entering a prior mints nothing");
+}
+
+/// `new --from <entered-project>` **adopts** the project's already-built closure:
+/// it roots the registry env (`env-<name>`) reusing the store paths — no re-entry,
+/// no rebuild — while leaving the project's `proj-*` roots in place. `--clean` then
+/// releases the source project's roots.
+#[test]
+#[ignore = "needs nix + network"]
+fn new_adopts_an_entered_projects_build_and_clean_releases_source() {
+	if !have_nix() {
+		return;
+	}
+	let p = Project::new();
+	p.clinix(&["env", "init", ".", "-p", "ripgrep"])
+		.assert()
+		.success();
+
+	let roots = p.state().join("roots");
+	let count = |prefix: &str| {
+		std::fs::read_dir(&roots)
+			.map(|rd| {
+				rd.filter_map(Result::ok)
+					.filter(|e| {
+						let n = e.file_name();
+						let n = n.to_string_lossy();
+						n.starts_with(prefix) && !n.ends_with(".rt")
+					})
+					.count()
+			})
+			.unwrap_or(0)
+	};
+
+	// Enter the project → builds + roots proj-<slug>@1.
+	p.clinix(&["env", "run", ".", "--", "true"]).assert().success();
+	assert_eq!(count("proj-"), 1);
+	assert_eq!(count("env-"), 0);
+
+	// Save to the registry → adopts the existing build (no re-entry needed).
+	p.clinix(&["env", "new", "saved", "--from", "."])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("adopted"));
+	assert_eq!(count("env-"), 1, "adopt rooted env-saved without `env shell`");
+	assert_eq!(count("proj-"), 1, "project roots left in place (no --clean)");
+	// The adopted `.rt` is a real root resolving into the store (reused closure).
+	let rt = std::fs::read_dir(&roots)
+		.unwrap()
+		.filter_map(Result::ok)
+		.find(|e| {
+			let n = e.file_name();
+			let n = n.to_string_lossy();
+			n.starts_with("env-saved@") && n.ends_with(".rt")
+		})
+		.expect("env-saved .rt exists");
+	assert!(
+		std::fs::read_link(rt.path())
+			.unwrap()
+			.starts_with("/nix/store/")
+	);
+
+	// Registering again with --clean adopts and releases the source's project roots.
+	p.clinix(&["env", "new", "saved2", "--from", ".", "--clean"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("released the source"));
+	assert_eq!(count("proj-"), 0, "--clean released the project roots");
+	assert_eq!(count("env-"), 2, "both registry envs rooted");
 }
 
 /// A **File target** — an explicit `*.nix` path — is entered directly (not

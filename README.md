@@ -56,7 +56,7 @@ Intriciate configurations will require modifying the `*.nix` files directly.
 
 A plain `nix-shell` does not register a GC root, so `nix-collect-garbage` deletes a project environment's closure the moment you leave it, which forces a redownload/rebuild on the next entry.
 To preserve an environment with clinix, you create a new environment from that project or shell.nix using `clinix env new YourProject --from ./path/to/project/dir/or/shell.nix`.
-After you register and enter the env, its packages are saved.
+If you had already entered that project, `new` **adopts its existing build** — it roots the registry env reusing the already-built store paths, so there is **no re-entry and no rebuild** (add `--clean` to also release the source project's own roots; otherwise clinix just notes how). Once rooted, its packages are saved.
 `clinix env clean` releases them, and then `nix-collect-garbage` reaps what nothing else keeps.
 No global `nix.conf` changes required.
 
@@ -94,15 +94,23 @@ versions around for fast — and **offline** — switch-back, set in `config.tom
 
 ```toml
 [env.gc]
-keep_n_prior_roots = 2   # keep the current version + 2 priors; default 0
+keep_n_prior_roots = 2            # named registry (env-*) + file (file-*) roots; default 0
+keep_n_prior_project_roots = 0    # project (proj-*) roots; negative = don't root projects at all
+keep_n_prior_stack_roots = 0      # stack/union (stack-*) roots; negative = don't root unions
 ```
+
+The three settings let each **kind** of root have its own policy. Projects (entered by
+path) and composed unions are more ephemeral than named envs, so you can keep fewer of
+them, or **disable their rooting entirely with a negative value** (a `-1` project
+setting means entering a project behaves like a plain `nix-shell` — GC-collectible).
 
 Because each version keeps both its `.drv` *and* its `.rt`, a prior retains the recipe
 **and** the built packages, so it can be re-entered offline straight from its stored
 derivation (no evaluation). List and enter them:
 
 ```sh
-clinix env roots web                 # list versions: current + retained priors, with ids
+clinix env roots web                 # list one env's versions: current + retained priors, with ids
+clinix env roots                     # (no name) list ALL root families grouped by kind
 clinix env shell web --prior 1       # enter the version just before current (offset)
 clinix env shell web --root-version 4  # enter an exact version by its id
 ```
@@ -116,21 +124,28 @@ clinix env shell web --root-version 4  # enter an exact version by its id
 
 ```sh
 clinix env clean web                     # release ALL of the `web` env's versions
-clinix env clean rust python a           # release several envs, each resolved independently
-clinix env clean web --root-version 4    # release only version @4 (exact, from `env roots`)
-clinix env clean web --oldest 2          # release only the 2 oldest versions, keep the rest
+clinix env clean rust python a           # several envs, each resolved independently
+clinix env clean web --root-version 4    # only version @4 (exact, from `env roots`)
+clinix env clean web --oldest 2          # only the 2 oldest versions, keep the rest
+clinix env clean --union a b             # the composed union `stack-a-b` (sorted)
+clinix env clean -o a b                  # the ORDERED union `stack-a-b` (as `shell -o a b` made it)
+clinix env clean --projects              # bulk: every project (proj-*) root
+clinix env clean --stacks                # bulk: every stack/union (stack-*) root
+clinix env clean --match '*-rust*'       # bulk: every root whose key matches the glob
 nix-collect-garbage                      # now reap every store path no root keeps
 nix-store --optimise                     # optional: hardlink-dedup identical files
 ```
 
-`clinix env clean a b c` releases **each** name's own versions in turn (it does *not*
-target a `stack-a_b_c` union — that root only exists if you launched that exact union).
-The version-targeted flags give finer control over a **single** env's history:
-`--root-version <id>` releases one exact version (the id shown by `clinix env roots
-<name>`), and `--oldest <N>` releases the N oldest versions while keeping the newer ones
-(both require exactly one name). Releasing touches only the symlinks; the env's
-`shell.nix`/`flake.lock` are untouched, and a name/version with no root is a reported
-no-op rather than an error.
+Target selection is one of three modes:
+- **Per-name** (`clean a b c`) — releases **each** name's own versions in turn (it does *not* target a `stack-a_b_c` union).
+- **Union** (`--union`, or the global `-o`) — treats the names as one composition and releases the single `stack-<…>` root a `shell`/`run` of the same names created (sorted, or ordered under `-o`).
+- **Bulk** (`--projects`/`--stacks` by kind, `--match <glob>` by key) — releases many families at once; takes no names.
+
+Within any target, `--root-version <id>` releases one exact version and `--oldest <N>`
+releases the N oldest (both require a single target). Releasing touches only the
+symlinks; the env's `shell.nix`/`flake.lock` are untouched, and a name/version with no
+root is a reported no-op rather than an error. Use `clinix env roots` (no name) to
+discover project/file/stack roots, which have no registry listing.
 
 Diagnostics for reasoning about the store:
 ```sh
