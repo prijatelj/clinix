@@ -385,7 +385,23 @@ pub(crate) fn launch(
 			std::fs::read_link(&vpath)?.to_string_lossy().into_owned()
 		}
 	};
-	crate::nix::nix_shell(&drv, pure, command)
+	match command {
+		// Interactive shell: hand the terminal off by *replacing* this process
+		// (like `~/dev_env/shell`'s `exec nix-shell`), so no clinix node lingers
+		// between the parent shell and the nix-shell. A lingering clinix process
+		// otherwise hides the nix-shell layer from process-tree tools such as
+		// `clonetty`. On success this does not return (see [`crate::nix::nix_shell_exec`]).
+		//
+		// A future post-shell cleanup hook would attach here: swap this arm back to
+		// `nix::nix_shell(&drv, pure, None)` (fork + wait) and run the hook on the
+		// returned `ExitStatus`. Kept out until such a hook has a defined purpose,
+		// rather than shipping an unreachable stub.
+		None => crate::nix::nix_shell_exec(&drv, pure),
+		// Non-interactive `run`: fork + wait so `execution::run` can mirror the
+		// command's exit code. No terminal is handed off, so there is no
+		// process-tree concern and nothing to gain from `exec` here.
+		Some(c) => crate::nix::nix_shell(&drv, pure, Some(c)),
+	}
 }
 
 /// Root the current composition as a new version **iff its derivation differs** from

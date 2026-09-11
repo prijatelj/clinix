@@ -16,6 +16,7 @@
 //! it lands. The github path used by `init` is fully classic.)
 
 use std::fs::File;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Output};
 
@@ -216,6 +217,30 @@ pub fn nix_shell(drv: &str, pure: bool, command: Option<&str>) -> Result<ExitSta
 		cmd.arg("--run").arg(c);
 	}
 	Ok(cmd.status()?)
+}
+
+/// Enter `nix-shell <drv>` interactively **by replacing this process image**
+/// (`execvp`), so clinix does not linger as a parent of the nix-shell.
+///
+/// This keeps the process tree the same shape as `~/dev_env/shell`'s
+/// `exec nix-shell`: the parent shell's direct child is the nix-shell's bash, with
+/// no intervening clinix node. Tools that reconstruct a terminal's shell stack from
+/// `/proc` (e.g. `clonetty`) walk that tree and treat every process between the
+/// terminal and the leaf shell as a shell level; a lingering non-shell clinix
+/// process otherwise breaks that descent and hides the nix-shell layer. `--pure`
+/// for a pure shell.
+///
+/// On success `execvp` does not return (the image is replaced); a returned value is
+/// therefore always the `Err` case — the `exec` itself failed (e.g. `nix-shell` not
+/// on `PATH`). The `Ok(ExitStatus)` arm is unreachable and exists only to share a
+/// signature with [`nix_shell`] so callers can select between them uniformly.
+pub fn nix_shell_exec(drv: &str, pure: bool) -> Result<ExitStatus> {
+	let mut cmd = Command::new("nix-shell");
+	cmd.arg(drv);
+	if pure {
+		cmd.arg("--pure");
+	}
+	Err(cmd.exec().into()) // io::Error → ClinixError::Io; only reached if exec fails
 }
 
 /// Evaluate a nix expression to JSON with **classic** `nix-instantiate --eval
