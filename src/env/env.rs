@@ -36,7 +36,10 @@ pub enum Kind {
 pub struct ShellOptions {
 	/// Preserve the given order instead of sorting names lexically.
 	pub ordered: bool,
-	/// In a project, compose only the runtime env (skip dev tools).
+	/// In a project, compose only the runtime env (skip dev tools). Threaded from
+	/// the CLI but **not yet read by any verb**: implicit project composition
+	/// (`compose.nix` — runtime ∪ dev shells) is deferred, so a project already
+	/// composes alone. Wire this up when that composition lands.
 	pub runtime: bool,
 }
 
@@ -678,7 +681,9 @@ pub enum Cmd {
 	/// Scaffold a new **project** env in a directory (adopt via `--from` is a
 	/// later slice; init never overwrites existing project files).
 	Init(Init),
-	/// Create a new **registry** env by merging existing envs (`--from A B C`).
+	/// Create a new **registry** env — two modes, chosen by `--from`: compose seed
+	/// fragments (`--from a b c`) into a frozen, portable env, or register an
+	/// existing project/shell (`--from <dir-or-file>`) under a name.
 	New(New),
 	/// Rename a registered env.
 	Rename(Rename),
@@ -686,15 +691,20 @@ pub enum Cmd {
 	Add(Pkgs),
 	/// Remove packages from an env's `shell.nix`.
 	Remove(Pkgs),
-	/// Manage `flake.lock` inputs: `flake <env> add|rm|freeze|unfreeze`.
+	/// Manage an env's `flake.lock` inputs and its flake front door:
+	/// `flake <env> add|rm|freeze|unfreeze|wrap-shell`.
 	Flake(Flake),
-	/// Update unpinned packages to the latest the baseline provides.
+	/// Advance the env's tracked `flake.lock` inputs to the latest commit of the
+	/// branch each tracks. Frozen (rev-pinned) and non-github inputs are left
+	/// as-is; the lock is written only if something advanced.
 	Update(Update),
 	/// Report tracked inputs whose upstream rev is newer than the lock (no writes).
 	Outdated(Target),
 	/// Re-check every locked input still hashes correctly.
 	Verify(Target),
-	/// Import an env from another format (shell.nix / flake / .deb / OCI / …).
+	/// Register an env from an exported closure plus its `shell.nix` (the inverse
+	/// of `export closure`). Other source formats (flake / .deb / OCI / …) are a
+	/// later slice.
 	Import(Import),
 	/// Export an env to another format.
 	Export(Export),
@@ -709,7 +719,8 @@ pub enum Cmd {
 	Run(Run),
 
 	// -- diagnostics: read-only reports over resolved envs --------------------
-	/// List registered envs.
+	/// List everything `env <name>` can enter: registry envs (with their nixpkgs
+	/// pin) and seeds (with their namespace and source path).
 	List(diagnostics::List),
 	/// Summarize a single env (nixpkgs pin + resolved package versions).
 	Info(Info),

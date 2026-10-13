@@ -8,7 +8,7 @@ use crate::env::project::Project;
 use crate::env::wrap_shell::WrapShell;
 use crate::env::{Context, Env, RunCmd, Target, resolve};
 use crate::error::{ClinixError, Result, unimplemented};
-use crate::model::lock::{FlakeLock, InputRef, Source};
+use crate::model::lock::{FlakeLock, Source};
 
 /// A package with an optional pinned version, parsed from `name[=version]`.
 #[derive(Debug, Clone)]
@@ -128,7 +128,9 @@ pub struct FlakeUnfreeze {
 pub struct Update {
 	/// Target env name.
 	pub name: String,
-	/// Packages to update; empty = all unpinned packages.
+	/// Packages to update — **not yet supported** (per-package version update is a
+	/// later phase; naming any package is rejected). Omit them to advance every
+	/// tracked `flake.lock` input.
 	pub packages: Vec<String>,
 	/// Show what would change and don't write the lock (a preview). Resolves the
 	/// latest rev of each tracked input but skips the hash prefetch and the write.
@@ -161,164 +163,15 @@ impl RunCmd for Update {
 		}
 		let mut project = Project::load(env)?;
 
-		let mut changed = 0;
-		for tgt in tracking_github_inputs(&project)? {
-			let old = tgt.locked_rev.as_deref();
-			if self.dry_run {
-				// Preview: the rev is enough; skip the hash prefetch.
-				let rev = crate::nix::resolve_github_ref(&tgt.owner, &tgt.repo, &tgt.git_ref)?;
-				if old == Some(rev.as_str()) {
-					println!("{}: unchanged", tgt.name);
-				} else {
-					println!("{}: {} -> {} (dry run)", tgt.name, short_opt(old), short_rev(&rev));
-					changed += 1;
-				}
-				continue;
-			}
-			let (rev, nar_hash) = crate::nix::resolve_github(&tgt.owner, &tgt.repo, &tgt.git_ref)?;
-			if old == Some(rev.as_str()) {
-				println!("{}: unchanged", tgt.name);
-				continue;
-			}
-			project
-				.lock
-				.nodes
-				.get_mut(&tgt.name)
-				.expect("target exists")
-				.locked = Some(Source::github_locked(
-				&tgt.owner,
-				&tgt.repo,
-				rev.as_str(),
-				nar_hash.as_str(),
-			));
-			println!("{}: {} -> {}", tgt.name, short_opt(old), short_rev(&rev));
-			changed += 1;
-		}
-
-		if self.dry_run {
-			println!(
-				"clinix: {}",
-				match changed {
-					0 => "all inputs up to date".to_string(),
-					n => format!("{n} input(s) would update (dry run — not written)"),
-				}
-			);
-		} else if changed == 0 {
-			println!("clinix: all inputs up to date");
-		} else {
+		// The re-lock engine is shared with `sys update` (see [`crate::relock`]);
+		// it mutates the lock in place and returns how many inputs advanced, and we
+		// persist here — the engine itself never writes.
+		let changed = crate::relock::update_tracked(&mut project.lock, self.dry_run)?;
+		if !self.dry_run && changed > 0 {
 			project.save_lock()?;
 		}
 		Ok(())
 	}
-}
-
-/// A required `original` field, or a [`ClinixError::Resolve`] naming what's missing.
-fn required(value: Option<&str>, node: &str, field: &str) -> Result<String> {
-	value
-		.map(str::to_string)
-		.ok_or_else(|| ClinixError::Resolve(format!("{node}: github input missing `{field}`")))
-}
-
-/// First 9 chars of a rev for compact display (revs are 40-hex).
-fn short(rev: &str) -> &str {
-	&rev[..rev.len().min(9)]
-}
-/// Compact display of an optional locked rev (`none` when absent).
-fn short_opt(rev: Option<&str>) -> &str {
-	rev.map(short).unwrap_or("none")
-}
-fn short_rev(rev: &crate::model::newtypes::Rev) -> String {
-	short(rev.as_str()).to_string()
-}
-
-/// The root's **direct** input node names (the `pin`/update set; `follows` edges have
-/// no node of their own). Shared by `update`, `outdated`, and `verify`.
-fn root_input_names(project: &Project) -> Vec<String> {
-	match project.lock.nodes.get(&project.lock.root) {
-		Some(node) => node
-			.inputs
-			.values()
-			.filter_map(|edge| match edge {
-				InputRef::Direct(name) => Some(name.clone()),
-				InputRef::Follows(_) => None,
-			})
-			.collect(),
-		None => Vec::new(),
-	}
-}
-
-/// A root github input that **tracks a branch/tag** (the update/outdated set). Frozen
-/// (rev-pinned) and non-github inputs are excluded.
-struct GhTracking {
-	name: String,
-	owner: String,
-	repo: String,
-	git_ref: String,
-	locked_rev: Option<String>,
-}
-
-fn tracking_github_inputs(project: &Project) -> Result<Vec<GhTracking>> {
-	let mut out = Vec::new();
-	for name in root_input_names(project) {
-		let Some(node) = project.lock.nodes.get(&name) else {
-			continue;
-		};
-		let Some(original) = &node.original else {
-			continue;
-		};
-		if original.source_type() != Some("github") {
-			continue; // git/tarball re-lock is a later phase
-		}
-		let Some(git_ref) = original.git_ref().map(str::to_string) else {
-			continue; // frozen at a rev — nothing to advance
-		};
-		out.push(GhTracking {
-			owner: required(original.owner(), &name, "owner")?,
-			repo: required(original.repo(), &name, "repo")?,
-			git_ref,
-			locked_rev: node.locked.as_ref().and_then(|l| l.rev()).map(str::to_string),
-			name,
-		});
-	}
-	Ok(out)
-}
-
-/// A root github input with a **locked** source (the verify set): its recorded
-/// `(rev, narHash)` to re-check against the upstream tarball.
-struct GhLocked {
-	name: String,
-	owner: String,
-	repo: String,
-	rev: String,
-	nar_hash: String,
-}
-
-fn locked_github_inputs(project: &Project) -> Vec<GhLocked> {
-	let mut out = Vec::new();
-	for name in root_input_names(project) {
-		let Some(node) = project.lock.nodes.get(&name) else {
-			continue;
-		};
-		let Some(locked) = &node.locked else { continue };
-		if locked.source_type() != Some("github") {
-			continue; // only github tarball hashes are re-checkable here
-		}
-		if let (Some(owner), Some(repo), Some(rev), Some(nar_hash)) = (
-			locked.owner(),
-			locked.repo(),
-			locked.rev(),
-			locked.nar_hash(),
-		) {
-			out.push(GhLocked {
-				name,
-				owner: owner.to_string(),
-				repo: repo.to_string(),
-				rev: rev.to_string(),
-				nar_hash: nar_hash.to_string(),
-			});
-		}
-	}
-	out
 }
 
 /// `env outdated <name>` — report which tracked github inputs have a newer upstream
@@ -327,7 +180,7 @@ fn locked_github_inputs(project: &Project) -> Vec<GhLocked> {
 pub fn outdated(target: Target, context: &Context) -> Result<()> {
 	let env = resolve(&context.config, Some(&target.name))?;
 	let project = Project::load(env)?;
-	let targets = tracking_github_inputs(&project)?;
+	let targets = crate::relock::tracking_github_inputs(&project.lock)?;
 	if targets.is_empty() {
 		println!("clinix: no tracked github inputs to check");
 		return Ok(());
@@ -337,13 +190,13 @@ pub fn outdated(target: Target, context: &Context) -> Result<()> {
 		let rev = crate::nix::resolve_github_ref(&tgt.owner, &tgt.repo, &tgt.git_ref)?;
 		let old = tgt.locked_rev.as_deref();
 		if old == Some(rev.as_str()) {
-			println!("{}: up to date ({})", tgt.name, short_rev(&rev));
+			println!("{}: up to date ({})", tgt.name, crate::relock::short_rev(&rev));
 		} else {
 			println!(
 				"{}: OUTDATED {} -> {} (tracking {})",
 				tgt.name,
-				short_opt(old),
-				short_rev(&rev),
+				crate::relock::short_opt(old),
+				crate::relock::short_rev(&rev),
 				tgt.git_ref
 			);
 			stale += 1;
@@ -365,7 +218,7 @@ pub fn outdated(target: Target, context: &Context) -> Result<()> {
 pub fn verify(target: Target, context: &Context) -> Result<()> {
 	let env = resolve(&context.config, Some(&target.name))?;
 	let project = Project::load(env)?;
-	let targets = locked_github_inputs(&project);
+	let targets = crate::relock::locked_github_inputs(&project.lock);
 	if targets.is_empty() {
 		println!("clinix: no locked github inputs to verify");
 		return Ok(());
@@ -374,7 +227,7 @@ pub fn verify(target: Target, context: &Context) -> Result<()> {
 	for tgt in &targets {
 		let actual = crate::nix::github_tarball_narhash(&tgt.owner, &tgt.repo, &tgt.rev)?;
 		if actual.as_str() == tgt.nar_hash {
-			println!("{}: ok ({})", tgt.name, short(&tgt.rev));
+			println!("{}: ok ({})", tgt.name, crate::relock::short(&tgt.rev));
 		} else {
 			eprintln!(
 				"{}: HASH MISMATCH — locked {}, actual {}",

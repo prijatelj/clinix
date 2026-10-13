@@ -38,6 +38,10 @@ pub struct Cli {
 	pub ordered: bool,
 
 	/// In a project, compose only the runtime env (skip the dev tools).
+	/// **Currently inert**: implicit project composition (runtime ∪ dev shells) is
+	/// deferred, so entering a project already composes only that project — there
+	/// is nothing yet to opt out of. Union dev tools by naming them explicitly
+	/// instead: `clinix python claude .`.
 	#[arg(short = 'r', long, global = true)]
 	pub runtime: bool,
 

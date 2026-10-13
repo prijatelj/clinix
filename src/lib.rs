@@ -16,4 +16,5 @@ pub mod ext;
 pub mod model;
 pub mod nix;
 pub mod progress;
+pub mod relock;
 pub mod sys;
