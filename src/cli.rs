@@ -76,11 +76,19 @@ pub enum Command {
 	Config(ConfigArgs),
 
 	/// Print a shell completion script to stdout (bash, zsh, fish, elvish,
-	/// powershell). Install it, or in nix `installShellCompletion`.
+	/// powershell).
+	///
+	/// clinix writes the script and nothing else — where it belongs depends on
+	/// your shell and on whether the install is user-local, system-wide, or done
+	/// by a package manager. The recipes for each are below.
 	Completions(CompletionsArgs),
 
-	/// Write the man page (roff) — so `man clinix` works. To a directory on
-	/// MANPATH, or stdout.
+	/// Write the man page (roff) so `man clinix` works — to a `man1` directory,
+	/// or stdout.
+	///
+	/// The user-local case needs care: `~/.local/share/man` is not universally on
+	/// the man search path (a Nix-managed profile usually omits it), so the
+	/// recipes below pair the write with making it findable.
 	Man(ManArgs),
 
 	/// Bare name list → `env shell <names…>` (see module docs). The first token
@@ -89,18 +97,82 @@ pub enum Command {
 	Shell(Vec<String>),
 }
 
+/// Where a generated completion script belongs, per shell. clinix only writes to
+/// stdout — installing is the caller's choice (user-local, system-wide, or by a
+/// package manager), so the recipes are documented rather than guessed at.
+const COMPLETIONS_HELP: &str = r#"Install for one user:
+  bash  clinix completions bash > ~/.local/share/bash-completion/completions/clinix
+  zsh   clinix completions zsh  > ~/.local/share/zsh/site-functions/_clinix
+        # the dir must be on $fpath BEFORE compinit runs, e.g. in ~/.zshrc:
+        #   fpath=(~/.local/share/zsh/site-functions $fpath)
+        #   autoload -Uz compinit && compinit
+  fish  clinix completions fish > ~/.config/fish/completions/clinix.fish
+  pwsh  clinix completions powershell >> $PROFILE
+
+Install system-wide (what a distro package does):
+  bash  /usr/share/bash-completion/completions/clinix
+  zsh   /usr/share/zsh/site-functions/_clinix
+  fish  /usr/share/fish/vendor_completions.d/clinix.fish
+
+In a nix derivation, let installShellFiles place all three:
+  nativeBuildInputs = [ installShellFiles ];
+  postInstall = ''
+    installShellCompletion --cmd clinix \
+      --bash <($out/bin/clinix completions bash) \
+      --zsh  <($out/bin/clinix completions zsh) \
+      --fish <($out/bin/clinix completions fish)
+  '';
+
+A written script is a snapshot of THIS version's verbs and flags, so re-generate
+it after upgrading clinix. To never have to, generate on shell startup instead:
+  bash/zsh  source <(clinix completions bash)   # use `zsh` in ~/.zshrc
+  fish      clinix completions fish | source"#;
+
 /// `clinix completions <shell>`.
 #[derive(clap::Args, Debug)]
+#[command(after_long_help = COMPLETIONS_HELP)]
 pub struct CompletionsArgs {
 	/// Shell to emit a completion script for.
 	pub shell: clap_complete::Shell,
 }
 
+/// How to get `man clinix` working. The user-local path is the fiddly one: a
+/// `~/.local/share/man` is **not** universally on the man search path (notably
+/// not under a Nix-managed profile), so the recipe pairs the write with the two
+/// ways to make it findable instead of assuming it is picked up.
+const MAN_HELP: &str = r#"Install for one user:
+  clinix man ~/.local/share/man/man1          # writes clinix.1 there
+  man clinix                                  # should now work
+
+  If it does not, that dir is not on the man search path (`manpath` shows the
+  real one — a Nix-managed profile usually omits it). Fix it either way:
+    export MANPATH="$HOME/.local/share/man:$(manpath)"     # in your shell rc
+  or add a line to ~/.manpath:
+    MANDATORY_MANPATH /home/<you>/.local/share/man
+
+Install system-wide (what a distro package does):
+  clinix man /usr/share/man/man1
+
+In a nix derivation:
+  nativeBuildInputs = [ installShellFiles ];
+  postInstall = ''
+    $out/bin/clinix man .
+    installManPage clinix.1
+  '';
+
+Without installing anything:
+  clinix man | man -l -                       # preview the page
+  clinix man > /tmp/clinix.1                  # keep the roff
+
+Only the top-level page is generated; per-verb detail lives in
+`clinix env <verb> --help`."#;
+
 /// `clinix man [dir]`.
 #[derive(clap::Args, Debug)]
+#[command(after_long_help = MAN_HELP)]
 pub struct ManArgs {
-	/// Output directory for `clinix.1` (install onto MANPATH, e.g.
-	/// `~/.local/share/man/man1`). Omit to print the roff to stdout.
+	/// Output directory for `clinix.1` — a `man1` dir on the man search path (see
+	/// the recipes below). Omit to print the roff to stdout.
 	pub dir: Option<PathBuf>,
 }
 
