@@ -227,6 +227,80 @@ pub fn inspect(src: &str) -> SeedInfo {
 	}
 }
 
+/// Which `[env.pins]` entries a fragment indexes, as far as a syntactic pass can
+/// tell. Used by `env new --from` to copy **only the locks an env actually reads**
+/// into the materialized env, instead of every declared pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinRefs {
+	/// Every use of `pins` was a static `pins.<name>` select, and these are the
+	/// names. A complete set — nothing else can be reached at eval time.
+	Named(std::collections::BTreeSet<String>),
+	/// `pins` is used in a form this pass cannot resolve to a fixed set of names.
+	/// Callers must assume **any** declared pin may be read.
+	Unknown,
+}
+
+/// The pins a fragment indexes ([`PinRefs`]).
+///
+/// Deliberately conservative: a name is collected only from `pins.<ident>`, and
+/// **any other** appearance of the `pins` identifier yields [`PinRefs::Unknown`] —
+/// `with pins;`, `pins.${n}`, `let p = pins;`, `builtins.getAttr n pins`, or handing
+/// `pins` to a function. Each of those can reach a name this pass never sees, and a
+/// missed name is not a cosmetic slip: it is a materialized env that fails to
+/// evaluate. Over-copying a lock costs a few hundred bytes, so the asymmetry in
+/// consequences decides the direction of the guess.
+///
+/// Separate from [`inspect`] rather than a field on [`SeedInfo`]: only `env new`
+/// needs this, and it already reads each fragment in order to copy it, so the
+/// catalog — rebuilt on every composition — does not carry the cost.
+pub fn pin_refs(src: &str) -> PinRefs {
+	let parse = rnix::Root::parse(src);
+	if parse.errors().first().is_some() {
+		return PinRefs::Unknown; // unparseable: assume the worst
+	}
+	let mut named = std::collections::BTreeSet::new();
+	for node in parse.syntax().descendants() {
+		if node.kind() != SyntaxKind::NODE_IDENT || node.text().to_string().trim() != "pins" {
+			continue;
+		}
+		// Two positions spell `pins` without *referencing* our argument, and must not
+		// be mistaken for a use of it:
+		match node.parent().map(|p| p.kind()) {
+			// the formal itself, `{ pkgs, pins }:`
+			Some(SyntaxKind::NODE_PAT_ENTRY) => continue,
+			// an attribute *name* — `pkgs.lib.pins`, or `{ pins = …; }`
+			Some(SyntaxKind::NODE_ATTRPATH) => continue,
+			_ => {}
+		}
+		// Anything else is a reference, and only one form is resolvable.
+		match static_select_name(&node) {
+			Some(name) => {
+				named.insert(name);
+			}
+			None => return PinRefs::Unknown,
+		}
+	}
+	PinRefs::Named(named)
+}
+
+/// For a `pins` reference, the first attrpath component of the select it heads —
+/// `pins.unstable.hello` → `unstable`. `None` whenever the name cannot be read off
+/// the syntax: the ident is not a select head at all (`with pins;`, `inherit pins;`,
+/// a bare `pins`), or the component is dynamic (`pins.${n}`) or a quoted string.
+fn static_select_name(ident: &SyntaxNode) -> Option<String> {
+	let select = ident.parent().filter(|p| p.kind() == SyntaxKind::NODE_SELECT)?;
+	// Only the select's *head* is a reference; `foo.pins` is an attribute name, and
+	// is already excluded above.
+	if select.first_child().as_ref() != Some(ident) {
+		return None;
+	}
+	let first = select
+		.children()
+		.find(|n| n.kind() == SyntaxKind::NODE_ATTRPATH)?
+		.first_child()?;
+	(first.kind() == SyntaxKind::NODE_IDENT).then(|| first.text().to_string().trim().to_string())
+}
+
 /// Whether a fragment's top-level argument pattern would accept a `pins` argument:
 /// it names `pins` (`{ pkgs, pins }:`), or it ends in an ellipsis (`{ pkgs, ... }:`)
 /// and so accepts anything.
@@ -374,6 +448,43 @@ mod tests {
 		assert!(!wants("{ pkgs }: pkgs.mkShell { packages = [ pins ]; }"));
 		// A flake is classified before formals are considered.
 		assert!(!wants(FLAKE));
+	}
+
+	#[test]
+	fn pin_refs_collects_static_selects_and_gives_up_on_anything_else() {
+		let named = |src: &str| match pin_refs(src) {
+			PinRefs::Named(n) => n.into_iter().collect::<Vec<_>>(),
+			PinRefs::Unknown => panic!("expected Named for: {src}"),
+		};
+
+		// No pins at all → an empty, complete set (nothing to copy).
+		assert!(named("{ pkgs }: pkgs.mkShell { }").is_empty());
+		// The ordinary form, including a deeper attrpath: only the pin name counts.
+		assert_eq!(
+			named("{ pkgs, pins }: pkgs.mkShell { packages = [ pins.unstable.claude-code ]; }"),
+			vec!["unstable"]
+		);
+		// Several pins, de-duplicated and sorted.
+		assert_eq!(
+			named("{ pkgs, pins }: [ pins.old.a pins.unstable.b pins.old.c ]"),
+			vec!["old", "unstable"]
+		);
+		// `pins` as an attrpath component, not a head, is unrelated to our argument.
+		assert!(named("{ pkgs }: pkgs.lib.pins").is_empty());
+
+		// Everything that can reach a name this pass cannot see.
+		for src in [
+			"{ pkgs, pins }: with pins; [ unstable.hello ]", // bare names
+			"{ pkgs, pins }: pins.${pkgs.system}.hello",     // dynamic component
+			"{ pkgs, pins }: let p = pins; in p.unstable",   // aliased
+			"{ pkgs, pins }: builtins.getAttr \"unstable\" pins", // indirect
+			"{ pkgs, pins }: pkgs.callPackage ./x.nix { inherit pins; }", // handed on
+			"{ pkgs, pins }: pins",                          // returned whole
+		] {
+			assert_eq!(pin_refs(src), PinRefs::Unknown, "should be Unknown: {src}");
+		}
+		// Unparseable → Unknown, never a false "complete set".
+		assert_eq!(pin_refs("{ ( broken"), PinRefs::Unknown);
 	}
 
 	#[test]

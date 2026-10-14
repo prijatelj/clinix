@@ -8,7 +8,7 @@
 //!
 //! Pure `&str`/`&Path` → `String` — no I/O — so callers stay unit-testable.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// A path as an escaped, double-quoted nix string literal (nix coerces it to a
 /// path where one is expected, e.g. `readFile`/`import`). Escapes `\`, `"`, and
@@ -79,7 +79,7 @@ pub fn lock_prelude(lock_ref: &str, config_frag: &str) -> String {
 pub fn lock_prelude_with_pins(
 	lock_ref: &str,
 	config_frag: &str,
-	pins: &[(String, PathBuf)],
+	pins: &[(String, String)],
 ) -> String {
 	LOCK_PRELUDE
 		.replace("@LOCK@", lock_ref)
@@ -87,20 +87,25 @@ pub fn lock_prelude_with_pins(
 		.replace("@PINS@", &pins_frag(pins))
 }
 
-/// The `pins = { <name> = pkgsOf "<lock>"; … };` block for the declared alternate
-/// nixpkgs pins, or **empty** when there are none. Goes in `@PINS@`.
+/// The `pins = { <name> = pkgsOf <lock>; … };` block for the alternate nixpkgs
+/// pins, or **empty** when there are none. Goes in `@PINS@`.
 ///
-/// Every declared pin is bound, not just the ones a seed names, because nix
-/// attribute sets are lazy: an unreferenced entry is never forced, so it costs no
-/// fetch and no evaluation. That keeps clinix out of the business of working out
-/// which seed touches which pin.
-pub fn pins_frag(pins: &[(String, PathBuf)]) -> String {
+/// Each `lock` is spliced **verbatim**, so the caller chooses the reference form:
+/// the live composition passes [`nix_str`] of an absolute path, while `new`'s
+/// materialized env passes a bare `./locks/<name>.lock` literal. That is not a
+/// style choice — nix rejects a quoted *relative* path outright ("string
+/// './x' doesn't represent an absolute path"), while a bare literal resolves
+/// against the containing file from any working directory.
+///
+/// Within one composition the set is bound whole and nix attrsets are lazy, so an
+/// entry nothing references costs no fetch and no evaluation.
+pub fn pins_frag(pins: &[(String, String)]) -> String {
 	if pins.is_empty() {
 		return String::new();
 	}
 	let entries: String = pins
 		.iter()
-		.map(|(name, lock)| format!("    {name} = pkgsOf {};\n", nix_str(lock)))
+		.map(|(name, lock)| format!("    {name} = pkgsOf {lock};\n"))
 		.collect();
 	format!("  pins = {{\n{entries}  }};\n")
 }
@@ -165,9 +170,11 @@ pub struct ComposeSpec<'a> {
 	pub label: &'a str,
 	/// Ad-hoc package attribute names; empty ⇒ no `packages` line at all.
 	pub packages: &'a [String],
-	/// Declared alternate nixpkgs pins to bind as `pins` ([`pins_frag`]); empty ⇒ no
-	/// `pins` binding at all.
-	pub pins: &'a [(String, PathBuf)],
+	/// Alternate nixpkgs pins to bind as `pins` ([`pins_frag`]); empty ⇒ no `pins`
+	/// binding at all. `(name, already-rendered lock ref)` — rendered, like
+	/// [`Self::lock_ref`] and for the same reason: the live compose path writes
+	/// quoted absolute paths while a materialized env writes bare relative literals.
+	pub pins: &'a [(String, String)],
 }
 
 impl ComposeSpec<'_> {
@@ -231,14 +238,25 @@ mod tests {
 	#[test]
 	fn pins_frag_is_empty_or_one_pkgs_of_per_declared_pin() {
 		assert_eq!(pins_frag(&[]), "");
+		// Quoted absolute refs — the live composition's form.
 		let pins = [
-			("unstable".to_string(), PathBuf::from("/c/locks/unstable.lock")),
-			("old".to_string(), PathBuf::from("/c/locks/old.lock")),
+			(
+				"unstable".to_string(),
+				nix_str(Path::new("/c/locks/unstable.lock")),
+			),
+			("old".to_string(), nix_str(Path::new("/c/locks/old.lock"))),
 		];
 		assert_eq!(
 			pins_frag(&pins),
 			"  pins = {\n    unstable = pkgsOf \"/c/locks/unstable.lock\";\n    \
 			 old = pkgsOf \"/c/locks/old.lock\";\n  };\n"
+		);
+		// Bare relative refs — a materialized env's form, which must NOT be quoted
+		// (nix rejects a quoted relative path).
+		let rel = [("unstable".to_string(), "./locks/unstable.lock".to_string())];
+		assert_eq!(
+			pins_frag(&rel),
+			"  pins = {\n    unstable = pkgsOf ./locks/unstable.lock;\n  };\n"
 		);
 	}
 
@@ -246,7 +264,7 @@ mod tests {
 	fn lock_prelude_with_pins_binds_every_pin_through_the_one_reader() {
 		let pins = [(
 			"unstable".to_string(),
-			PathBuf::from("/c/locks/unstable.lock"),
+			nix_str(Path::new("/c/locks/unstable.lock")),
 		)];
 		let p = lock_prelude_with_pins("\"/cfg/flake.lock\"", "", &pins);
 		// The stack's pin and the alternate pin both go through `pkgsOf` — the fetch

@@ -106,13 +106,11 @@ impl New {
 
 		let settings = Settings::load(&cfg.config_dir)?;
 		let catalog = Catalog::build(&settings.env.seeds);
-		let mut seeds: Vec<(String, PathBuf)> = Vec::with_capacity(self.from.len());
+		let mut seeds: Vec<SeedCopy> = Vec::with_capacity(self.from.len());
 		for name in &self.from {
 			match catalog.find(name) {
-				Some(Resolved::One(s)) => seeds.push((s.name.clone(), s.path.clone())),
-				Some(Resolved::Collision { chosen, .. }) => {
-					seeds.push((chosen.name.clone(), chosen.path.clone()))
-				}
+				Some(Resolved::One(s)) => seeds.push(SeedCopy::of(s)),
+				Some(Resolved::Collision { chosen, .. }) => seeds.push(SeedCopy::of(chosen)),
 				None => {
 					return Err(ClinixError::Config(format!(
 						"`new --from` names must be seeds (or a single dir/file to register); \
@@ -123,14 +121,19 @@ impl New {
 		}
 
 		let lock = super::env::seed_lock(cfg, &settings)?;
+		// Decide which pin locks this env needs **before** the first write: a copied
+		// `{ pkgs, pins }:` fragment still demands the argument, and an undeclared pin
+		// is an error. `init` follows the same order (resolve, then write) so a failure
+		// leaves no half-built directory to block a retry.
+		let selected_pins = select_pins(cfg, &settings, &seeds)?;
 		if seeds.is_empty() {
 			// A packages-only env: no `seeds/` dir to create.
 			std::fs::create_dir_all(&dest)?;
 		} else {
 			let seeds_dir = dest.join("seeds");
 			std::fs::create_dir_all(&seeds_dir)?;
-			for (sname, spath) in &seeds {
-				std::fs::copy(spath, seeds_dir.join(format!("{sname}.nix")))?;
+			for seed in &seeds {
+				std::fs::copy(&seed.source, seeds_dir.join(format!("{}.nix", seed.name)))?;
 			}
 		}
 		std::fs::copy(&lock, dest.join("flake.lock"))?;
@@ -141,9 +144,12 @@ impl New {
 			}
 			None => false,
 		};
+		// Copy them in, for the same reason the lock and the nixpkgs config are copied
+		// above: the env must not reach back into the user's config dir.
+		let pins = copy_pins(&dest, &selected_pins)?;
 		let seed_label = seeds
 			.iter()
-			.map(|(n, _)| n.as_str())
+			.map(|s| s.name.as_str())
 			.collect::<Vec<_>>()
 			.join(" ");
 		// `-p` is a global flag (see `crate::cli`), so it arrives via `Context`.
@@ -159,7 +165,7 @@ impl New {
 		};
 		std::fs::write(
 			dest.join("shell.nix"),
-			render_composed_shell(&seeds, &label, with_config, &packages),
+			render_composed_shell(&seeds, &label, with_config, &packages, &pins),
 		)?;
 
 		super::env::warn_name_collision(cfg, &self.name);
@@ -549,15 +555,150 @@ fn render_wrapper_no_lock(source_expr: &str) -> String {
 /// `env shell -p` splices into a throwaway compose file is written here into a
 /// registered env's committed `shell.nix`, where `env add`/`remove` can edit it
 /// from then on.
+/// One seed being materialized into a registry env: its catalog name (which becomes
+/// `seeds/<name>.nix`), the source fragment to copy, and whether that fragment asked
+/// for `pins`. The flag is carried from the catalog rather than re-derived, so the
+/// copy is called with exactly the arguments the live composition would use.
+struct SeedCopy {
+	name: String,
+	source: PathBuf,
+	wants_pins: bool,
+}
+
+impl SeedCopy {
+	fn of(seed: &crate::env::seeds::Seed) -> Self {
+		SeedCopy {
+			name: seed.name.clone(),
+			source: seed.path.clone(),
+			wants_pins: seed.wants_pins,
+		}
+	}
+}
+
+/// Which alternate-pin locks a materialized env will need: the declared pins its
+/// copied fragments actually index, resolved to their source lockfiles. Empty when
+/// no copied seed asked for `pins`.
+///
+/// Only the referenced pins, not every declared one:
+/// [`crate::env::seeds::pin_refs`] reads the `pins.<name>` selections off the
+/// syntax. A fragment using `pins` in a form analysis cannot resolve falls back to
+/// **all** declared pins — over-copying a few hundred bytes is strictly better than
+/// an env that fails to evaluate.
+///
+/// A seed naming a pin `[env.pins]` does not declare is an **error**, and this runs
+/// before `new` writes anything, so that error leaves no half-built env behind. The
+/// alternative would be an env whose `pins.<name>` is a missing attribute,
+/// discovered only on first entry.
+fn select_pins(
+	cfg: &crate::env::config::Config,
+	settings: &Settings,
+	seeds: &[SeedCopy],
+) -> Result<Vec<(String, PathBuf)>> {
+	use crate::env::seeds::{PinRefs, pin_refs};
+
+	if !seeds.iter().any(|s| s.wants_pins) {
+		return Ok(Vec::new());
+	}
+	let declared = super::env::named_pins(cfg, settings)?;
+	let names = || -> String {
+		match declared.is_empty() {
+			true => "none declared".to_string(),
+			false => format!(
+				"declared: {}",
+				declared
+					.iter()
+					.map(|(n, _)| n.as_str())
+					.collect::<Vec<_>>()
+					.join(", ")
+			),
+		}
+	};
+
+	// Union the references across the fragments; one unresolvable use widens the
+	// whole set, since any declared pin might then be reached.
+	let mut wanted: Option<std::collections::BTreeSet<String>> = Some(Default::default());
+	for seed in seeds.iter().filter(|s| s.wants_pins) {
+		match pin_refs(&std::fs::read_to_string(&seed.source)?) {
+			PinRefs::Named(found) => {
+				if let Some(set) = wanted.as_mut() {
+					set.extend(found);
+				}
+			}
+			PinRefs::Unknown => {
+				eprintln!(
+					"clinix: note: `{}` indexes `pins` dynamically — copying every pin ({}) \
+					 into the env",
+					seed.name,
+					names()
+				);
+				wanted = None;
+				break;
+			}
+		}
+	}
+
+	match &wanted {
+		// Exactly the referenced pins, each of which must be declared.
+		Some(wanted) => wanted
+			.iter()
+			.map(|name| {
+				declared
+					.iter()
+					.find(|(n, _)| n == name)
+					.cloned()
+					.ok_or_else(|| {
+						ClinixError::Config(format!(
+							"a seed reads `pins.{name}`, but [env.pins] declares no `{name}` ({})",
+							names()
+						))
+					})
+			})
+			.collect(),
+		// Unresolvable: every declared pin.
+		None => Ok(declared),
+	}
+}
+
+/// Copy the [`select_pins`] locks into `<dest>/locks/<pin>.lock` and return the
+/// **bare relative** refs the generated `shell.nix` reads (`./locks/<pin>.lock`).
+/// Empty input ⇒ no `locks/` dir and no `pins` binding, so an env without alternate
+/// pins is byte-identical to one built before this existed.
+///
+/// Locks are copied byte-for-byte: a lock's own unused inputs are part of the pin,
+/// not noise to be pruned.
+fn copy_pins(dest: &Path, selected: &[(String, PathBuf)]) -> Result<Vec<(String, String)>> {
+	if selected.is_empty() {
+		return Ok(Vec::new());
+	}
+	let locks_dir = dest.join("locks");
+	std::fs::create_dir_all(&locks_dir)?;
+	let mut refs = Vec::with_capacity(selected.len());
+	for (name, lock) in selected {
+		std::fs::copy(lock, locks_dir.join(format!("{name}.lock")))?;
+		refs.push((name.clone(), format!("./locks/{name}.lock")));
+	}
+	Ok(refs)
+}
+
 fn render_composed_shell(
-	seeds: &[(String, PathBuf)],
+	seeds: &[SeedCopy],
 	label: &str,
 	with_config: bool,
 	packages: &[String],
+	pins: &[(String, String)],
 ) -> String {
+	// A seed is handed `pins` iff it asked — the same gate as the live composition
+	// ([`crate::env::compose`]), applied to the copies.
 	let imports = seeds
 		.iter()
-		.map(|(n, _)| format!("    (import ./seeds/{n}.nix {{ inherit pkgs; }})"))
+		.map(|s| {
+			let args = if s.wants_pins {
+				"{ inherit pkgs pins; }"
+			} else {
+				"{ inherit pkgs; }"
+			};
+			format!("    (import ./seeds/{}.nix {args})", s.name)
+		})
 		.collect::<Vec<_>>()
 		.join("\n");
 	let config = if with_config {
@@ -572,9 +713,8 @@ fn render_composed_shell(
 		imports: &imports,
 		label,
 		packages,
-		// A materialized env is self-contained: it carries copies of its seeds and
-		// its own lock, so it deliberately does not inherit the host's `[env.pins]`.
-		pins: &[],
+		// Relative to this file, so the env stays portable (see `materialize_pins`).
+		pins,
 	}
 	.render()
 }
@@ -630,19 +770,27 @@ mod tests {
 		);
 	}
 
+	/// A seed copy as `compose_seeds` builds it, without touching the catalog.
+	fn copy_of(name: &str, wants_pins: bool) -> SeedCopy {
+		SeedCopy {
+			name: name.to_string(),
+			source: PathBuf::from(format!("/src/{name}.nix")),
+			wants_pins,
+		}
+	}
+
 	#[test]
 	fn render_composed_shell_is_self_contained_and_portable() {
-		let seeds = vec![
-			("rust".to_string(), PathBuf::from("/src/rust.nix")),
-			("claude".to_string(), PathBuf::from("/src/claude.nix")),
-		];
-		let s = render_composed_shell(&seeds, "rust claude", false, &[]);
+		let seeds = vec![copy_of("rust", false), copy_of("claude", false)];
+		let s = render_composed_shell(&seeds, "rust claude", false, &[], &[]);
 		assert!(s.contains("pkgs = pkgsOf ./flake.lock;"));
 		assert!(s.contains("import ./seeds/rust.nix { inherit pkgs; }"));
 		assert!(!s.contains("/src/"), "must not reference source paths");
 		assert!(s.contains("name = \"rust-claude\";"));
+		// No pins requested ⇒ byte-identical to a pre-`[env.pins]` env.
+		assert!(!s.contains("pins"));
 
-		let s2 = render_composed_shell(&seeds, "rust claude", true, &[]);
+		let s2 = render_composed_shell(&seeds, "rust claude", true, &[], &[]);
 		assert!(s2.contains("config = import ./nixpkgs-config.nix;"));
 	}
 
@@ -650,15 +798,33 @@ mod tests {
 	fn render_composed_shell_bakes_in_adhoc_packages() {
 		// The ephemeral→permanent path: `-p` packages become a committed list in the
 		// registered env's own shell.nix, which `env add`/`remove` can then edit.
-		let seeds = vec![("rust".to_string(), PathBuf::from("/src/rust.nix"))];
-		let s = render_composed_shell(&seeds, "rust", false, &["tokei".to_string()]);
+		let seeds = vec![copy_of("rust", false)];
+		let s = render_composed_shell(&seeds, "rust", false, &["tokei".to_string()], &[]);
 		assert!(s.contains("packages = with pkgs; [ tokei ];"));
 		assert!(s.contains("import ./seeds/rust.nix { inherit pkgs; }"));
 
 		// A packages-only env (`new tools -p tokei`): no seeds, no imports.
-		let bare = render_composed_shell(&[], "", false, &["tokei".to_string()]);
+		let bare = render_composed_shell(&[], "", false, &["tokei".to_string()], &[]);
 		assert!(bare.contains("packages = with pkgs; [ tokei ];"));
 		assert!(!bare.contains("import ./seeds/"));
+	}
+
+	#[test]
+	fn render_composed_shell_carries_pins_for_the_seed_that_asked() {
+		// The regression this fixes: a copied `{ pkgs, pins }:` fragment still demands
+		// the argument, so the generated import must supply it — and the pin's lock
+		// must be referenced as a BARE relative literal, since nix rejects a quoted
+		// relative path.
+		let seeds = vec![copy_of("claude-latest", true), copy_of("rust", false)];
+		let pins = [("unstable".to_string(), "./locks/unstable.lock".to_string())];
+		let s = render_composed_shell(&seeds, "claude-latest rust", false, &[], &pins);
+		assert!(s.contains("pins = {\n    unstable = pkgsOf ./locks/unstable.lock;\n  };"));
+		assert!(s.contains("import ./seeds/claude-latest.nix { inherit pkgs pins; }"));
+		// The seed that did not ask keeps exactly its old argument.
+		assert!(s.contains("import ./seeds/rust.nix { inherit pkgs; }"));
+		// Still portable: no host path, and no quoted lock reference.
+		assert!(!s.contains("/src/"));
+		assert!(!s.contains("\"./locks"), "a quoted relative path would not evaluate");
 	}
 
 	#[test]

@@ -205,8 +205,13 @@ fn adhoc_composition(
 	// Alternate pins are resolved (and lazily locked) **only** when a member asked
 	// for them, so a declared-but-unused `[env.pins]` costs nothing — not even the
 	// one-time network lock of a `Ref` pin.
-	let pins = if members.iter().any(|m| m.pins) {
-		let declared = named_pins(cfg, settings)?;
+	let pins: Vec<(String, String)> = if members.iter().any(|m| m.pins) {
+		// Absolute lock paths, quoted: this expression lives in `state/compose/` and
+		// must reach locks in the user's config dir.
+		let declared: Vec<(String, String)> = named_pins(cfg, settings)?
+			.into_iter()
+			.map(|(name, lock)| (name, crate::env::nix_expr::nix_str(&lock)))
+			.collect();
 		if declared.is_empty() {
 			eprintln!(
 				"clinix: warning: `{label}` asks for `pins` but [env.pins] declares none — \
@@ -621,7 +626,7 @@ mod tests {
 	fn a_composition_binds_pins_once_for_every_declared_pin() {
 		let pins = [(
 			"unstable".to_string(),
-			PathBuf::from("/c/locks/unstable.lock"),
+			crate::env::nix_expr::nix_str(Path::new("/c/locks/unstable.lock")),
 		)];
 		let expr = crate::env::nix_expr::ComposeSpec {
 			lock_ref: "\"/cfg/flake.lock\"",
