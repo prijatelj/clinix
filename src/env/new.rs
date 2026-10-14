@@ -34,8 +34,9 @@ pub struct New {
 	/// Name of the new env: a bare name, or `namespace:member` for a member subshell.
 	pub name: String,
 	/// Source(s): seed names to compose, or a single directory / `*.nix` file to
-	/// register (in stack order for compose).
-	#[arg(long = "from", num_args = 1.., required = true)]
+	/// register (in stack order for compose). Optional only when `-p` is given —
+	/// `new tools -p tokei` registers a packages-only env.
+	#[arg(long = "from", num_args = 1..)]
 	pub from: Vec<String>,
 	/// Register mode: copy the source shell into the registry (a frozen snapshot)
 	/// instead of referencing it in place.
@@ -61,8 +62,26 @@ impl RunCmd for New {
 		// otherwise the tokens are seed names to compose.
 		if let [only] = self.from.as_slice() {
 			if is_shell_source(only) {
+				// Register mode wraps the source shell rather than generating a
+				// `mkShell`, so there is no `packages` list to splice into. Say so
+				// instead of silently dropping them.
+				if !ctx.options.packages.is_empty() {
+					return Err(crate::error::unimplemented(
+						"env new --from <dir-or-file> with -p",
+						"register mode wraps the source shell; add the packages to that \
+						 shell with `clinix env add <name> <pkgs…>` after registering",
+					));
+				}
 				return self.register_shell(ctx, only.clone());
 			}
+		}
+		// Nothing to build from at all: `--from` is optional only to allow a
+		// packages-only env (`new tools -p tokei`).
+		if self.from.is_empty() && ctx.options.packages.is_empty() {
+			return Err(ClinixError::Config(
+				"give `--from <seeds…|dir|file>`, or `-p <pkgs…>` for a packages-only env"
+					.to_string(),
+			));
 		}
 		self.compose_seeds(ctx)
 	}
@@ -104,10 +123,15 @@ impl New {
 		}
 
 		let lock = super::env::seed_lock(cfg, &settings)?;
-		let seeds_dir = dest.join("seeds");
-		std::fs::create_dir_all(&seeds_dir)?;
-		for (sname, spath) in &seeds {
-			std::fs::copy(spath, seeds_dir.join(format!("{sname}.nix")))?;
+		if seeds.is_empty() {
+			// A packages-only env: no `seeds/` dir to create.
+			std::fs::create_dir_all(&dest)?;
+		} else {
+			let seeds_dir = dest.join("seeds");
+			std::fs::create_dir_all(&seeds_dir)?;
+			for (sname, spath) in &seeds {
+				std::fs::copy(spath, seeds_dir.join(format!("{sname}.nix")))?;
+			}
 		}
 		std::fs::copy(&lock, dest.join("flake.lock"))?;
 		let with_config = match super::env::nixpkgs_config_path(&settings)? {
@@ -122,17 +146,27 @@ impl New {
 			.map(|(n, _)| n.as_str())
 			.collect::<Vec<_>>()
 			.join(" ");
+		// `-p` is a global flag (see `crate::cli`), so it arrives via `Context`.
+		let packages = ctx.options.packages.clone();
 		std::fs::write(
 			dest.join("shell.nix"),
-			render_composed_shell(&seeds, &label, with_config),
+			render_composed_shell(&seeds, &label, with_config, &packages),
 		)?;
 
 		super::env::warn_name_collision(cfg, &self.name);
 		println!(
-			"clinix: created registry env `{}` from {} seed(s): {label}",
+			"clinix: created registry env `{}` from {} seed(s){}",
 			self.name,
-			seeds.len()
+			seeds.len(),
+			if label.is_empty() {
+				String::new()
+			} else {
+				format!(": {label}")
+			}
 		);
+		if !packages.is_empty() {
+			println!("  packages: {}", packages.join(" "));
+		}
 		println!("  enter: clinix env {}", self.name);
 		Ok(())
 	}
@@ -488,9 +522,20 @@ fn render_wrapper_no_lock(source_expr: &str) -> String {
 
 /// The self-contained `shell.nix` for a **composed** seed env: reads
 /// `./flake.lock`, imports the pinned nixpkgs, unions the local seed copies via
-/// `inputsFrom`. Portable — no reference to the user's source paths. Built from the
-/// shared [`crate::env::nix_expr`] compose assembler.
-fn render_composed_shell(seeds: &[(String, PathBuf)], label: &str, with_config: bool) -> String {
+/// `inputsFrom`, and adds any `-p` packages to its own `packages` list. Portable —
+/// no reference to the user's source paths. Built from the shared
+/// [`crate::env::nix_expr`] compose assembler.
+///
+/// This is what makes an ephemeral `-p` shell keepable: the same package set that
+/// `env shell -p` splices into a throwaway compose file is written here into a
+/// registered env's committed `shell.nix`, where `env add`/`remove` can edit it
+/// from then on.
+fn render_composed_shell(
+	seeds: &[(String, PathBuf)],
+	label: &str,
+	with_config: bool,
+	packages: &[String],
+) -> String {
 	let imports = seeds
 		.iter()
 		.map(|(n, _)| format!("    (import ./seeds/{n}.nix {{ inherit pkgs; }})"))
@@ -501,13 +546,15 @@ fn render_composed_shell(seeds: &[(String, PathBuf)], label: &str, with_config: 
 	} else {
 		""
 	};
-	crate::env::nix_expr::compose_shell(
-		"./flake.lock",
-		config,
-		&label.replace(' ', "-"),
-		&imports,
+	crate::env::nix_expr::ComposeSpec {
+		lock_ref: "./flake.lock",
+		config_frag: config,
+		name: &label.replace(' ', "-"),
+		imports: &imports,
 		label,
-	)
+		packages,
+	}
+	.render()
 }
 
 #[cfg(test)]
@@ -567,14 +614,29 @@ mod tests {
 			("rust".to_string(), PathBuf::from("/src/rust.nix")),
 			("claude".to_string(), PathBuf::from("/src/claude.nix")),
 		];
-		let s = render_composed_shell(&seeds, "rust claude", false);
+		let s = render_composed_shell(&seeds, "rust claude", false, &[]);
 		assert!(s.contains("builtins.readFile ./flake.lock"));
 		assert!(s.contains("import ./seeds/rust.nix { inherit pkgs; }"));
 		assert!(!s.contains("/src/"), "must not reference source paths");
 		assert!(s.contains("name = \"rust-claude\";"));
 
-		let s2 = render_composed_shell(&seeds, "rust claude", true);
+		let s2 = render_composed_shell(&seeds, "rust claude", true, &[]);
 		assert!(s2.contains("config = import ./nixpkgs-config.nix;"));
+	}
+
+	#[test]
+	fn render_composed_shell_bakes_in_adhoc_packages() {
+		// The ephemeral→permanent path: `-p` packages become a committed list in the
+		// registered env's own shell.nix, which `env add`/`remove` can then edit.
+		let seeds = vec![("rust".to_string(), PathBuf::from("/src/rust.nix"))];
+		let s = render_composed_shell(&seeds, "rust", false, &["tokei".to_string()]);
+		assert!(s.contains("packages = with pkgs; [ tokei ];"));
+		assert!(s.contains("import ./seeds/rust.nix { inherit pkgs; }"));
+
+		// A packages-only env (`new tools -p tokei`): no seeds, no imports.
+		let bare = render_composed_shell(&[], "", false, &["tokei".to_string()]);
+		assert!(bare.contains("packages = with pkgs; [ tokei ];"));
+		assert!(!bare.contains("import ./seeds/"));
 	}
 
 	#[test]

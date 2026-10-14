@@ -114,11 +114,66 @@ pub fn clean(args: Clean, context: &Context) -> Result<()> {
 		println!("clinix: no matching roots");
 	}
 
+	// Generated compose expressions outlive the roots they were written for — an
+	// ephemeral `-p` shell never roots one at all. Sweep the orphans here, after
+	// the releases above, so a root just released takes its compose file with it.
+	sweep_compose(cfg, args.dry_run)?;
+
 	if unresolved.is_empty() {
 		Ok(())
 	} else {
 		Err(ClinixError::UnknownEnv(unresolved.join(", ")))
 	}
+}
+
+/// Delete generated compose expressions in `state/compose/` that nothing uses: a
+/// `<key>.nix` is **orphaned** when no GC root for `<key>` remains — neither a
+/// version `roots/<key>@<seq>` nor a bare `roots/<key>` (the unversioned shape
+/// clinix wrote before root versioning; still a live indirect root, so it counts
+/// as in-use).
+///
+/// Two ways one becomes orphaned: the union's roots were just released (so the
+/// expression is dead with them), or it was never rooted in the first place — the
+/// ephemeral `-p` case, whose file is a pure cache. A registered env is unaffected:
+/// `state/envs/<name>/shell.nix` is its own file and is never written here.
+///
+/// Deleting one is always safe — the next entry of that composition rewrites it.
+/// Best-effort and silent when there is nothing to do; a read error is not worth
+/// failing a `clean` over.
+fn sweep_compose(cfg: &crate::env::config::Config, dry_run: bool) -> Result<()> {
+	let dir = registry::compose_dir(cfg);
+	let read = match std::fs::read_dir(&dir) {
+		Ok(r) => r,
+		Err(_) => return Ok(()), // no compose dir yet
+	};
+	let mut swept = 0usize;
+	for entry in read {
+		let Ok(entry) = entry else { continue };
+		let path = entry.path();
+		if path.extension().is_none_or(|e| e != "nix") {
+			continue;
+		}
+		let Some(key) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+			continue;
+		};
+		// Still rooted ⇒ still in use; leave it alone. Checked both ways: a
+		// versioned root, or a bare unversioned one.
+		let root_base = registry::roots_dir(cfg).join(&key);
+		let rooted = !registry::list_versions(&root_base)?.is_empty()
+			|| root_base.symlink_metadata().is_ok();
+		if rooted {
+			continue;
+		}
+		if dry_run {
+			println!("clinix: would sweep unused compose file `{key}.nix`");
+		} else if std::fs::remove_file(&path).is_ok() {
+			swept += 1;
+		}
+	}
+	if swept > 0 {
+		println!("clinix: swept {swept} unused compose file(s)");
+	}
+	Ok(())
 }
 
 /// Enumerate the bulk-selected base keys, filtered by kind (`--projects`/`--stacks`)

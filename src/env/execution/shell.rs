@@ -23,10 +23,14 @@ pub struct Shell {
 	/// Enter an **exact** root version by its id (as shown by `env roots <name>`).
 	#[arg(long = "root-version", conflicts_with = "prior")]
 	pub root_version: Option<u64>,
+	// Ad-hoc `-p`/`--pkg` packages are NOT declared here: they are one global flag
+	// in `crate::cli`, reaching this verb (and `run`/`new`, and the sugar) through
+	// `Context`. `launch` reads them from there.
 }
 impl RunCmd for Shell {
 	/// The launcher. Reached by `env shell`, the bare-name sugar, and the no-arg
-	/// cwd case. GC-roots the env's `shell.nix` and enters it interactively.
+	/// cwd case. GC-roots the env's `shell.nix` and enters it interactively —
+	/// except under `-p`, where the composition is ephemeral and entered unrooted.
 	fn run(self, context: &Context) -> Result<()> {
 		let version = super::version_select(self.prior, self.root_version);
 		launch(context, &self.names, self.pure, None, version)?;

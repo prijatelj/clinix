@@ -281,6 +281,7 @@ pub fn compose_expr(
 	imports: &[(PathBuf, bool)],
 	label: &str,
 	nixpkgs_config: Option<&Path>,
+	packages: &[String],
 ) -> String {
 	use crate::env::nix_expr;
 	let imports = imports
@@ -291,13 +292,15 @@ pub fn compose_expr(
 		})
 		.collect::<Vec<_>>()
 		.join("\n");
-	nix_expr::compose_shell(
-		&nix_expr::nix_str(lock),
-		&nix_expr::nixpkgs_config_frag(nixpkgs_config),
-		&label.replace(' ', "-"),
-		&imports,
+	nix_expr::ComposeSpec {
+		lock_ref: &nix_expr::nix_str(lock),
+		config_frag: &nix_expr::nixpkgs_config_frag(nixpkgs_config),
+		name: &label.replace(' ', "-"),
+		imports: &imports,
 		label,
-	)
+		packages,
+	}
+	.render()
 }
 
 #[cfg(test)]
@@ -406,7 +409,7 @@ mod tests {
 			(PathBuf::from("/s/rust.nix"), true),
 			(PathBuf::from("/proj/shell.nix"), false),
 		];
-		let expr = compose_expr(&lock, &imports, "rust proj", None);
+		let expr = compose_expr(&lock, &imports, "rust proj", None, &[]);
 		assert!(expr.contains("builtins.readFile \"/cfg/flake.lock\""));
 		assert!(expr.contains("import \"/s/rust.nix\" { inherit pkgs; }"));
 		assert!(
@@ -427,8 +430,12 @@ mod tests {
 
 		// A nixpkgs config file is applied to the nixpkgs import (allowUnfree etc.).
 		let cfg = PathBuf::from("/cfg/nixpkgs-config.nix");
-		let expr2 = compose_expr(&lock, &imports, "rust proj", Some(&cfg));
+		let expr2 = compose_expr(&lock, &imports, "rust proj", Some(&cfg), &[]);
 		assert!(expr2.contains("config = import \"/cfg/nixpkgs-config.nix\";"));
+
+		// Ad-hoc `-p` packages ride along in the composed shell's own list.
+		let expr3 = compose_expr(&lock, &imports, "rust proj", None, &["tokei".to_string()]);
+		assert!(expr3.contains("packages = with pkgs; [ tokei ];"));
 	}
 
 	#[test]

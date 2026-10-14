@@ -30,6 +30,7 @@ impl RunCmd for Run {
 	fn run(self, context: &Context) -> Result<()> {
 		let command = shell_join(&self.command);
 		let version = super::version_select(self.prior, self.root_version);
+		// `-p` arrives via `Context` (see `crate::cli`), so `launch` reads it there.
 		let status = launch(context, &self.names, false, Some(&command), version)?;
 		if status.success() {
 			Ok(())

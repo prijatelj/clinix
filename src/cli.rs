@@ -3,23 +3,31 @@
 //! ## Grammar:
 //! - top level commands: sys, env, info, config, completions, man
 //! - Verb-first: `clinix env <verb> [names…] [args]`.
-//! - Sugar (the common case): a bare name list `clinix <names…>` is captured by
-//!   clap's `external_subcommand` and routed to `env shell <names…>`. This form
-//!   is *terminal* — no verb may follow the names — which is why it is
-//!   unambiguous despite the variadic name list.
+//! - Sugar (the common case): a bare name list `clinix <names…>` is `env shell
+//!   <names…>`. It is **parsed by clap**, not hand-split: [`Shell`] is flattened
+//!   into both [`Cli`] and [`EnvArgs`] under
+//!   `args_conflicts_with_subcommands`, so a token list that matches no
+//!   subcommand is parsed as `Shell`'s own arguments. A name equal to a verb is
+//!   taken as that verb — write `env shell <name>` for such an env.
 //! 	- `clinix` with no args prints help — it does **not** enter the cwd
 //!			project, unlike `clinix env shell`. Use `clinix .` at top level.
 //!
-//! Global flags (`-o`, `-r`, `-v`) are declared once here and read by whichever
-//! command needs them, so the sugar form can still pass the common options that
-//! `external_subcommand` cannot itself parse.
+//! That flatten is why the sugar supports *every* `env shell` flag (`--pure`,
+//! `--prior`, …) rather than only the ones a hand-written splitter knew about: a
+//! flag is declared once, on `Shell`, and clap does the parsing at both levels.
+//!
+//! Global flags (`-o`, `-r`, `-v`, `-p`/`--pkg`) are declared once here. `-p` is
+//! global rather than per verb because the ad-hoc package set is part of the
+//! composition *request*, which every verb reads from [`Context`].
 
 use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::env::config::{Config, Overrides};
-use crate::env::{Context, EnvArgs, InfoVerb, RunCmd, Shell, ShellOptions, context_report};
+use crate::env::{
+	Context, EnvArgs, InfoVerb, Pkg, PkgArgs, RunCmd, Shell, ShellOptions, context_report,
+};
 use crate::error::Result;
 use crate::sys::SysArgs;
 
@@ -27,6 +35,9 @@ use crate::sys::SysArgs;
 #[derive(Parser, Debug)]
 #[command(name = "clinix", version, propagate_version = true)]
 #[command(about = "Manage Nix environments (env) and a NixOS system (sys).")]
+// Args XOR subcommands: a token list matching no subcommand is parsed as the
+// flattened `Shell` below — the bare-name sugar, without a hand-rolled splitter.
+#[command(args_conflicts_with_subcommands = true)]
 pub struct Cli {
 	/// Increase verbosity (repeatable: `-v`, `-vv`).
 	#[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
@@ -55,8 +66,30 @@ pub struct Cli {
 	#[arg(long = "state-dir", global = true, value_name = "DIR")]
 	pub state_dir: Option<PathBuf>,
 
+	/// Ad-hoc packages layered onto the composition, resolved from its own nixpkgs
+	/// pin — the `nix-shell -p` shape. **Greedy**: every remaining bare token is a
+	/// package, not an env. The resulting shell is ephemeral (entered unrooted);
+	/// keep it with `env new <name> --from <envs…> -p <pkgs…>`.
+	///
+	/// Declared here, once, and `global` so it reaches `env shell`/`run`/`new` and
+	/// can lead the bare-name sugar (`clinix -p tokei`). A trailing occurrence
+	/// (`clinix claude -p tokei`) lands in the sugar's raw token list instead and is
+	/// recovered by `Shell::from_sugar`; the two are merged.
+	#[arg(short = 'p', long = "pkgs", global = true, num_args = 1.., value_name = "PKG")]
+	pub pkgs: Vec<Pkg>,
+
+	/// One ad-hoc package; repeatable, and bare tokens after it are still envs —
+	/// `clinix claude --pkg tokei rust --pkg fastfetch python`.
+	#[arg(long = "pkg", global = true, value_name = "PKG")]
+	pub pkg: Vec<Pkg>,
+
 	#[command(subcommand)]
 	pub command: Option<Command>,
+
+	/// The bare-name sugar: `clinix <names…> [shell flags]` ≡ `clinix env shell
+	/// <names…>`. Parsed only when no subcommand matched.
+	#[command(flatten)]
+	pub shell: Shell,
 }
 
 #[derive(Subcommand, Debug)]
@@ -90,11 +123,6 @@ pub enum Command {
 	/// the man search path (a Nix-managed profile usually omits it), so the
 	/// recipes below pair the write with making it findable.
 	Man(ManArgs),
-
-	/// Bare name list → `env shell <names…>` (see module docs). The first token
-	/// is the "subcommand name" clap could not match, so it is folded back in.
-	#[command(external_subcommand)]
-	Shell(Vec<String>),
 }
 
 /// Where a generated completion script belongs, per shell. clinix only writes to
@@ -213,10 +241,18 @@ impl Cli {
 	/// (`None` = cwd project, `Shell(..)` = bare names) both resolve to
 	/// `env shell`, keeping a single launcher implementation.
 	pub fn dispatch(self) -> Result<()> {
+		// Validate the ad-hoc package specs once, here, so every consumer
+		// (`env shell`/`run`/`new`, the sugar) reports a bad spec identically.
+		let packages = PkgArgs {
+			pkgs: self.pkgs,
+			pkg: self.pkg,
+		}
+		.names()?;
 		let context = Context {
 			options: ShellOptions {
 				ordered: self.ordered,
 				runtime: self.runtime,
+				packages,
 			},
 			config: Config::resolve(&Overrides {
 				config_dir: self.config,
@@ -225,7 +261,19 @@ impl Cli {
 		};
 		match self.command {
 			Some(Command::Sys(args)) => crate::sys::dispatch(args),
-			Some(Command::Env(c)) => c.cmd.run(&context),
+			// `clinix env <verb> …`, or `clinix env <names…>` (the same sugar, one
+			// level down). Bare `clinix env` prints the env help rather than
+			// silently entering the cwd project.
+			Some(Command::Env(c)) => match c.cmd {
+				Some(cmd) => cmd.run(&context),
+				None if c.shell.names.is_empty() && context.options.packages.is_empty() => {
+					if let Some(env) = Cli::command().find_subcommand_mut("env") {
+						env.print_help()?;
+					}
+					Ok(())
+				}
+				None => c.shell.run(&context),
+			},
 			Some(Command::Info(a)) => context_report(a.verb, &context),
 			Some(Command::Config(a)) => match a.verb {
 				ConfigVerb::Example { full } => {
@@ -290,20 +338,15 @@ impl Cli {
 					}
 				}
 			}
-			Some(Command::Shell(names)) => Shell {
-				names,
-				pure: false,
-				prior: None,
-				root_version: None,
-			}
-			.run(&context),
 			// Bare `clinix` (or only global flags) → print help, rather than
 			// silently entering the cwd project. Enter the project explicitly with
 			// `clinix .` or `clinix env shell`.
-			None => {
+			None if self.shell.names.is_empty() && context.options.packages.is_empty() => {
 				Cli::command().print_help()?;
 				Ok(())
 			}
+			// The sugar: names and/or `-p` with no subcommand → the launcher.
+			None => self.shell.run(&context),
 		}
 	}
 }

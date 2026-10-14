@@ -67,32 +67,75 @@ pub fn lock_prelude(lock_ref: &str, config_frag: &str) -> String {
 /// env: unions the imported shells via `inputsFrom`, in composition order, and
 /// exports a human `name`. Follows a [`lock_prelude`] (it opens with `in`).
 /// `@NAME@` is the sanitized store name, `@IMPORTS@` the newline-joined
-/// `(import … { … })` lines, `@LABEL@` the un-sanitized human label.
+/// `(import … { … })` lines, `@LABEL@` the un-sanitized human label, and
+/// `@PACKAGES@` the optional ad-hoc `packages` line ([`packages_frag`] — empty for
+/// a plain composition, so its generated file is byte-identical to before `-p`).
 pub const MKSHELL_TAIL: &str = r##"in
 pkgs.mkShell {
   name = "@NAME@";
-  inputsFrom = [
+@PACKAGES@  inputsFrom = [
 @IMPORTS@
   ];
   shellHook = "export name=${pkgs.lib.escapeShellArg ''@LABEL@''}\n";
 }
 "##;
 
-/// Assemble the `mkShell` composition: [`lock_prelude`] + [`MKSHELL_TAIL`] with the
-/// name/imports/label filled. Shared by seed-stack compose and `new` compose (they
-/// differ only in `lock_ref`/`config_frag` and how each builds `imports`).
-pub fn compose_shell(
-	lock_ref: &str,
-	config_frag: &str,
-	name: &str,
-	imports: &str,
-	label: &str,
-) -> String {
-	let tail = MKSHELL_TAIL
-		.replace("@NAME@", name)
-		.replace("@IMPORTS@", imports)
-		.replace("@LABEL@", label);
-	format!("{}{tail}", lock_prelude(lock_ref, config_frag))
+/// The `  packages = with pkgs; [ … ];` line for ad-hoc `-p`/`--pkg` packages, or
+/// **empty** when there are none. Goes in `@PACKAGES@`.
+///
+/// Names are spliced as written, so a nixpkgs **attribute path**
+/// (`python313Packages.black`) works as well as a bare name — matching
+/// `nix-shell -p`, whose arguments are "interpreted as attribute names inside the
+/// Nix Packages collection". `with pkgs;` is what makes a bare name resolve.
+pub fn packages_frag(packages: &[String]) -> String {
+	if packages.is_empty() {
+		String::new()
+	} else {
+		format!("  packages = with pkgs; [ {} ];\n", packages.join(" "))
+	}
+}
+
+/// Everything the generated `mkShell` composition needs, as **named fields with
+/// defaults** rather than a positional parameter list.
+///
+/// This shape is deliberate: the two callers (the seed-stack compose and `new`'s
+/// materialized env) differ only in a couple of fields, and every past widening of
+/// this assembler rippled out to both of them plus their callers' callers. With a
+/// `Default` struct, a caller that does not care about a new field keeps compiling
+/// unchanged — the field is set by the one caller that needs it.
+///
+/// Fields are the already-rendered fragments, because the two callers build them
+/// differently: the seed stack uses quoted absolute paths ([`nix_str`]), while
+/// `new` writes bare relative literals (`./flake.lock`, `./seeds/x.nix`) so the
+/// materialized env stays portable.
+#[derive(Debug, Default, Clone)]
+pub struct ComposeSpec<'a> {
+	/// The lock reference placed after `readFile ` — a [`nix_str`] result or a bare
+	/// relative literal.
+	pub lock_ref: &'a str,
+	/// The nixpkgs `config` fragment ([`nixpkgs_config_frag`]), or `""` for none.
+	pub config_frag: &'a str,
+	/// The sanitized store name.
+	pub name: &'a str,
+	/// Newline-joined `(import … { … })` lines for `inputsFrom`.
+	pub imports: &'a str,
+	/// The un-sanitized human label, exported by the `shellHook`.
+	pub label: &'a str,
+	/// Ad-hoc package attribute names; empty ⇒ no `packages` line at all.
+	pub packages: &'a [String],
+}
+
+impl ComposeSpec<'_> {
+	/// Assemble the composition: [`lock_prelude`] + [`MKSHELL_TAIL`] with every slot
+	/// filled.
+	pub fn render(&self) -> String {
+		let tail = MKSHELL_TAIL
+			.replace("@NAME@", self.name)
+			.replace("@IMPORTS@", self.imports)
+			.replace("@LABEL@", self.label)
+			.replace("@PACKAGES@", &packages_frag(self.packages));
+		format!("{}{tail}", lock_prelude(self.lock_ref, self.config_frag))
+	}
 }
 
 #[cfg(test)]
@@ -135,7 +178,14 @@ mod tests {
 	#[test]
 	fn compose_shell_wires_prelude_and_mkshell_tail() {
 		let imports = "    (import ./seeds/rust.nix { inherit pkgs; })";
-		let s = compose_shell("./flake.lock", "", "rust-claude", imports, "rust claude");
+		let s = ComposeSpec {
+			lock_ref: "./flake.lock",
+			name: "rust-claude",
+			imports,
+			label: "rust claude",
+			..Default::default()
+		}
+		.render();
 		assert!(s.contains("builtins.readFile ./flake.lock"));
 		assert!(
 			s.contains("inputsFrom = [\n    (import ./seeds/rust.nix { inherit pkgs; })\n  ];")
@@ -145,5 +195,50 @@ mod tests {
 			s.contains("''rust claude''"),
 			"un-sanitized label in the shellHook"
 		);
+		// No `-p` packages → no `packages` line at all (byte-identical to pre-`-p`).
+		assert!(!s.contains("packages ="));
+	}
+
+	#[test]
+	fn packages_frag_is_empty_or_a_with_pkgs_list() {
+		assert_eq!(packages_frag(&[]), "");
+		assert_eq!(
+			packages_frag(&["tokei".to_string(), "fastfetch".to_string()]),
+			"  packages = with pkgs; [ tokei fastfetch ];\n"
+		);
+		// An attribute path is spliced as written (resolved by `with pkgs;`).
+		assert_eq!(
+			packages_frag(&["python313Packages.black".to_string()]),
+			"  packages = with pkgs; [ python313Packages.black ];\n"
+		);
+	}
+
+	#[test]
+	fn compose_shell_splices_adhoc_packages_before_inputs_from() {
+		let s = ComposeSpec {
+			lock_ref: "./flake.lock",
+			name: "claude",
+			imports: "    (import /s/claude.nix { inherit pkgs; })",
+			label: "claude",
+			packages: &["tokei".to_string()],
+			..Default::default()
+		}
+		.render();
+		assert!(s.contains("  packages = with pkgs; [ tokei ];\n  inputsFrom = ["));
+	}
+
+	#[test]
+	fn compose_shell_with_only_packages_has_an_empty_inputs_from() {
+		// The `nix-shell -p` case: no envs at all, just packages.
+		let s = ComposeSpec {
+			lock_ref: "\"/cfg/flake.lock\"",
+			name: "pkgs",
+			label: "pkgs",
+			packages: &["tokei".to_string()],
+			..Default::default()
+		}
+		.render();
+		assert!(s.contains("packages = with pkgs; [ tokei ];"));
+		assert!(s.contains("inputsFrom = [\n\n  ];"), "valid empty list");
 	}
 }

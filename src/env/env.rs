@@ -30,9 +30,9 @@ pub enum Kind {
 	Project,
 }
 
-/// Composition options read from the global flags (so the `external_subcommand`
-/// bare-name sugar can still set them). See [`crate::cli`].
-#[derive(Debug, Clone, Copy, Default)]
+/// Composition options read from the global flags, shared by every verb and by
+/// the bare-name sugar. See [`crate::cli`].
+#[derive(Debug, Clone, Default)]
 pub struct ShellOptions {
 	/// Preserve the given order instead of sorting names lexically.
 	pub ordered: bool,
@@ -41,6 +41,14 @@ pub struct ShellOptions {
 	/// (`compose.nix` — runtime ∪ dev shells) is deferred, so a project already
 	/// composes alone. Wire this up when that composition lands.
 	pub runtime: bool,
+	/// Ad-hoc `-p`/`--pkg` package attribute names, already validated once in
+	/// [`crate::cli`] (see [`crate::env::PkgArgs::names`]).
+	///
+	/// They live here, on the shared request context, rather than on each verb's
+	/// own args: the ad-hoc set is part of what a composition *is*, so
+	/// [`compose_nodes`] reads it directly instead of every caller threading it
+	/// through. Empty for every non-`-p` invocation.
+	pub packages: Vec<String>,
 }
 
 /// Shared execution context: the resolved [`Config`] (config/state roots) plus
@@ -196,6 +204,10 @@ pub(crate) struct Composition {
 	/// registry env's own lock, a file target's adjacent lock, or the seed pin for
 	/// a stack). `export docker` needs it to pin `dockerTools`.
 	pub lock: Option<PathBuf>,
+	/// True when ad-hoc `-p` packages made this composition **ephemeral**: it is
+	/// entered unrooted (like plain `nix-shell`), so `nix-collect-garbage` reclaims
+	/// it. Register it with `env new <name> --from <envs…> -p <pkgs…>` to keep it.
+	pub ephemeral: bool,
 }
 
 /// A directory-backed env's own `flake.lock`, if present.
@@ -219,14 +231,34 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 		eprintln!("clinix: {w}");
 	}
 
-	// Empty ⇒ the cwd project.
+	// Ad-hoc `-p` packages are part of the composition *request*, which `Context`
+	// already carries — so they are read here rather than threaded through every
+	// caller. A caller that composes without them simply never set them.
+	let packages: &[String] = &ctx.options.packages;
+	// They must be spliced into a generated `mkShell`, so they force the compose
+	// path below, including the 0-node and 1-node shapes that otherwise hand back
+	// an env's own `shell.nix` untouched.
+	let adhoc = !packages.is_empty();
+
+	// Empty ⇒ the cwd project. With `-p` and no names this is instead the bare
+	// `nix-shell -p` shape: no imports at all, pinned by whatever lock is active
+	// here — the cwd project's if there is one, else the seed pin — so
+	// `clinix -p tokei` works in any directory.
 	if names.is_empty() {
+		if adhoc {
+			let lock = match resolve(cfg, None).ok().as_ref().and_then(env_lock) {
+				Some(l) => l,
+				None => seed_lock(cfg, &settings)?,
+			};
+			return adhoc_composition(cfg, &settings, &[], &[], lock, packages);
+		}
 		let env = resolve(cfg, None)?;
 		return Ok(Composition {
 			shell_file: env_shell_file(&env.root)?,
 			label: env_label(&env),
 			root: registry::root_path(cfg, &env),
 			lock: env_lock(&env),
+			ephemeral: false,
 		});
 	}
 
@@ -236,28 +268,33 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 		.collect::<Result<_>>()?;
 
 	// A single self-contained node: an env's own shell, or an explicit `*.nix` file.
-	match nodes.as_slice() {
-		[Node::Env(env)] => {
-			return Ok(Composition {
-				shell_file: env_shell_file(&env.root)?,
-				label: env_label(env),
-				root: registry::root_path(cfg, env),
-				lock: env_lock(env),
-			});
+	// Skipped under `-p`, which needs a generated wrapper to carry the packages.
+	if !adhoc {
+		match nodes.as_slice() {
+			[Node::Env(env)] => {
+				return Ok(Composition {
+					shell_file: env_shell_file(&env.root)?,
+					label: env_label(env),
+					root: registry::root_path(cfg, env),
+					lock: env_lock(env),
+					ephemeral: false,
+				});
+			}
+			[Node::File { path }] => {
+				let lock = path
+					.parent()
+					.map(|d| d.join("flake.lock"))
+					.filter(|l| l.is_file());
+				return Ok(Composition {
+					shell_file: path.clone(),
+					label: file_label(path),
+					root: registry::file_root(cfg, path),
+					lock,
+					ephemeral: false,
+				});
+			}
+			_ => {}
 		}
-		[Node::File { path }] => {
-			let lock = path
-				.parent()
-				.map(|d| d.join("flake.lock"))
-				.filter(|l| l.is_file());
-			return Ok(Composition {
-				shell_file: path.clone(),
-				label: file_label(path),
-				root: registry::file_root(cfg, path),
-				lock,
-			});
-		}
-		_ => {}
 	}
 
 	// Otherwise a **union** of 2+ nodes. Seeds inject the shared `pkgs`;
@@ -293,16 +330,53 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 	if !ctx.options.ordered {
 		items.sort_by(|a, b| a.label.cmp(&b.label));
 	}
-	let label = items
-		.iter()
-		.map(|i| i.label.as_str())
-		.collect::<Vec<_>>()
-		.join(" ");
+	let labels: Vec<String> = items.iter().map(|i| i.label.clone()).collect();
 	let imports: Vec<(PathBuf, bool)> = items.iter().map(|i| (i.shell.clone(), i.inject)).collect();
+	adhoc_composition(cfg, &settings, &labels, &imports, lock, packages)
+}
 
-	let nixpkgs_config = nixpkgs_config_path(&settings)?;
-	let expr = crate::env::seeds::compose_expr(&lock, &imports, &label, nixpkgs_config.as_deref());
-	let key = stack_key(items.iter().map(|i| i.label.as_str()));
+/// Write a generated compose expression and describe it as a [`Composition`]. The
+/// single writer for every composed shape: a plain union (`packages` empty) and an
+/// ad-hoc `-p` layer (which may have **no** imports at all — the `nix-shell -p`
+/// case). Ad-hoc compositions are **ephemeral**: entered unrooted, so GC reclaims
+/// them.
+///
+/// The compose file's name carries a hash of the package set, so distinct `-p`
+/// invocations over the same envs do not overwrite each other's expression.
+fn adhoc_composition(
+	cfg: &Config,
+	settings: &crate::env::config::Settings,
+	labels: &[String],
+	imports: &[(PathBuf, bool)],
+	lock: PathBuf,
+	packages: &[String],
+) -> Result<Composition> {
+	let label = if labels.is_empty() {
+		packages.join(" ")
+	} else {
+		labels.join(" ")
+	};
+	let nixpkgs_config = nixpkgs_config_path(settings)?;
+	let expr = crate::env::seeds::compose_expr(
+		&lock,
+		imports,
+		&label,
+		nixpkgs_config.as_deref(),
+		packages,
+	);
+
+	// Key: the stack key, plus `-p<hash>` when ad-hoc so the two never collide.
+	let base = if labels.is_empty() {
+		"stack".to_string()
+	} else {
+		stack_key(labels.iter().map(String::as_str))
+	};
+	let key = if packages.is_empty() {
+		base
+	} else {
+		format!("{base}-p{:08x}", package_hash(packages))
+	};
+
 	let compose_dir = registry::compose_dir(cfg);
 	std::fs::create_dir_all(&compose_dir)?;
 	let compose_file = compose_dir.join(format!("{key}.nix"));
@@ -312,7 +386,27 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 		label,
 		root: registry::roots_dir(cfg).join(&key),
 		lock: Some(lock),
+		ephemeral: !packages.is_empty(),
 	})
+}
+
+/// A stable 32-bit FNV-1a hash of the package set, order-independent (the set is
+/// sorted first) — the compose-file name's `-p<hash>` suffix. Hand-rolled rather
+/// than `DefaultHasher` so the same `-p` set always names the same file, across
+/// toolchain versions.
+fn package_hash(packages: &[String]) -> u32 {
+	let mut sorted: Vec<&str> = packages.iter().map(String::as_str).collect();
+	sorted.sort_unstable();
+	let mut hash: u32 = 0x811c_9dc5;
+	for name in sorted {
+		for b in name.as_bytes() {
+			hash ^= u32::from(*b);
+			hash = hash.wrapping_mul(0x0100_0193);
+		}
+		hash ^= u32::from(b'\0');
+		hash = hash.wrapping_mul(0x0100_0193);
+	}
+	hash
 }
 
 /// One node's contribution to a union: the shell file to import, whether to inject
@@ -379,6 +473,10 @@ pub(crate) fn launch(
 ) -> Result<ExitStatus> {
 	let comp = compose_nodes(ctx, names)?;
 	let drv = match version {
+		// An ad-hoc `-p` composition is ephemeral by design: evaluate and enter it
+		// unrooted, exactly as plain `nix-shell -p` does, so it mints no version and
+		// `nix-collect-garbage` reclaims it once the shell exits.
+		_ if comp.ephemeral => crate::nix::instantiate(&comp.shell_file)?,
 		// Current: mint a new version iff the derivation changed, else reuse.
 		registry::VersionSelect::Current => mint_current(ctx, &comp)?,
 		// A prior/exact version: enter its stored `.drv` directly — no eval, no mint,
@@ -733,13 +831,6 @@ pub enum Cmd {
 	/// List GC-root versions — one env's (`roots <name>`) or, with no name, a grouped
 	/// listing of every root family (`--size` for disk, `--json` for machine output).
 	Roots(diagnostics::Roots),
-
-	/// Bare name list under `env` → `shell <names…>` (parity with the top-level
-	/// `clinix <names…>` sugar), so `clinix env rust claude` composes those envs.
-	/// The unmatched first token is folded back in. A name equal to a verb above
-	/// is taken as that verb — use `env shell <name>` to enter such an env.
-	#[command(external_subcommand)]
-	Compose(Vec<String>),
 }
 impl RunCmd for Cmd {
 	/// Pure dispatch. Verbs with a dedicated struct delegate to their own
@@ -775,16 +866,6 @@ impl RunCmd for Cmd {
 			Check(a) => diagnostics::check(a, context),
 			Roots(a) => diagnostics::roots(a, context),
 			Clean(a) => clean::clean(a, context),
-
-			// Bare-name sugar → the launcher (interactive shell). Fully qualified
-			// because `use Cmd::*` shadows the `Shell` struct with the `Shell` variant.
-			Compose(names) => super::execution::Shell {
-				names,
-				pure: false,
-				prior: None,
-				root_version: None,
-			}
-			.run(context),
 		}
 	}
 }
@@ -802,9 +883,16 @@ Command groups:
   management   init new rename add remove flake update outdated verify import export clean
   execution    shell run
   diagnostics  list info deps shared check roots")]
+// Args XOR subcommands, so `clinix env rust claude` parses as the flattened
+// `Shell` below — the same clap-native sugar the top level uses (`crate::cli`).
+#[command(args_conflicts_with_subcommands = true)]
 pub struct EnvArgs {
 	#[command(subcommand)]
-	pub cmd: Cmd,
+	pub cmd: Option<Cmd>,
+	/// `clinix env <names…>` ≡ `clinix env shell <names…>`. Parsed only when no
+	/// verb matched.
+	#[command(flatten)]
+	pub shell: Shell,
 }
 
 /// Rename a registered env (registry relabel). Kept here in the shared file

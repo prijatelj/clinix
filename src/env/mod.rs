@@ -41,4 +41,4 @@ pub use export::{Export, ExportTarget};
 pub use import::Import;
 pub use init::Init;
 pub use new::New;
-pub use pkgs::{Flake, Pkg, Pkgs, Update};
+pub use pkgs::{Flake, Pkg, PkgArgs, Pkgs, Update};

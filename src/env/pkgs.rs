@@ -38,6 +38,59 @@ impl std::str::FromStr for Pkg {
 	}
 }
 
+/// Ad-hoc packages layered onto a composition — the `nix-shell -p` shape, shared
+/// by `shell`, `run`, and `new`'s compose mode.
+///
+/// Two spellings, because the name list they sit beside is variadic:
+/// - **`-p` / `--pkgs`** is greedy — every remaining bare token is a package, not
+///   an env. The terminal form: `clinix env shell rust -p tokei fastfetch`.
+/// - **`--pkg`** takes exactly one value, so bare tokens after it are envs again.
+///   The interleaving form: `clinix claude --pkg tokei rust --pkg fastfetch python`.
+#[derive(Args, Debug, Default, Clone)]
+pub struct PkgArgs {
+	/// Ad-hoc packages (greedy — every remaining bare token is a package, not an
+	/// env). Resolved from the composition's own nixpkgs pin.
+	#[arg(short = 'p', long = "pkgs", num_args = 1.., value_name = "PKG")]
+	pub pkgs: Vec<Pkg>,
+	/// One ad-hoc package; repeatable, and bare tokens after it are still envs.
+	#[arg(long = "pkg", value_name = "PKG")]
+	pub pkg: Vec<Pkg>,
+}
+
+impl PkgArgs {
+	/// Whether any ad-hoc package was requested (what makes a composition
+	/// ephemeral, and forces the generated-compose path).
+	pub fn is_empty(&self) -> bool {
+		self.pkgs.is_empty() && self.pkg.is_empty()
+	}
+
+	/// The requested attribute names, `--pkgs` first then `--pkg`, each in given
+	/// order.
+	///
+	/// A **versioned** spec is rejected: `nix-shell -p` interprets its arguments
+	/// "as attribute names inside the Nix Packages collection" and has no
+	/// `name=version` syntax, so clinix does not invent one. Pick the versioned
+	/// attribute (`nodejs_20`), or pin declaratively — `env add` + the env's
+	/// `flake.lock` is the place versions belong.
+	pub fn names(&self) -> Result<Vec<String>> {
+		let all = || self.pkgs.iter().chain(self.pkg.iter());
+		let versioned: Vec<&str> = all()
+			.filter(|p| p.version.is_some())
+			.map(|p| p.name.as_str())
+			.collect();
+		if !versioned.is_empty() {
+			return Err(ClinixError::Resolve(format!(
+				"ad-hoc packages take an attribute name, not a version ({}). \
+				 `nix-shell -p` has no `name=version` form either — use the versioned \
+				 attribute (e.g. `nodejs_20`), or pin it declaratively with \
+				 `clinix env add <env> <pkg>` against the env's flake.lock",
+				versioned.join(", ")
+			)));
+		}
+		Ok(all().map(|p| p.name.clone()).collect())
+	}
+}
+
 /// A set of packages for a target environment (shared by `add`/`remove`).
 #[derive(Args, Debug)]
 pub struct Pkgs {
