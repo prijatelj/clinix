@@ -73,14 +73,22 @@ Three things worth knowing immediately:
 
 ```sh
 clinix config path                      # which config.toml clinix reads
-clinix config state                     # where envs, GC roots, compose files, the seed pin live
+clinix config state                     # where envs, GC roots, compose files, and the pins live
 clinix config example --full > ~/.config/clinix/config.toml
 ```
 
-`config.toml` mirrors the command tree (`[env]`, `[env.seeds]`, `[env.gc]`). A
-root-level `use = ["other.toml"]` merge-imports other config files: imports are
-the base, the importing file overrides them, later `use` entries win over
-earlier, list fields concatenate with the local file first, and cycles error.
+`config.toml` mirrors the command tree (`[env]`, `[env.pins]`, `[env.seeds]`,
+`[env.gc]`). A root-level `use = ["other.toml"]` merge-imports other config files:
+imports are the base, the importing file overrides them, later `use` entries win
+over earlier, list fields concatenate with the local file first, maps (`[env.pins]`)
+merge per key with the local file winning, and cycles error.
+
+**Paths in `config.toml`.** `~` expands; an absolute path is used as given; a
+**relative** path resolves against the directory that setting's default lives in —
+the **config** dir for `locks`, `flake_lock`, and `nixpkgs_config`, the **state**
+dir for `registry`. Never the shell's cwd, so one config means the same thing
+wherever clinix runs, and a config directory moved with `--config` /
+`$CLINIX_CONFIG_DIR` keeps working without rewriting a path.
 
 ---
 
@@ -99,11 +107,12 @@ which you are holding explains every behavioural difference that follows.
                     ┌──────────────────────────────────────────────┐
    seed             │ a *.nix FRAGMENT in your seed sources        │
                     │   `{ pkgs }: pkgs.mkShell { … }`             │
+                    │   (or `{ pkgs, pins }:` for alternate pins)  │
                     │   read in place; named by basename           │
                     │   NOT self-contained: clinix supplies pkgs   │
                     └──────────────────────────────────────────────┘
                     ┌──────────────────────────────────────────────┐
-   registry env     │ state/envs/<name>/ — a NAMED, reusable env   │
+   registry env     │ <registry>/<name>/ — a NAMED, reusable env   │
    (Kind::Registry) │   shell.nix + flake.lock (its own pin)       │
                     │   may hold `namespace:member` subshells      │
                     │   self-contained: reads its OWN lock         │
@@ -115,7 +124,8 @@ which you are holding explains every behavioural difference that follows.
 1. an explicit `*.nix` **file** — checked first, so `./dev.nix` runs the file;
 2. a **directory-backed env** — `.`/empty = the cwd project, a `/`-bearing or
    existing path = a project there, `namespace:member` = a registry subshell, a
-   bare name = `state/envs/<name>` if it exists;
+   bare name = `<registry>/<name>` if it exists (`<registry>` defaults to
+   `state/envs`; see §12);
 3. a **seed** from the catalog — `namespace:name`, or a bare name.
 
 A registry env therefore **shadows a same-named seed**. `clinix env new` and
@@ -224,6 +234,10 @@ without baking them into any of them.
 nixpkgs = "nixos-26.05"                              # a git REF clinix locks (never a channel)
 # nixpkgs = { flake_lock = "~/nixos/flake.lock" }    # or: an existing lock is authoritative
 # nixpkgs_config = "~/.config/nixpkgs/config.nix"    # allowUnfree/CUDA for seed builds
+# locks = "locks"                                    # where clinix keeps its locks (default <config>/locks)
+
+[env.pins]                                           # optional: alternate pins a seed can ask for (below)
+# unstable = { flake_lock = "locks/unstable.lock" }
 
 [env.seeds]
 sources = [
@@ -273,30 +287,108 @@ clinix ~/one-off/my-python.nix   # the exact-path selector (always works)
 
 Seeds compose by **union**: clinix writes a compose expression to
 `state/compose/stack-<labels>.nix` that imports the pinned nixpkgs once and joins
-each fragment via `mkShell`'s `inputsFrom`. **One pin per composed stack** — so no
-two packages in a stack can disagree about a shared library's ABI.
+each fragment via `mkShell`'s `inputsFrom`. **One pin per composed stack** — every
+fragment receives the same `pkgs`, so no two packages built from it can disagree
+about a shared library's ABI. The one sanctioned exception is a seed that asks
+for an *alternate* pin by name; see below.
 
 ### The seed pin
 
 Seeds have no lock of their own; clinix supplies one:
 
 - `[env].nixpkgs = "<ref>"` — clinix resolves and locks it into
-  `<config>/flake.lock` on first use (network, once). Committable; it is your pin.
+  `<locks>/default.lock` on first use (network, once). Committable; it is your pin.
 - `[env].nixpkgs = { flake_lock = "<path>" }` — that file is authoritative and
   clinix never writes it. This is how one lock governs your system *and* your
   seeds.
 
+**A ref is only used to *create* a lock.** Once the file exists clinix returns it
+untouched and never re-resolves it, so the declared ref and the lock can drift
+apart. clinix checks, and warns when they disagree — the lock still wins:
+
+```
+clinix: warning: [env.pins].unstable declares nixpkgs ref `nixos-25.05`, but
+  ~/.config/clinix/locks/unstable.lock already tracks `nixos-unstable` — the
+  existing lock wins (clinix never rewrites one). Fix the declaration, or delete
+  the lock to rebuild it from the ref.
+```
+
+Prefer the `{ flake_lock = … }` form for a lock that already exists: it states the
+file that is actually used and cannot disagree with it. The ref form earns its
+place when you want clinix to create the lock — and deleting the lock is then how
+you re-resolve it to the branch's latest rev.
+
+**Legacy location.** The stack pin used to be locked at `<config>/flake.lock`. If
+that file exists and `<locks>/default.lock` does not, clinix uses it and prints a
+one-line note asking you to `mv` it; it is never silently re-locked to a newer rev.
+
 Unfree packages (e.g. `claude-code`) need a nixpkgs `config`. Set
 `[env].nixpkgs_config` to a file evaluating to a config attrset; when unset,
 clinix passes no explicit config, so nixpkgs falls back to its own default
-(`~/.config/nixpkgs/config.nix`).
+(`~/.config/nixpkgs/config.nix`). The same config is applied to every alternate
+pin, so unfree policy is declared once.
+
+### Alternate pins: one package from a different nixpkgs
+
+Sometimes one tool must be newer than the pin everything else shares — a release
+branch that has frozen a fast-moving package, say. Moving the stack's pin would
+move *every* package; a registry env with its own lock would do the same to every
+seed unioned with it (§6). The narrow tool is a **named alternate pin** that a
+seed opts into:
+
+```toml
+[env.pins]
+unstable = { flake_lock = "locks/unstable.lock" }   # relative → <config>/locks/unstable.lock
+# unstable = "nixos-unstable"                       # or: clinix locks it there on first use
+```
+
+```nix
+# ~/.config/clinix/seeds/claude-latest.nix
+{ pkgs, pins }:
+pkgs.mkShell {
+  name = "claude-latest";
+  packages = [ pins.unstable.claude-code ];   # this one package from unstable
+}
+```
+
+How it composes:
+
+- **Opt-in is the argument pattern.** clinix reads each seed's formals; a seed
+  naming `pins` (or ending in `...`) is passed `{ inherit pkgs pins; }`, every
+  other seed exactly `{ inherit pkgs; }` as before. Nix attrset patterns are
+  strict, so this is what keeps existing `{ pkgs }:` seeds working untouched.
+- **The stack's pin does not move.** `pkgs` — and `pkgs.mkShell` itself, and
+  every other seed in the union — still comes from the stack's pin. Only what the
+  fragment explicitly takes from `pins.<name>` diverges.
+- **Unused pins cost nothing.** `pins` is a lazy attrset, so a declared pin no
+  seed reads is never fetched or evaluated.
+- A seed asking for `pins` when `[env.pins]` declares none gets a warning, and
+  the composition then fails to evaluate.
+
+The worked case this exists for — current Claude Code without moving anything
+else. `nixos-26.05` had frozen `claude-code` at 2.1.223 at both its pinned rev and
+its branch head, so advancing the stack pin could not help; `nixos-unstable` had
+2.1.296:
+
+```sh
+clinix claude-latest                 # claude-code from unstable; nothing else involved
+clinix claude-latest rust base       # rust/base from the stack pin, claude from unstable
+clinix claude-latest .               # the project's own lock, plus claude from unstable
+clinix claude                        # the ordinary seed — unchanged
+```
+
+**Advancing an alternate pin is manual today** — `update`/`outdated`/`verify` act
+on an env's `flake.lock`, and a bare lock under `<locks>/` is not an env. Either
+declare the pin as a ref and delete the lock to re-resolve it, or edit it by hand.
 
 ---
 
 ## 5. Registry envs — named, reusable, and promoting a project
 
-A registry env lives at `state/envs/<name>` and is entered by name from
-anywhere. `clinix env new` creates one, in **two modes** chosen by what `--from`
+A registry env lives at `<registry>/<name>` (default `state/envs/<name>`;
+relocate the whole registry with `[env].registry`) and is entered by name from
+anywhere. The directory appears on first `env new` — before then the state dir
+holds only `compose/` and `roots/`. `clinix env new` creates one, in **two modes** chosen by what `--from`
 names.
 
 ### Mode A — compose seeds into a frozen env
@@ -314,6 +406,24 @@ does not change it. Refresh by re-running `new --from`.
 
 Contrast with `clinix rust claude python`, which reads the fragments **live** —
 Nix re-evaluates on every entry, so a seed edit takes effect immediately.
+
+**Alternate pins are materialised too.** A copied `{ pkgs, pins }:` fragment keeps
+its argument contract, so the env carries the locks it reads in
+`state/envs/<name>/locks/<pin>.lock`, referenced by bare relative path — the env
+still evaluates after being copied anywhere. Only the pins the fragments actually
+index are copied:
+
+- clinix reads the `pins.<name>` selections off each fragment's syntax;
+- a use it cannot resolve statically (`with pins;`, `pins.${x}`, `let p = pins;`,
+  handing `pins` to a function) falls back to copying **every** declared pin, with a
+  note — over-copying a few hundred bytes beats an env that cannot evaluate;
+- a fragment naming a pin `[env.pins]` does not declare is an **error**, raised
+  before anything is written, so a failed `new` leaves nothing behind;
+- each lock is copied byte-for-byte, unused inputs included.
+
+The env's *own* pin stays `flake.lock`: `shell.nix` + `flake.lock` is the pair
+`nix-shell`, `nix develop`, and `env update` read by name, and `locks/` holds only
+alternates.
 
 ### Mode B — register an existing shell (promoting a project)
 
@@ -468,6 +578,12 @@ clinix: not yet implemented: composing envs with differing flake.locks
   only a shared flake.lock is supported at this time — every env in a union must share one pin
 ```
 
+A seed's **alternate pin is not part of this check** (§4). It never governs
+`pkgs`, so `clinix claude-latest .` composes under the project's lock with only
+`claude-code` taken from the alternate — exactly what a registry env carrying an
+unstable `flake.lock` could not do, since its lock would become the whole union's
+pin.
+
 A corollary: a **`--shell-only` project cannot join a union at all** — the
 shared-pin check needs a `flake.lock` file to compare, and a shell-only env's
 lock is embedded in its `shell.nix`. Such an env enters fine on its own
@@ -507,7 +623,8 @@ one construct: the `packages` list. Anything else is a normal file you own:
 
 - `shellHook`, environment variables, `VIRTUAL_ENV` wiring
 - `buildInputs` / `nativeBuildInputs` distinctions, `inputsFrom`
-- overlays, `overrideAttrs`, a package from a second nixpkgs input
+- overlays, `overrideAttrs`, a package from a second nixpkgs input (for a
+  **seed**, prefer `[env.pins]` — §4 — which keeps the lock reader written once)
 - any non-`mkShell` shape
 
 Versioned specs (`clinix env add work nodejs=20.11`) are **rejected**, not
@@ -798,8 +915,9 @@ Every one of these **errors clearly** rather than degrading silently:
 | `env new <ns>:<member> --from <seeds…>` | register a single shell into a member instead |
 | `env new --from <dir-or-file> -p <pkgs…>` (register mode) | register mode wraps the source shell, so there is no `packages` list to splice into; `env add` after registering |
 | `sys init` / `sys switch` / `sys rollback` | use `nixos-rebuild --file` |
-| self-contained **seeds** (a seed bringing its own pin) and flake seeds | deferred together |
+| a seed whose **whole** `pkgs` comes from its own pin, and flake seeds | deferred; for one package from another nixpkgs, use `[env.pins]` (§4) |
 | per-input `update`, per-input `freeze` | whole-env today; `flake rm` + `add` is the workaround |
+| `update` / `outdated` / `verify` on an `[env.pins]` lock | no CLI target for a bare lock yet; declare it as a ref and delete the lock, or edit it (§4) |
 
 Two that do **not** error — they silently do less than the syntax suggests:
 
@@ -807,6 +925,9 @@ Two that do **not** error — they silently do less than the syntax suggests:
 |---|---|
 | `--pkg` layering by position | parses correctly, but the package lands in the composed shell's own `packages` list rather than at its slot between the envs (§6) |
 | `env roots` on a legacy unversioned root | lists the key as `(0 versions)`; `clean` handles it correctly (§8) |
+| `env new --from <file.nix>` (register mode) on a `{ pkgs, pins }:` file | registers, but the wrapper passes only `pkgs`, so entering it fails to evaluate. Compose mode (`--from <seed>`) handles pins (§5) |
+| `env flake <env> wrap-shell` on a `{ pkgs, pins }:` shell | classified `conventional` and passed only `pkgs`; the flake fails to evaluate |
+| `env list` / `env info` and alternate pins | declared and materialised pins are not reported |
 
 ---
 
@@ -815,8 +936,10 @@ Two that do **not** error — they silently do less than the syntax suggests:
 | path | what |
 |---|---|
 | `~/.config/clinix/config.toml` | the config (`clinix config path`) |
-| `~/.config/clinix/flake.lock` | the seed nixpkgs pin — generated, committable, unless `[env].nixpkgs.flake_lock` points elsewhere |
-| `~/.local/state/clinix/envs/<name>/` | registry envs (`shell.nix`, `flake.lock`, `seeds/`, members) |
+| `<locks>/default.lock` | the stack (seed) nixpkgs pin — generated from a ref, committable, unless `[env].nixpkgs.flake_lock` points elsewhere. `<locks>` = `[env].locks`, default `~/.config/clinix/locks` |
+| `<locks>/<name>.lock` | an `[env.pins]` alternate pin created from a ref (or wherever its `flake_lock` points) |
+| `~/.config/clinix/flake.lock` | **legacy** stack-pin location, adopted with a note if `<locks>/default.lock` is absent |
+| `<registry>/<name>/` | registry envs (`shell.nix`, `flake.lock`, `seeds/`, `locks/`, members). `<registry>` = `[env].registry`, default `~/.local/state/clinix/envs` |
 | `~/.local/state/clinix/roots/` | GC roots: `<key>@<seq>` + `<key>@<seq>.rt` |
 | `~/.local/state/clinix/compose/` | generated seed-stack compose expressions |
 | your seed sources | seeds, read in place (`[env.seeds].sources`) |

@@ -325,9 +325,15 @@ impl Cli {
 						"  compose: {}   generated seed-stack compose files",
 						registry::compose_dir(cfg).display()
 					);
+					// Best-effort, like the context above: a broken config.toml must not
+					// stop this report, so fall back to the defaults it would imply.
+					let settings =
+						crate::env::config::Settings::load(&cfg.config_dir).unwrap_or_default();
+					let (pin, how) = crate::env::seed_lock_location(cfg, &settings);
+					println!("pin lock: {}   seed nixpkgs pin ({how})", pin.display());
 					println!(
-						"pin lock: {}   seed nixpkgs pin (generated; lives in config)",
-						cfg.config_dir.join("flake.lock").display()
+						"  locks:   {}   [env.pins] alternates created from a ref",
+						settings.env.locks_dir(&cfg.config_dir).display()
 					);
 					Ok(())
 				}

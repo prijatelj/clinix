@@ -33,6 +33,7 @@ pub mod seeds;
 mod wrap_shell;
 
 pub(crate) use compose::{compose_nodes, launch, node_root, resolve_stack_key};
+pub(crate) use env::seed_lock_location;
 pub use diagnostics::{Deps, Info, InfoVerb, context_report};
 pub use env::{
 	Cmd, Context, Env, EnvArgs, Kind, OptionalTarget, Rename, RunCmd, ShellOptions, Target,

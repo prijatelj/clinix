@@ -370,9 +370,8 @@ pub(crate) fn pin_lock(
 			// Adopt that file rather than locking a second copy at the new path — the
 			// pin is the user's committed artifact, so it must not be silently
 			// orphaned (or re-resolved to a newer rev behind their back).
-			if name.is_none() && !lazy_path.is_file() {
-				let legacy = cfg.config_dir.join("flake.lock");
-				if legacy.is_file() {
+			if name.is_none() {
+				if let Some(legacy) = legacy_stack_lock(cfg, &lazy_path) {
 					eprintln!(
 						"clinix: note: using the legacy stack pin at {} — clinix now keeps it at \
 						 {}; `mv` it there to silence this.",
@@ -386,6 +385,42 @@ pub(crate) fn pin_lock(
 			ensure_lock(r, &lazy_path, &label)
 		}
 	}
+}
+
+/// The legacy `<config>/flake.lock` stack pin, **iff** it is the only stack pin on
+/// disk — present while `<locks>/default.lock` (`lazy`) is not. The one statement of
+/// that rule, shared by [`pin_lock`] (which adopts it) and [`seed_lock_location`]
+/// (which reports it).
+fn legacy_stack_lock(cfg: &Config, lazy: &Path) -> Option<PathBuf> {
+	let legacy = cfg.config_dir.join("flake.lock");
+	(!lazy.is_file() && legacy.is_file()).then_some(legacy)
+}
+
+/// Where the stack (seed) pin lives, and how it got there — **without** creating
+/// it. A read-only counterpart to [`seed_lock`] for reporting (`clinix config
+/// state`): `seed_lock` may lock a ref over the network on first use, which a
+/// diagnostic must never do. Resolution order matches `seed_lock` exactly.
+pub(crate) fn seed_lock_location(
+	cfg: &Config,
+	settings: &crate::env::config::Settings,
+) -> (PathBuf, &'static str) {
+	use crate::env::config::{NixpkgsPin, resolve_path};
+	if let Some(NixpkgsPin::FlakeLock { flake_lock }) = &settings.env.nixpkgs {
+		return (
+			resolve_path(flake_lock, &cfg.config_dir),
+			"[env].nixpkgs.flake_lock — yours; clinix never writes it",
+		);
+	}
+	let lazy = settings.env.pin_lock_path(&cfg.config_dir, None);
+	if let Some(legacy) = legacy_stack_lock(cfg, &lazy) {
+		return (legacy, "legacy location — `mv` it to <locks>/default.lock");
+	}
+	let how = if lazy.is_file() {
+		"locked from the [env].nixpkgs ref"
+	} else {
+		"not created yet — locked from the [env].nixpkgs ref on first use"
+	};
+	(lazy, how)
 }
 
 /// Every declared `[env.pins]` entry resolved to its lockfile, in config order.
