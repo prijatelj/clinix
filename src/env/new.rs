@@ -134,7 +134,7 @@ impl New {
 			}
 		}
 		std::fs::copy(&lock, dest.join("flake.lock"))?;
-		let with_config = match super::env::nixpkgs_config_path(&settings)? {
+		let with_config = match super::env::nixpkgs_config_path(cfg, &settings)? {
 			Some(src) => {
 				std::fs::copy(&src, dest.join("nixpkgs-config.nix"))?;
 				true

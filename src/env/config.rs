@@ -43,13 +43,27 @@ pub struct Config {
 	pub config_dir: PathBuf,
 	/// `$XDG_STATE_HOME/clinix` — machine-generated, disposable state.
 	pub state_dir: PathBuf,
+	/// Where registry envs live — `<state_dir>/envs` by default, relocated by
+	/// `[env].registry` ([`EnvSettings::registry_dir`]).
+	///
+	/// Resolved **once** into the carried config ([`Self::with_settings`]) rather
+	/// than looked up per call, so [`crate::env::registry::envs_dir`] stays a pure
+	/// field read and none of its callers need the settings.
+	pub registry_dir: PathBuf,
 }
 
 impl Config {
-	/// Resolve both roots by the precedence chain. Infallible: it only inspects
-	/// env vars and joins paths (no I/O), so it never fails — directories are
-	/// created lazily by the verbs that write into them.
+	/// Resolve the roots by the precedence chain. Infallible: it only inspects env
+	/// vars and joins paths (no I/O), so it never fails — directories are created
+	/// lazily by the verbs that write into them. [`Self::registry_dir`] gets its
+	/// default here; apply [`Self::with_settings`] to honour `[env].registry`.
 	pub fn resolve(overrides: &Overrides) -> Self {
+		let state_dir = resolve_root(
+			overrides.state_dir.clone(),
+			"CLINIX_STATE_DIR",
+			"XDG_STATE_HOME",
+			".local/state",
+		);
 		Config {
 			config_dir: resolve_root(
 				overrides.config_dir.clone(),
@@ -57,13 +71,29 @@ impl Config {
 				"XDG_CONFIG_HOME",
 				".config",
 			),
-			state_dir: resolve_root(
-				overrides.state_dir.clone(),
-				"CLINIX_STATE_DIR",
-				"XDG_STATE_HOME",
-				".local/state",
-			),
+			registry_dir: state_dir.join("envs"),
+			state_dir,
 		}
+	}
+
+	/// A config rooted at the two given directories, with every **derived** root at
+	/// its default. Keeps callers that know both roots outright (and tests) from
+	/// spelling out fields they do not care about — adding a derived root later
+	/// then costs them nothing.
+	pub fn at(config_dir: PathBuf, state_dir: PathBuf) -> Self {
+		Config {
+			config_dir,
+			registry_dir: state_dir.join("envs"),
+			state_dir,
+		}
+	}
+
+	/// Apply the settings that can relocate a root. Separate from [`Self::resolve`]
+	/// because the settings are read *from* `config_dir`, so the roots must be
+	/// resolved first — flag/env precedence over the file is preserved by that order.
+	pub fn with_settings(mut self, settings: &Settings) -> Self {
+		self.registry_dir = settings.env.registry_dir(&self.state_dir);
+		self
 	}
 }
 
@@ -127,7 +157,8 @@ pub struct ClinixMeta {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct EnvSettings {
-	/// Override the registry (env store) location; default = `<state>/envs`.
+	/// `[env].registry` — relocate the registry (env store); default `<state>/envs`.
+	/// See [`Self::registry_dir`], folded into [`Config::registry_dir`] once.
 	pub registry: Option<PathBuf>,
 	/// The nixpkgs pin fragments build against (a ref clinix locks, or a lockfile).
 	pub nixpkgs: Option<NixpkgsPin>,
@@ -135,6 +166,10 @@ pub struct EnvSettings {
 	/// predicate), applied when building seeds. If unset, clinix passes no explicit
 	/// config, so nixpkgs uses its default (`~/.config/nixpkgs/config.nix`).
 	pub nixpkgs_config: Option<PathBuf>,
+	/// `[env].locks` — the directory every lockfile clinix owns lives in, as
+	/// `<locks>/<name>.lock` (the stack pin is `default`). Default `<config>/locks`.
+	/// See [`Self::locks_dir`] and [`Self::pin_lock_path`].
+	pub locks: Option<PathBuf>,
 	/// `[env.pins]` — **named alternate nixpkgs pins**, each the same shape as
 	/// [`Self::nixpkgs`] (a ref clinix locks, or an existing lockfile).
 	///
@@ -150,6 +185,46 @@ pub struct EnvSettings {
 }
 
 impl EnvSettings {
+	/// Where clinix's own lockfiles live: `[env].locks` ([`resolve_path`]) if set,
+	/// else `<config_dir>/locks`.
+	///
+	/// A method on the settings rather than a constant, so the layout is stated once
+	/// and every caller agrees. Pure — no I/O, so unit-testable.
+	pub fn locks_dir(&self, config_dir: &Path) -> PathBuf {
+		match &self.locks {
+			Some(p) => resolve_path(p, config_dir),
+			None => config_dir.join("locks"),
+		}
+	}
+
+	/// The lockfile a pin's **ref** form is lazily locked into:
+	/// `<locks>/<name>.lock`, with the **stack** pin ([`Self::nixpkgs`]) named
+	/// `default`.
+	///
+	/// The stack pin is just the pin every seed gets when it asks for none, so it
+	/// lives beside the named ones instead of at its own `<config>/flake.lock` —
+	/// one directory holds every lock clinix owns, and `<locks>` relocates them all
+	/// together. [`crate::env::pin_lock`] still honours a legacy
+	/// `<config>/flake.lock` if one is there, so an existing setup is not orphaned.
+	pub fn pin_lock_path(&self, config_dir: &Path, name: Option<&str>) -> PathBuf {
+		self.locks_dir(config_dir)
+			.join(format!("{}.lock", name.unwrap_or("default")))
+	}
+
+	/// Where registry envs live: `[env].registry` ([`resolve_path`], relative to the
+	/// **state** dir since the registry is machine-generated state) if set, else
+	/// `<state_dir>/envs`.
+	///
+	/// Not `<state_dir>` itself: `roots/` and `compose/` are its siblings there, so
+	/// env directories placed directly in the state dir could collide with clinix's
+	/// own subdirectories (an env named `roots` would shadow the GC roots).
+	pub fn registry_dir(&self, state_dir: &Path) -> PathBuf {
+		match &self.registry {
+			Some(p) => resolve_path(p, state_dir),
+			None => state_dir.join("envs"),
+		}
+	}
+
 	/// How many prior root versions to keep on replacement (default `0` = release
 	/// the outgoing version immediately). See [`GcSettings`].
 	pub fn keep_n_prior_roots(&self) -> usize {
@@ -340,12 +415,15 @@ pub const FULL_TEMPLATE: &str = r#"# clinix configuration (TOML)
 shorthand = true
 
 [env]
-# Where the env registry (materialized envs + GC roots) lives.
-# Default: $XDG_STATE_HOME/clinix (i.e. ~/.local/state/clinix).
-# registry = "~/.local/state/clinix/envs"
+# Where registry envs live. Default: <state>/envs, i.e. ~/.local/state/clinix/envs.
+# A relative path resolves against the STATE dir (the registry is machine-generated
+# state); an absolute path is used as given. Not <state> itself, since roots/ and
+# compose/ are its siblings there.
+# registry = "envs"
 
 # The nixpkgs pin seed fragments build against — a git ref clinix locks into
-# <config>/flake.lock (never a nix-channel), or a path to an existing lockfile.
+# <locks>/default.lock (never a nix-channel), or a path to an existing lockfile
+# (relative to the config dir, or absolute).
 nixpkgs = "nixos-26.05"
 # nixpkgs = { flake_lock = "~/dev_env/flake.lock" }
 
@@ -354,15 +432,25 @@ nixpkgs = "nixos-26.05"
 # If unset, nixpkgs uses its default (~/.config/nixpkgs/config.nix).
 # nixpkgs_config = "~/dev_env/nixpkgs-config.nix"
 
+# Where the lockfiles clinix owns live, as <locks>/<name>.lock. The pin below is
+# named `default`, so the stack pin is <locks>/default.lock.
+# Default: <config>/locks. A relative path resolves against the CONFIG dir, so the
+# whole config directory stays relocatable; an absolute path is used as given.
+# locks = "locks"
+
 # Named ALTERNATE nixpkgs pins, each the same shape as [env].nixpkgs above (a ref
 # clinix locks, or an existing lockfile). They never change a stack's pin: they are
 # handed to a seed that asks for them, so one package can come from a different
 # nixpkgs than everything else in the shell.
 #
 #   [env.pins]
-#   unstable = "nixos-unstable"                              # clinix locks it into
-#                                                            # <config>/locks/unstable.lock
 #   old      = { flake_lock = "~/.config/clinix/locks/old.lock" }   # existing lock
+#   unstable = "nixos-unstable"   # clinix locks it into <locks>/unstable.lock
+#
+# PREFER the `flake_lock` form for a lock that already exists. A bare ref is only
+# used to CREATE the lock: once <locks>/<name>.lock is there, clinix returns it
+# untouched and the declared ref is never read again. clinix warns when the two
+# disagree, but the lock always wins.
 #
 # A seed opts in by accepting the argument, and indexes the pin by name:
 #
@@ -443,6 +531,7 @@ impl Settings {
 				registry: other.env.registry.or(self.env.registry),
 				nixpkgs: other.env.nixpkgs.or(self.env.nixpkgs),
 				nixpkgs_config: other.env.nixpkgs_config.or(self.env.nixpkgs_config),
+				locks: other.env.locks.or(self.env.locks),
 				// Per-key merge (`other` wins a name collision), matching how the list
 				// settings concatenate `other` first: a local config can redefine one
 				// pin without restating the imported ones.
@@ -555,6 +644,29 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 	path.to_path_buf()
 }
 
+/// Resolve a path written in `config.toml` against `base`: `~` expanded, an
+/// absolute path used as given, a **relative** path joined onto `base`.
+///
+/// One rule for every configured path, with `base` being the directory that
+/// setting's default lives in — the **config** dir for config-side paths (`locks`,
+/// `flake_lock`, `nixpkgs_config`), the **state** dir for state-side ones
+/// (`registry`).
+///
+/// Resolving relative paths against the *process cwd* would make one config file
+/// mean different things depending on where clinix was invoked — the opposite of a
+/// declarative config. Resolving against `base` is what keeps a config directory
+/// relocatable and committable, which is the whole point of `--config` /
+/// `$CLINIX_CONFIG_DIR`: `flake_lock = "locks/unstable.lock"` keeps working after
+/// the directory moves, while an absolute path still reaches a lock kept outside it.
+pub fn resolve_path(path: &Path, base: &Path) -> PathBuf {
+	let expanded = expand_tilde(path);
+	if expanded.is_absolute() {
+		expanded
+	} else {
+		base.join(expanded)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -628,6 +740,129 @@ ignore = ["_*.nix"]
 		assert_eq!(s.env.seeds.sources.len(), 2);
 		assert_eq!(s.env.seeds.sources[0].namespace.as_deref(), Some("dev"));
 		assert_eq!(s.env.seeds.ignore, vec!["_*.nix".to_string()]);
+	}
+
+	#[test]
+	fn resolve_path_joins_relative_onto_the_base_and_keeps_absolute() {
+		let base = Path::new("/cfg");
+		// Relative ⇒ under the base, so a config dir can be moved wholesale.
+		assert_eq!(
+			resolve_path(Path::new("locks/unstable.lock"), base),
+			PathBuf::from("/cfg/locks/unstable.lock")
+		);
+		// Absolute ⇒ as given, so a lock kept outside the config dir still resolves.
+		assert_eq!(
+			resolve_path(Path::new("/srv/pins/u.lock"), base),
+			PathBuf::from("/srv/pins/u.lock")
+		);
+		// `~` expands and is then absolute (so never joined onto the base).
+		if std::env::var_os("HOME").is_some() {
+			let home = resolve_path(Path::new("~/a.lock"), base);
+			assert!(home.is_absolute());
+			assert!(!home.starts_with("/cfg"));
+		}
+	}
+
+	#[test]
+	fn locks_dir_defaults_under_config_and_honours_an_override() {
+		let cfg = Path::new("/cfg");
+		// Default layout.
+		assert_eq!(
+			EnvSettings::default().locks_dir(cfg),
+			PathBuf::from("/cfg/locks")
+		);
+		// Relative → under the config dir (the locks are part of the committable
+		// config, so that is the useful base).
+		let rel = EnvSettings {
+			locks: Some(PathBuf::from("pins")),
+			..Default::default()
+		};
+		assert_eq!(rel.locks_dir(cfg), PathBuf::from("/cfg/pins"));
+		// Absolute → used as given.
+		let abs = EnvSettings {
+			locks: Some(PathBuf::from("/var/lib/clinix/locks")),
+			..Default::default()
+		};
+		assert_eq!(abs.locks_dir(cfg), PathBuf::from("/var/lib/clinix/locks"));
+	}
+
+	#[test]
+	fn pin_lock_path_names_the_stack_pin_default_beside_the_named_ones() {
+		let cfg = Path::new("/cfg");
+		let s = EnvSettings::default();
+		// The stack pin is just the unnamed pin, so it sits in the same directory.
+		assert_eq!(
+			s.pin_lock_path(cfg, None),
+			PathBuf::from("/cfg/locks/default.lock")
+		);
+		assert_eq!(
+			s.pin_lock_path(cfg, Some("unstable")),
+			PathBuf::from("/cfg/locks/unstable.lock")
+		);
+		// `locks` relocates every one of them together.
+		let moved = EnvSettings {
+			locks: Some(PathBuf::from("/srv/pins")),
+			..Default::default()
+		};
+		assert_eq!(
+			moved.pin_lock_path(cfg, None),
+			PathBuf::from("/srv/pins/default.lock")
+		);
+		assert_eq!(
+			moved.pin_lock_path(cfg, Some("unstable")),
+			PathBuf::from("/srv/pins/unstable.lock")
+		);
+	}
+
+	#[test]
+	fn registry_dir_defaults_under_state_and_honours_an_override() {
+		let state = Path::new("/s");
+		assert_eq!(
+			EnvSettings::default().registry_dir(state),
+			PathBuf::from("/s/envs")
+		);
+		// Relative → under the STATE dir, not the config dir: the registry is
+		// machine-generated state, so that is the base its default lives in.
+		let rel = EnvSettings {
+			registry: Some(PathBuf::from("my-envs")),
+			..Default::default()
+		};
+		assert_eq!(rel.registry_dir(state), PathBuf::from("/s/my-envs"));
+		let abs = EnvSettings {
+			registry: Some(PathBuf::from("/data/envs")),
+			..Default::default()
+		};
+		assert_eq!(abs.registry_dir(state), PathBuf::from("/data/envs"));
+	}
+
+	#[test]
+	fn config_registry_dir_defaults_then_follows_the_settings() {
+		// `resolve`/`at` give the default; `with_settings` applies `[env].registry`.
+		let cfg = Config::at(PathBuf::from("/c"), PathBuf::from("/s"));
+		assert_eq!(cfg.registry_dir, PathBuf::from("/s/envs"));
+		let settings = Settings {
+			env: EnvSettings {
+				registry: Some(PathBuf::from("/data/envs")),
+				..Default::default()
+			},
+			..Default::default()
+		};
+		assert_eq!(
+			cfg.with_settings(&settings).registry_dir,
+			PathBuf::from("/data/envs")
+		);
+	}
+
+	#[test]
+	fn env_locks_parses_and_merges_like_the_other_scalars() {
+		let dir = tempfile::tempdir().unwrap();
+		write(dir.path(), "config.toml", "[env]\nlocks = \"my-locks\"\n");
+		let s = Settings::load(dir.path()).unwrap();
+		assert_eq!(s.env.locks.as_deref(), Some(Path::new("my-locks")));
+		assert_eq!(
+			s.env.locks_dir(Path::new("/cfg")),
+			PathBuf::from("/cfg/my-locks")
+		);
 	}
 
 	#[test]

@@ -201,7 +201,7 @@ fn adhoc_composition(
 	} else {
 		labels.join(" ")
 	};
-	let nixpkgs_config = nixpkgs_config_path(settings)?;
+	let nixpkgs_config = nixpkgs_config_path(cfg, settings)?;
 	// Alternate pins are resolved (and lazily locked) **only** when a member asked
 	// for them, so a declared-but-unused `[env.pins]` costs nothing — not even the
 	// one-time network lock of a `Ref` pin.

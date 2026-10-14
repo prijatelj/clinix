@@ -31,9 +31,10 @@ use crate::env::config::Config;
 use crate::env::{Env, Kind};
 use crate::error::{ClinixError, Result};
 
-/// Where registry envs live: `state/envs/`.
+/// Where registry envs live: `state/envs/` by default, or wherever
+/// `[env].registry` put it (resolved once into [`Config::registry_dir`]).
 pub fn envs_dir(cfg: &Config) -> PathBuf {
-	cfg.state_dir.join("envs")
+	cfg.registry_dir.clone()
 }
 
 /// Where GC-root symlinks live: `state/roots/`.
@@ -439,10 +440,7 @@ mod tests {
 
 	#[test]
 	fn file_root_slugs_the_path() {
-		let cfg = Config {
-			config_dir: PathBuf::from("/c"),
-			state_dir: PathBuf::from("/s"),
-		};
+		let cfg = Config::at(PathBuf::from("/c"), PathBuf::from("/s"));
 		assert_eq!(
 			file_root(&cfg, Path::new("/home/u/dev.nix")),
 			PathBuf::from("/s/roots/file-home_u_dev.nix")
@@ -516,10 +514,7 @@ mod tests {
 	#[test]
 	fn rename_rekeys_a_legacy_root_instead_of_stranding_it() {
 		let dir = tempfile::tempdir().unwrap();
-		let cfg = Config {
-			config_dir: dir.path().join("c"),
-			state_dir: dir.path().to_path_buf(),
-		};
+		let cfg = Config::at(dir.path().join("c"), dir.path().to_path_buf());
 		std::fs::create_dir_all(envs_dir(&cfg).join("old")).unwrap();
 		std::fs::create_dir_all(roots_dir(&cfg)).unwrap();
 		let old_base = roots_dir(&cfg).join("env-old");
@@ -612,10 +607,7 @@ mod tests {
 	#[test]
 	fn list_root_keys_strips_version_and_rt_suffixes_and_dedups() {
 		let dir = tempfile::tempdir().unwrap();
-		let cfg = Config {
-			config_dir: dir.path().join("c"),
-			state_dir: dir.path().to_path_buf(),
-		};
+		let cfg = Config::at(dir.path().join("c"), dir.path().to_path_buf());
 		let roots = roots_dir(&cfg);
 		std::fs::create_dir_all(&roots).unwrap();
 		for f in [

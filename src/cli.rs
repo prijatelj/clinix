@@ -258,10 +258,23 @@ impl Cli {
 				runtime: self.runtime,
 				packages,
 			},
-			config: Config::resolve(&Overrides {
-				config_dir: self.config,
-				state_dir: self.state_dir,
-			}),
+			config: {
+				let cfg = Config::resolve(&Overrides {
+					config_dir: self.config,
+					state_dir: self.state_dir,
+				});
+				// `[env].registry` can relocate the registry root, so fold the settings
+				// in once here rather than re-reading them at every path lookup.
+				//
+				// Best-effort on purpose: a malformed `config.toml` must not break
+				// `clinix config example` or `--help` — the very commands you reach for
+				// to fix it. Verbs that genuinely need the settings load them again and
+				// surface the parse error there.
+				match crate::env::config::Settings::load(&cfg.config_dir) {
+					Ok(settings) => cfg.with_settings(&settings),
+					Err(_) => cfg,
+				}
+			},
 		};
 		match self.command {
 			Some(Command::Sys(args)) => crate::sys::dispatch(args),

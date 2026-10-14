@@ -317,9 +317,14 @@ pub(crate) fn node_label(node: &Node) -> String {
 pub(crate) fn seed_lock(cfg: &Config, settings: &crate::env::config::Settings) -> Result<PathBuf> {
 	use crate::env::config::NixpkgsPin;
 	match &settings.env.nixpkgs {
-		Some(pin) => pin_lock(cfg, pin, None),
+		Some(pin) => pin_lock(cfg, settings, pin, None),
 		// Unset ⇒ the latest stable, locked lazily like any other ref.
-		None => pin_lock(cfg, &NixpkgsPin::Ref("nixos-26.05".to_string()), None),
+		None => pin_lock(
+			cfg,
+			settings,
+			&NixpkgsPin::Ref("nixos-26.05".to_string()),
+			None,
+		),
 	}
 }
 
@@ -334,18 +339,23 @@ pub(crate) fn seed_lock(cfg: &Config, settings: &crate::env::config::Settings) -
 ///   so a lock you wrote yourself (or moved there) is picked up unchanged.
 pub(crate) fn pin_lock(
 	cfg: &Config,
+	settings: &crate::env::config::Settings,
 	pin: &crate::env::config::NixpkgsPin,
 	name: Option<&str>,
 ) -> Result<PathBuf> {
-	use crate::env::config::{NixpkgsPin, expand_tilde};
-	// Where a `Ref` gets lazily locked, and how to name this pin in an error.
-	let (lazy_path, label) = match name {
-		Some(n) => (cfg.config_dir.join("locks").join(format!("{n}.lock")), format!("[env.pins].{n}")),
-		None => (cfg.config_dir.join("flake.lock"), "[env].nixpkgs".to_string()),
+	use crate::env::config::{NixpkgsPin, resolve_path};
+	// Every lock clinix owns lives under one directory: `<locks>/<name>.lock`, with
+	// the stack pin named `default` (see `EnvSettings::pin_lock_path`).
+	let lazy_path = settings.env.pin_lock_path(&cfg.config_dir, name);
+	let label = match name {
+		Some(n) => format!("[env.pins].{n}"),
+		None => "[env].nixpkgs".to_string(),
 	};
 	match pin {
+		// An explicit lockfile. Relative ⇒ under the config dir, so a config
+		// directory stays relocatable; absolute ⇒ a lock kept outside it.
 		NixpkgsPin::FlakeLock { flake_lock } => {
-			let p = expand_tilde(flake_lock);
+			let p = resolve_path(flake_lock, &cfg.config_dir);
 			if p.is_file() {
 				Ok(p)
 			} else {
@@ -355,7 +365,26 @@ pub(crate) fn pin_lock(
 				)))
 			}
 		}
-		NixpkgsPin::Ref(r) => ensure_lock(r, &lazy_path),
+		NixpkgsPin::Ref(r) => {
+			// Legacy layout: the stack pin used to be locked at `<config>/flake.lock`.
+			// Adopt that file rather than locking a second copy at the new path — the
+			// pin is the user's committed artifact, so it must not be silently
+			// orphaned (or re-resolved to a newer rev behind their back).
+			if name.is_none() && !lazy_path.is_file() {
+				let legacy = cfg.config_dir.join("flake.lock");
+				if legacy.is_file() {
+					eprintln!(
+						"clinix: note: using the legacy stack pin at {} — clinix now keeps it at \
+						 {}; `mv` it there to silence this.",
+						legacy.display(),
+						lazy_path.display()
+					);
+					warn_ref_mismatch(r, &legacy, &label);
+					return Ok(legacy);
+				}
+			}
+			ensure_lock(r, &lazy_path, &label)
+		}
 	}
 }
 
@@ -370,7 +399,7 @@ pub(crate) fn named_pins(
 		.env
 		.pins
 		.iter()
-		.map(|(name, pin)| Ok((name.clone(), pin_lock(cfg, pin, Some(name))?)))
+		.map(|(name, pin)| Ok((name.clone(), pin_lock(cfg, settings, pin, Some(name))?)))
 		.collect()
 }
 
@@ -379,11 +408,13 @@ pub(crate) fn named_pins(
 /// clinix then passes no explicit config, so nixpkgs uses its default
 /// (`~/.config/nixpkgs/config.nix`).
 pub(crate) fn nixpkgs_config_path(
+	cfg: &Config,
 	settings: &crate::env::config::Settings,
 ) -> Result<Option<PathBuf>> {
 	match &settings.env.nixpkgs_config {
 		Some(p) => {
-			let path = crate::env::config::expand_tilde(p);
+			// Same rule as every configured path: relative ⇒ under the config dir.
+			let path = crate::env::config::resolve_path(p, &cfg.config_dir);
 			if path.is_file() {
 				Ok(Some(path))
 			} else {
@@ -401,8 +432,9 @@ pub(crate) fn nixpkgs_config_path(
 /// reusing `init`'s classic lock builder. Committable — the user's pin. An existing
 /// file is returned untouched, which is what makes a hand-written or relocated lock
 /// adoptable: declare the ref, drop the lock at the path, and clinix uses it.
-fn ensure_lock(nixpkgs_ref: &str, lock: &Path) -> Result<PathBuf> {
+fn ensure_lock(nixpkgs_ref: &str, lock: &Path, label: &str) -> Result<PathBuf> {
 	if lock.is_file() {
+		warn_ref_mismatch(nixpkgs_ref, lock, label);
 		return Ok(lock.to_path_buf());
 	}
 	// Silent for now (no `--quiet` on launch); the same first-run lock could show
@@ -414,6 +446,75 @@ fn ensure_lock(nixpkgs_ref: &str, lock: &Path) -> Result<PathBuf> {
 	}
 	std::fs::write(lock, built.to_json())?;
 	Ok(lock.to_path_buf())
+}
+
+/// Warn when a declared **ref** pin disagrees with the lock already on disk.
+///
+/// [`ensure_lock`] returns an existing lock untouched, so a declared ref is only
+/// ever used to *create* one. That makes a stale declaration silent: `nixpkgs =
+/// "nixos-25.05"` beside a lock tracking `nixos-unstable` reads like an assertion
+/// about the pin and is not one — the lock wins and the config lies. This turns
+/// that into a visible contradiction.
+///
+/// Best-effort and never fatal: an unreadable lock, a `follows` edge, or a nixpkgs
+/// input the lock does not record is simply not checked. A diagnostic must not stop
+/// a shell from being entered, and a genuinely broken lock fails loudly later when
+/// nix reads it.
+fn warn_ref_mismatch(declared: &str, lock_path: &Path, label: &str) {
+	let Ok(text) = std::fs::read_to_string(lock_path) else {
+		return;
+	};
+	let Ok(lock) = crate::model::lock::FlakeLock::from_json(&text) else {
+		return;
+	};
+	if let Some(msg) = ref_mismatch(declared, &lock, label, lock_path) {
+		eprintln!("clinix: warning: {msg}");
+	}
+}
+
+/// The mismatch message, or `None` when the declaration agrees with the lock (or
+/// there is nothing comparable to check). Pure over its inputs — no I/O, no
+/// printing — so the comparison table is unit-testable; [`warn_ref_mismatch`] does
+/// the reading and the reporting.
+fn ref_mismatch(
+	declared: &str,
+	lock: &crate::model::lock::FlakeLock,
+	label: &str,
+	lock_path: &Path,
+) -> Option<String> {
+	// A `follows` edge, or a lock with no nixpkgs input, has nothing to compare.
+	let node = lock
+		.root_node()
+		.and_then(|root| root.inputs.get("nixpkgs"))
+		.and_then(|edge| edge.node_key())
+		.and_then(|key| lock.nodes.get(key))?;
+	let original = node.original.as_ref()?;
+	// A 40-hex declaration freezes a rev; anything else tracks a branch/tag. Compare
+	// like against like, so a frozen pin is not reported as a missing branch.
+	let (kind, actual) = if super::init::is_rev(declared) {
+		(
+			"rev",
+			original
+				.rev()
+				.or_else(|| node.locked.as_ref().and_then(|l| l.rev())),
+		)
+	} else {
+		("ref", original.git_ref())
+	};
+	match actual {
+		Some(a) if a == declared => None,
+		Some(a) => Some(format!(
+			"{label} declares nixpkgs {kind} `{declared}`, but {} already tracks `{a}` — the \
+			 existing lock wins (clinix never rewrites one). Fix the declaration, or delete \
+			 the lock to rebuild it from the ref.",
+			lock_path.display()
+		)),
+		None => Some(format!(
+			"{label} declares nixpkgs {kind} `{declared}`, but {} records no {kind} for \
+			 nixpkgs — the existing lock wins.",
+			lock_path.display()
+		)),
+	}
 }
 
 /// The unified verb set. Every verb takes an env name (or several, for the
@@ -602,5 +703,72 @@ mod tests {
 			env_shell_file(dir.path()).unwrap(),
 			dir.path().join("shell.nix")
 		);
+	}
+
+	/// A one-input lock whose nixpkgs node carries the given `original` fields.
+	fn lock_with(original: &str) -> crate::model::lock::FlakeLock {
+		crate::model::lock::FlakeLock::from_json(&format!(
+			r#"{{
+			  "nodes": {{
+			    "nixpkgs": {{
+			      "locked": {{ "narHash": "sha256-x", "owner": "NixOS", "repo": "nixpkgs",
+			                   "rev": "1111111111111111111111111111111111111111",
+			                   "type": "github" }},
+			      "original": {{ {original} }}
+			    }},
+			    "root": {{ "inputs": {{ "nixpkgs": "nixpkgs" }} }}
+			  }},
+			  "root": "root",
+			  "version": 7
+			}}"#
+		))
+		.unwrap()
+	}
+
+	#[test]
+	fn ref_mismatch_reports_only_a_real_disagreement() {
+		let path = Path::new("/cfg/locks/unstable.lock");
+		let tracking = lock_with(
+			r#""owner": "NixOS", "ref": "nixos-unstable", "repo": "nixpkgs", "type": "github""#,
+		);
+		let m = |declared, lock: &crate::model::lock::FlakeLock| {
+			ref_mismatch(declared, lock, "[env.pins].unstable", path)
+		};
+
+		// Agreement is silent — this is the common case and must not be noisy.
+		assert!(m("nixos-unstable", &tracking).is_none());
+		// A stale declaration is the whole point: the lock wins, so say so.
+		let warning = m("nixos-25.05", &tracking).expect("should warn");
+		assert!(warning.contains("[env.pins].unstable"));
+		assert!(warning.contains("`nixos-25.05`"), "names the declaration");
+		assert!(warning.contains("`nixos-unstable`"), "names the reality");
+		assert!(warning.contains("locks/unstable.lock"), "names the file");
+
+		// A frozen lock records a rev and no ref: declaring a branch is a mismatch,
+		// and declaring that exact rev is not.
+		let frozen = lock_with(
+			r#""owner": "NixOS", "repo": "nixpkgs",
+			   "rev": "1111111111111111111111111111111111111111", "type": "github""#,
+		);
+		assert!(m("nixos-unstable", &frozen).unwrap().contains("records no ref"));
+		assert!(m("1111111111111111111111111111111111111111", &frozen).is_none());
+		assert!(
+			m("2222222222222222222222222222222222222222", &frozen)
+				.unwrap()
+				.contains("rev")
+		);
+
+		// Nothing comparable → no warning, rather than a false alarm: a `follows`
+		// edge, and a lock with no nixpkgs input at all.
+		let follows = crate::model::lock::FlakeLock::from_json(
+			r#"{"nodes":{"root":{"inputs":{"nixpkgs":["other","nixpkgs"]}}},"root":"root","version":7}"#,
+		)
+		.unwrap();
+		assert!(m("nixos-unstable", &follows).is_none());
+		let empty = crate::model::lock::FlakeLock::from_json(
+			r#"{"nodes":{"root":{}},"root":"root","version":7}"#,
+		)
+		.unwrap();
+		assert!(m("nixos-unstable", &empty).is_none());
 	}
 }
