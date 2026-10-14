@@ -206,7 +206,11 @@ fn release_one(label: &str, base: &std::path::Path, args: &Clean) -> Result<()> 
 				println!("clinix: `{label}` has no root version @{seq}");
 			}
 		} else if let Some(n) = args.oldest {
-			let ids: Vec<String> = versions.iter().take(n).map(|v| format!("@{}", v.seq)).collect();
+			let ids: Vec<String> = versions
+				.iter()
+				.take(n)
+				.map(|v| format!("@{}", v.seq))
+				.collect();
 			if ids.is_empty() {
 				println!("clinix: `{label}` had no versions to release");
 			} else {

@@ -64,12 +64,21 @@ fn version_row(v: &registry::RootVersion, size: bool) -> serde_json::Value {
 }
 
 /// The version history of a single env (current + retained priors).
-fn roots_of(cfg: &Config, catalog: &Catalog, name: &str, settings: &Settings, args: &Roots) -> Result<()> {
+fn roots_of(
+	cfg: &Config,
+	catalog: &Catalog,
+	name: &str,
+	settings: &Settings,
+	args: &Roots,
+) -> Result<()> {
 	let base = node_root(cfg, catalog, name)?;
 	let versions = registry::list_versions(&base)?;
 	if args.json {
 		let rows: Vec<_> = versions.iter().map(|v| version_row(v, args.size)).collect();
-		println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "env": name, "versions": rows }))?);
+		println!(
+			"{}",
+			serde_json::to_string_pretty(&serde_json::json!({ "env": name, "versions": rows }))?
+		);
 		return Ok(());
 	}
 	if versions.is_empty() {
@@ -84,13 +93,23 @@ fn roots_of(cfg: &Config, catalog: &Catalog, name: &str, settings: &Settings, ar
 		.unwrap_or_else(|| "not rooted (retention off)".to_string());
 	println!("root versions for `{name}` ({policy}):");
 	for (i, v) in versions.iter().rev().enumerate() {
-		let label = if i == 0 { "current".to_string() } else { format!("prior {i}") };
+		let label = if i == 0 {
+			"current".to_string()
+		} else {
+			format!("prior {i}")
+		};
 		let drv = std::fs::read_link(&v.drv_root)
 			.map(|p| super::store_label(&p.to_string_lossy()))
 			.unwrap_or_else(|_| "(unresolved)".to_string());
-		let pkgs = if registry::rt_root(&v.drv_root).symlink_metadata().is_ok() { "+pkgs" } else { "drv-only" };
+		let pkgs = if registry::rt_root(&v.drv_root).symlink_metadata().is_ok() {
+			"+pkgs"
+		} else {
+			"drv-only"
+		};
 		let size = if args.size {
-			version_bytes(&v.drv_root).map(|b| format!(" {}", human_bytes(b))).unwrap_or_default()
+			version_bytes(&v.drv_root)
+				.map(|b| format!(" {}", human_bytes(b)))
+				.unwrap_or_default()
 		} else {
 			String::new()
 		};
@@ -109,7 +128,10 @@ fn roots_global(cfg: &Config, args: &Roots) -> Result<()> {
 			let rows: Vec<_> = versions.iter().map(|v| version_row(v, args.size)).collect();
 			families.push(serde_json::json!({ "key": key, "versions": rows }));
 		}
-		println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "roots": families }))?);
+		println!(
+			"{}",
+			serde_json::to_string_pretty(&serde_json::json!({ "roots": families }))?
+		);
 		return Ok(());
 	}
 	if keys.is_empty() {
@@ -137,12 +159,18 @@ fn roots_global(cfg: &Config, args: &Roots) -> Result<()> {
 				.unwrap_or_default();
 			let n = versions.len();
 			let size = if args.size {
-				let total: u64 = versions.iter().filter_map(|v| version_bytes(&v.drv_root)).sum();
+				let total: u64 = versions
+					.iter()
+					.filter_map(|v| version_bytes(&v.drv_root))
+					.sum();
 				format!("  {}", human_bytes(total))
 			} else {
 				String::new()
 			};
-			println!("  {key}  ({n} version{}){size}  {cur}", if n == 1 { "" } else { "s" });
+			println!(
+				"  {key}  ({n} version{}){size}  {cur}",
+				if n == 1 { "" } else { "s" }
+			);
 		}
 	}
 	println!("\nrelease with: clinix env clean <name> | --projects | --stacks | --match '<glob>'");

@@ -1,10 +1,14 @@
 //! Shared `env` primitives: the verb dispatch ([`Cmd`]), the [`RunCmd`] trait,
-//! [`Context`], env resolution ([`resolve`]/[`Env`]/[`Kind`]), the generic
-//! env-name selectors, and the `rename` verb. Each concrete verb lives in its
-//! own sibling submodule; this file dispatches to them.
+//! [`Context`], env resolution ([`resolve`]/[`Env`]/[`Kind`]/[`resolve_node`]),
+//! the generic env-name selectors, and the `rename` verb. Each concrete verb
+//! lives in its own sibling submodule; this file dispatches to them.
+//!
+//! Resolution only — *combining* resolved targets into one instantiable
+//! expression, and entering it, is [`super::compose`]. Keeping the two apart is
+//! why a change to how environments compose no longer has to touch the file that
+//! also owns `Context`, `Env`, and the verb table.
 
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
 
 use clap::{Args, Subcommand};
 
@@ -186,368 +190,10 @@ pub(crate) fn warn_name_collision(cfg: &Config, name: &str) {
 
 /// A resolved stack node: an env with its own `shell.nix` (project/registry), an
 /// explicit `*.nix` **File** run directly, or a seed fragment from the catalog.
-enum Node {
+pub(crate) enum Node {
 	Env(Env),
 	File { path: PathBuf },
 	Seed { name: String, path: PathBuf },
-}
-
-/// A resolved composition: the single nix file to instantiate (an env's own
-/// shell, a `*.nix` file, or a written seed-stack compose file), a human `label`,
-/// and the GC-root path keyed for it. Produced by [`compose_nodes`] and consumed
-/// by both `launch` (enter it) and `export` (serialize/image it).
-pub(crate) struct Composition {
-	pub shell_file: PathBuf,
-	pub label: String,
-	pub root: PathBuf,
-	/// The `flake.lock` pinning this composition's nixpkgs, when discoverable (a
-	/// registry env's own lock, a file target's adjacent lock, or the seed pin for
-	/// a stack). `export docker` needs it to pin `dockerTools`.
-	pub lock: Option<PathBuf>,
-	/// True when ad-hoc `-p` packages made this composition **ephemeral**: it is
-	/// entered unrooted (like plain `nix-shell`), so `nix-collect-garbage` reclaims
-	/// it. Register it with `env new <name> --from <envs…> -p <pkgs…>` to keep it.
-	pub ephemeral: bool,
-}
-
-/// A directory-backed env's own `flake.lock`, if present.
-fn env_lock(env: &Env) -> Option<PathBuf> {
-	let lock = env.root.join("flake.lock");
-	lock.is_file().then_some(lock)
-}
-
-/// Resolve a name list to a single instantiable [`Composition`] — the one place
-/// the target precedence + seed-stack composition live, shared by `launch` and
-/// `export`. Empty names ⇒ the cwd project. No nix eval or entry here; a stack
-/// writes its compose expression to `state/compose/`. A union may mix a
-/// self-contained env (project/registry/file) with seeds **only when all such
-/// envs share a byte-identical `flake.lock`** (the shared-pin union); the general
-/// multi-pin case stays deferred.
-pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Composition> {
-	let cfg = &ctx.config;
-	let settings = crate::env::config::Settings::load(&cfg.config_dir)?;
-	let catalog = crate::env::seeds::Catalog::build(&settings.env.seeds);
-	for w in &catalog.warnings {
-		eprintln!("clinix: {w}");
-	}
-
-	// Ad-hoc `-p` packages are part of the composition *request*, which `Context`
-	// already carries — so they are read here rather than threaded through every
-	// caller. A caller that composes without them simply never set them.
-	let packages: &[String] = &ctx.options.packages;
-	// They must be spliced into a generated `mkShell`, so they force the compose
-	// path below, including the 0-node and 1-node shapes that otherwise hand back
-	// an env's own `shell.nix` untouched.
-	let adhoc = !packages.is_empty();
-
-	// Empty ⇒ the cwd project. With `-p` and no names this is instead the bare
-	// `nix-shell -p` shape: no imports at all, pinned by whatever lock is active
-	// here — the cwd project's if there is one, else the seed pin — so
-	// `clinix -p tokei` works in any directory.
-	if names.is_empty() {
-		if adhoc {
-			let lock = match resolve(cfg, None).ok().as_ref().and_then(env_lock) {
-				Some(l) => l,
-				None => seed_lock(cfg, &settings)?,
-			};
-			return adhoc_composition(cfg, &settings, &[], &[], lock, packages);
-		}
-		let env = resolve(cfg, None)?;
-		return Ok(Composition {
-			shell_file: env_shell_file(&env.root)?,
-			label: env_label(&env),
-			root: registry::root_path(cfg, &env),
-			lock: env_lock(&env),
-			ephemeral: false,
-		});
-	}
-
-	let nodes: Vec<Node> = names
-		.iter()
-		.map(|n| resolve_node(cfg, &catalog, n))
-		.collect::<Result<_>>()?;
-
-	// A single self-contained node: an env's own shell, or an explicit `*.nix` file.
-	// Skipped under `-p`, which needs a generated wrapper to carry the packages.
-	if !adhoc {
-		match nodes.as_slice() {
-			[Node::Env(env)] => {
-				return Ok(Composition {
-					shell_file: env_shell_file(&env.root)?,
-					label: env_label(env),
-					root: registry::root_path(cfg, env),
-					lock: env_lock(env),
-					ephemeral: false,
-				});
-			}
-			[Node::File { path }] => {
-				let lock = path
-					.parent()
-					.map(|d| d.join("flake.lock"))
-					.filter(|l| l.is_file());
-				return Ok(Composition {
-					shell_file: path.clone(),
-					label: file_label(path),
-					root: registry::file_root(cfg, path),
-					lock,
-					ephemeral: false,
-				});
-			}
-			_ => {}
-		}
-	}
-
-	// Otherwise a **union** of 2+ nodes. Seeds inject the shared `pkgs`;
-	// self-contained nodes (project/registry env, `*.nix` file) read their own
-	// `flake.lock` — permitted **only when all such locks are byte-identical** (a
-	// shared pin), else the multi-pin case stays deferred.
-	let mut items: Vec<UnionItem> = Vec::with_capacity(nodes.len());
-	for node in &nodes {
-		items.push(union_item(node)?);
-	}
-
-	// The shared pin: every self-contained node's lock must be identical; else the
-	// seeds compose against the configured seed pin (an all-seeds union).
-	let sc_locks: Vec<&PathBuf> = items.iter().filter_map(|i| i.lock.as_ref()).collect();
-	let lock = match sc_locks.first() {
-		Some(first) => {
-			let first_bytes = std::fs::read(first)?;
-			for other in &sc_locks[1..] {
-				if std::fs::read(other)? != first_bytes {
-					return Err(crate::error::unimplemented(
-						"composing envs with differing flake.locks",
-						"only a shared flake.lock is supported at this time — every env in a \
-						 union must share one pin",
-					));
-				}
-			}
-			(*first).clone()
-		}
-		None => seed_lock(cfg, &settings)?,
-	};
-
-	// Order: lexical by default; `-o` preserves the given order.
-	if !ctx.options.ordered {
-		items.sort_by(|a, b| a.label.cmp(&b.label));
-	}
-	let labels: Vec<String> = items.iter().map(|i| i.label.clone()).collect();
-	let imports: Vec<(PathBuf, bool)> = items.iter().map(|i| (i.shell.clone(), i.inject)).collect();
-	adhoc_composition(cfg, &settings, &labels, &imports, lock, packages)
-}
-
-/// Write a generated compose expression and describe it as a [`Composition`]. The
-/// single writer for every composed shape: a plain union (`packages` empty) and an
-/// ad-hoc `-p` layer (which may have **no** imports at all — the `nix-shell -p`
-/// case). Ad-hoc compositions are **ephemeral**: entered unrooted, so GC reclaims
-/// them.
-///
-/// The compose file's name carries a hash of the package set, so distinct `-p`
-/// invocations over the same envs do not overwrite each other's expression.
-fn adhoc_composition(
-	cfg: &Config,
-	settings: &crate::env::config::Settings,
-	labels: &[String],
-	imports: &[(PathBuf, bool)],
-	lock: PathBuf,
-	packages: &[String],
-) -> Result<Composition> {
-	let label = if labels.is_empty() {
-		packages.join(" ")
-	} else {
-		labels.join(" ")
-	};
-	let nixpkgs_config = nixpkgs_config_path(settings)?;
-	let expr = crate::env::seeds::compose_expr(
-		&lock,
-		imports,
-		&label,
-		nixpkgs_config.as_deref(),
-		packages,
-	);
-
-	// Key: the stack key, plus `-p<hash>` when ad-hoc so the two never collide.
-	let base = if labels.is_empty() {
-		"stack".to_string()
-	} else {
-		stack_key(labels.iter().map(String::as_str))
-	};
-	let key = if packages.is_empty() {
-		base
-	} else {
-		format!("{base}-p{:08x}", package_hash(packages))
-	};
-
-	let compose_dir = registry::compose_dir(cfg);
-	std::fs::create_dir_all(&compose_dir)?;
-	let compose_file = compose_dir.join(format!("{key}.nix"));
-	std::fs::write(&compose_file, expr)?;
-	Ok(Composition {
-		shell_file: compose_file,
-		label,
-		root: registry::roots_dir(cfg).join(&key),
-		lock: Some(lock),
-		ephemeral: !packages.is_empty(),
-	})
-}
-
-/// A stable 32-bit FNV-1a hash of the package set, order-independent (the set is
-/// sorted first) — the compose-file name's `-p<hash>` suffix. Hand-rolled rather
-/// than `DefaultHasher` so the same `-p` set always names the same file, across
-/// toolchain versions.
-fn package_hash(packages: &[String]) -> u32 {
-	let mut sorted: Vec<&str> = packages.iter().map(String::as_str).collect();
-	sorted.sort_unstable();
-	let mut hash: u32 = 0x811c_9dc5;
-	for name in sorted {
-		for b in name.as_bytes() {
-			hash ^= u32::from(*b);
-			hash = hash.wrapping_mul(0x0100_0193);
-		}
-		hash ^= u32::from(b'\0');
-		hash = hash.wrapping_mul(0x0100_0193);
-	}
-	hash
-}
-
-/// One node's contribution to a union: the shell file to import, whether to inject
-/// the shared `pkgs` (seeds do; self-contained shells read their own lock), and its
-/// own `flake.lock` for the shared-pin check (self-contained only).
-struct UnionItem {
-	label: String,
-	shell: PathBuf,
-	inject: bool,
-	lock: Option<PathBuf>,
-}
-
-fn union_item(node: &Node) -> Result<UnionItem> {
-	Ok(match node {
-		Node::Seed { name, path } => UnionItem {
-			label: name.clone(),
-			shell: path.clone(),
-			inject: true,
-			lock: None,
-		},
-		Node::Env(env) => {
-			let lock = env_lock(env).ok_or_else(|| {
-				ClinixError::Config(format!(
-					"`{}` has no flake.lock — it cannot join a shared-flake.lock union",
-					env_label(env)
-				))
-			})?;
-			UnionItem {
-				label: env_label(env),
-				shell: env_shell_file(&env.root)?,
-				inject: false,
-				lock: Some(lock),
-			}
-		}
-		Node::File { path } => {
-			let lock = path
-				.parent()
-				.map(|d| d.join("flake.lock"))
-				.filter(|l| l.is_file())
-				.ok_or_else(|| {
-					ClinixError::Config(format!(
-						"`{}` has no adjacent flake.lock — it cannot join a shared-flake.lock union",
-						path.display()
-					))
-				})?;
-			UnionItem {
-				label: file_label(path),
-				shell: path.clone(),
-				inject: false,
-				lock: Some(lock),
-			}
-		}
-	})
-}
-
-/// Shared launcher for `shell`/`run`: [`compose_nodes`] the names, GC-root, and
-/// enter via classic `nix-shell` (`--run <command>` when non-interactive).
-pub(crate) fn launch(
-	ctx: &Context,
-	names: &[String],
-	pure: bool,
-	command: Option<&str>,
-	version: registry::VersionSelect,
-) -> Result<ExitStatus> {
-	let comp = compose_nodes(ctx, names)?;
-	let drv = match version {
-		// An ad-hoc `-p` composition is ephemeral by design: evaluate and enter it
-		// unrooted, exactly as plain `nix-shell -p` does, so it mints no version and
-		// `nix-collect-garbage` reclaims it once the shell exits.
-		_ if comp.ephemeral => crate::nix::instantiate(&comp.shell_file)?,
-		// Current: mint a new version iff the derivation changed, else reuse.
-		registry::VersionSelect::Current => mint_current(ctx, &comp)?,
-		// A prior/exact version: enter its stored `.drv` directly — no eval, no mint,
-		// no prune (offline-capable, since the recipe + closure are already rooted).
-		sel => {
-			let vpath = registry::resolve_version(&comp.root, sel)?;
-			std::fs::read_link(&vpath)?.to_string_lossy().into_owned()
-		}
-	};
-	match command {
-		// Interactive shell: hand the terminal off by *replacing* this process
-		// (like `~/dev_env/shell`'s `exec nix-shell`), so no clinix node lingers
-		// between the parent shell and the nix-shell. A lingering clinix process
-		// otherwise hides the nix-shell layer from process-tree tools such as
-		// `clonetty`. On success this does not return (see [`crate::nix::nix_shell_exec`]).
-		//
-		// A future post-shell cleanup hook would attach here: swap this arm back to
-		// `nix::nix_shell(&drv, pure, None)` (fork + wait) and run the hook on the
-		// returned `ExitStatus`. Kept out until such a hook has a defined purpose,
-		// rather than shipping an unreachable stub.
-		None => crate::nix::nix_shell_exec(&drv, pure),
-		// Non-interactive `run`: fork + wait so `execution::run` can mirror the
-		// command's exit code. No terminal is handed off, so there is no
-		// process-tree concern and nothing to gain from `exec` here.
-		Some(c) => crate::nix::nix_shell(&drv, pure, Some(c)),
-	}
-}
-
-/// Root the current composition as a new version **iff its derivation differs** from
-/// the current version (else reuse — idempotent re-entry does no work), then prune to
-/// `keep_n_prior_roots + 1`. Returns the `.drv` to enter. Each minted version is a
-/// `.drv` root (`registry::version_path`) plus its `inputDerivation` `.rt` sibling —
-/// the complete build closure, retained regardless of `keep-outputs`.
-fn mint_current(ctx: &Context, comp: &Composition) -> Result<String> {
-	let settings = crate::env::config::Settings::load(&ctx.config.config_dir)?;
-	let base = &comp.root;
-	let base_key = base
-		.file_name()
-		.map(|n| n.to_string_lossy().into_owned())
-		.unwrap_or_default();
-
-	// Rooting may be disabled for this kind (negative project/stack retention): then
-	// just evaluate and enter unrooted (plain `nix-shell`, GC-collectible).
-	let Some(keep_total) = settings.env.root_retention(&base_key) else {
-		return crate::nix::instantiate(&comp.shell_file);
-	};
-
-	// Reuse the current version when the derivation is unchanged.
-	let versions = registry::list_versions(base)?;
-	if let Some(cur) = versions.last() {
-		let new_drv = crate::nix::instantiate(&comp.shell_file)?;
-		if std::fs::read_link(&cur.drv_root)
-			.map(|t| t == Path::new(&new_drv))
-			.unwrap_or(false)
-		{
-			return Ok(new_drv);
-		}
-	}
-
-	// Mint the next version (a real replacement, or the first entry).
-	let vpath = registry::version_path(base, registry::next_seq(base)?);
-	let drv = crate::nix::instantiate_rooted(&comp.shell_file, &vpath)?;
-	if let Err(e) = crate::nix::root_input_closure(&comp.shell_file, &registry::rt_root(&vpath)) {
-		eprintln!(
-			"clinix: warning: could not root `{}`'s full closure ({e}); \
-			 packages may be collected unless `keep-outputs = true`",
-			comp.label
-		);
-	}
-	registry::prune_versions(base, keep_total)?;
-	Ok(drv)
 }
 
 /// A resolved env's human label: its registry name, else the resolved directory's
@@ -566,7 +212,7 @@ pub(crate) fn env_label(env: &Env) -> String {
 }
 
 /// A `*.nix` file target's label: its file stem (`dev.nix` → `dev`).
-fn file_label(path: &Path) -> String {
+pub(crate) fn file_label(path: &Path) -> String {
 	path.file_stem()
 		.map(|s| s.to_string_lossy().into_owned())
 		.unwrap_or_else(|| "shell".to_string())
@@ -593,7 +239,11 @@ pub(crate) fn env_shell_file(root: &Path) -> Result<PathBuf> {
 /// (cwd/Dir/Member/bare); else a seed from the catalog (`namespace:name`, or a
 /// bare name — highest-precedence match, warning on a collision); else
 /// [`ClinixError::UnknownEnv`].
-fn resolve_node(cfg: &Config, catalog: &crate::env::seeds::Catalog, name: &str) -> Result<Node> {
+pub(crate) fn resolve_node(
+	cfg: &Config,
+	catalog: &crate::env::seeds::Catalog,
+	name: &str,
+) -> Result<Node> {
 	use crate::env::seeds::Resolved;
 	// File target: a `*.nix` path (or any existing file). A `.nix` name that does
 	// not exist is a clear error, not a fall-through to a registry/seed lookup.
@@ -644,64 +294,12 @@ fn resolve_node(cfg: &Config, catalog: &crate::env::seeds::Catalog, name: &str) 
 /// A resolved node's composition label — a seed's name, a registry/project env's
 /// [`env_label`], or a `*.nix` file's [`file_label`]. Shared by [`union_item`] (the
 /// composed shell) and [`resolve_stack_key`] (the offline key) so both agree.
-fn node_label(node: &Node) -> String {
+pub(crate) fn node_label(node: &Node) -> String {
 	match node {
 		Node::Env(env) => env_label(env),
 		Node::File { path } => file_label(path),
 		Node::Seed { name, .. } => name.clone(),
 	}
-}
-
-/// The `stack-<labels>` key that composing `names` would produce (sorted unless
-/// `ordered`), computed **offline** — label resolution only, no lock/eval/compose
-/// write. Lets `clean --union` / `clean -o` target the exact stack root a
-/// `shell`/`run` composition created.
-pub(crate) fn resolve_stack_key(
-	cfg: &Config,
-	catalog: &crate::env::seeds::Catalog,
-	names: &[String],
-	ordered: bool,
-) -> Result<String> {
-	let mut labels: Vec<String> = names
-		.iter()
-		.map(|n| resolve_node(cfg, catalog, n).map(|node| node_label(&node)))
-		.collect::<Result<_>>()?;
-	if !ordered {
-		labels.sort();
-	}
-	Ok(stack_key(labels.iter().map(String::as_str)))
-}
-
-/// The `stack-<labels>` GC-root key for a seed/union composition: each label
-/// slugged and joined by `-`. One source of truth shared by [`compose_nodes`] (all
-/// members) and [`node_root`] (a single seed → `stack-<label>`, since the join of
-/// one element is itself).
-fn stack_key<'a>(labels: impl Iterator<Item = &'a str>) -> String {
-	format!(
-		"stack-{}",
-		labels
-			.map(|l| crate::env::naming::slug(l, false, false, None))
-			.collect::<Vec<_>>()
-			.join("-")
-	)
-}
-
-/// The GC-root path a single target *would* have been rooted under, computed with
-/// **no side effects** (no compose-file write, no lazy locking, no network) — so
-/// `clean` can locate an env/seed/file/project root offline. Mirrors
-/// [`compose_nodes`]' single-target keying exactly: a registry/project env →
-/// [`registry::root_path`], a `*.nix` file → [`registry::file_root`], a single seed
-/// → `stack-<label>` (the union branch's key for one member).
-pub(crate) fn node_root(
-	cfg: &Config,
-	catalog: &crate::env::seeds::Catalog,
-	name: &str,
-) -> Result<PathBuf> {
-	Ok(match resolve_node(cfg, catalog, name)? {
-		Node::Env(env) => registry::root_path(cfg, &env),
-		Node::File { path } => registry::file_root(cfg, &path),
-		Node::Seed { name, .. } => registry::roots_dir(cfg).join(stack_key(std::iter::once(name.as_str()))),
-	})
 }
 
 /// The lockfile providing the seed catalog's nixpkgs pin: a configured
@@ -832,6 +430,7 @@ pub enum Cmd {
 	/// listing of every root family (`--size` for disk, `--json` for machine output).
 	Roots(diagnostics::Roots),
 }
+
 impl RunCmd for Cmd {
 	/// Pure dispatch. Verbs with a dedicated struct delegate to their own
 	/// `RunCmd` impl; verbs that share an arg shape delegate to a free function
@@ -902,6 +501,7 @@ pub struct Rename {
 	pub old: String,
 	pub new: String,
 }
+
 impl RunCmd for Rename {
 	/// Relabel a registry env: `mv envs/<old> envs/<new>` plus the `env-<name>`
 	/// GC-root rename ([`registry::rename`]), O(1) and rename-correct.
@@ -934,14 +534,6 @@ pub struct Targets {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn stack_key_joins_slugged_labels_and_a_single_label_is_itself() {
-		// One source of truth for the union key and node_root's single-seed key: the
-		// join of one element equals that element, so a lone seed keys `stack-<label>`.
-		assert_eq!(stack_key(std::iter::once("rust")), "stack-rust");
-		assert_eq!(stack_key(["rust", "claude"].into_iter()), "stack-rust-claude");
-	}
 
 	#[test]
 	fn env_shell_file_prefers_shell_nix_then_default_nix() {

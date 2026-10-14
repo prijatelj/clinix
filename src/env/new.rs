@@ -254,7 +254,14 @@ impl New {
 		let adopted = if src_versions.is_empty() {
 			false
 		} else {
-			try_adopt(cfg, &catalog, &self.name, &reg_shell, &src_versions, &settings)?
+			try_adopt(
+				cfg,
+				&catalog,
+				&self.name,
+				&reg_shell,
+				&src_versions,
+				&settings,
+			)?
 		};
 		if adopted {
 			println!("  adopted the source's existing build — no rebuild, no re-entry needed");
@@ -458,7 +465,10 @@ fn source_root_base(
 			},
 		))
 	} else {
-		Ok(registry::file_root(cfg, &std::fs::canonicalize(source_shell)?))
+		Ok(registry::file_root(
+			cfg,
+			&std::fs::canonicalize(source_shell)?,
+		))
 	}
 }
 

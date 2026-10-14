@@ -47,7 +47,9 @@ pub fn list(args: List, context: &Context) -> Result<()> {
 			.collect();
 		println!(
 			"{}",
-			serde_json::to_string_pretty(&serde_json::json!({ "registry_envs": envs, "seeds": seeds }))?
+			serde_json::to_string_pretty(
+				&serde_json::json!({ "registry_envs": envs, "seeds": seeds })
+			)?
 		);
 		return Ok(());
 	}

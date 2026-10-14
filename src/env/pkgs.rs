@@ -243,7 +243,11 @@ pub fn outdated(target: Target, context: &Context) -> Result<()> {
 		let rev = crate::nix::resolve_github_ref(&tgt.owner, &tgt.repo, &tgt.git_ref)?;
 		let old = tgt.locked_rev.as_deref();
 		if old == Some(rev.as_str()) {
-			println!("{}: up to date ({})", tgt.name, crate::relock::short_rev(&rev));
+			println!(
+				"{}: up to date ({})",
+				tgt.name,
+				crate::relock::short_rev(&rev)
+			);
 		} else {
 			println!(
 				"{}: OUTDATED {} -> {} (tracking {})",

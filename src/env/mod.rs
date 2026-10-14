@@ -9,10 +9,12 @@
 //!
 //! Layout: [`env`](self) holds the shared primitives (verb dispatch [`Cmd`], the
 //! [`RunCmd`] trait, [`Context`], [`resolve`], the env-name selectors, and
-//! `rename`); every concrete verb lives in its own sibling submodule and this
-//! module wires them together.
+//! `rename`); [`compose`] turns resolved targets into one instantiable
+//! expression and enters it; every concrete verb lives in its own sibling
+//! submodule and this module wires them together.
 
 mod clean;
+mod compose;
 pub mod config;
 mod diagnostics;
 mod env;
@@ -30,12 +32,12 @@ pub mod registry;
 pub mod seeds;
 mod wrap_shell;
 
+pub(crate) use compose::{compose_nodes, launch, node_root, resolve_stack_key};
 pub use diagnostics::{Deps, Info, InfoVerb, context_report};
 pub use env::{
 	Cmd, Context, Env, EnvArgs, Kind, OptionalTarget, Rename, RunCmd, ShellOptions, Target,
 	Targets, resolve,
 };
-pub(crate) use env::{compose_nodes, launch, node_root, resolve_stack_key};
 pub use execution::{Run, Shell};
 pub use export::{Export, ExportTarget};
 pub use import::Import;

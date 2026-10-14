@@ -373,7 +373,10 @@ mod tests {
 	#[test]
 	fn rt_root_appends_suffix_without_clobbering_a_dotted_slug() {
 		// `with_extension` would turn `…my.proj` into `…my.rt`; we must keep the slug.
-		assert_eq!(rt_root(Path::new("/s/roots/env-python")), Path::new("/s/roots/env-python.rt"));
+		assert_eq!(
+			rt_root(Path::new("/s/roots/env-python")),
+			Path::new("/s/roots/env-python.rt")
+		);
 		assert_eq!(
 			rt_root(Path::new("/s/roots/proj-home_u_my.proj")),
 			Path::new("/s/roots/proj-home_u_my.proj.rt")
@@ -420,7 +423,11 @@ mod tests {
 		// A `.rt` sibling must not be counted as its own version.
 		std::fs::write(rt_root(&version_path(&base, 3)), "rt").unwrap();
 
-		let seqs: Vec<u64> = list_versions(&base).unwrap().iter().map(|v| v.seq).collect();
+		let seqs: Vec<u64> = list_versions(&base)
+			.unwrap()
+			.iter()
+			.map(|v| v.seq)
+			.collect();
 		assert_eq!(seqs, vec![1, 2, 3], "sorted ascending; `.rt` excluded");
 		assert_eq!(next_seq(&base).unwrap(), 4);
 	}
@@ -434,9 +441,16 @@ mod tests {
 		}
 		// keep = current + 1 prior → newest two survive, older `.drv` + `.rt` pruned.
 		prune_versions(&base, 2).unwrap();
-		let seqs: Vec<u64> = list_versions(&base).unwrap().iter().map(|v| v.seq).collect();
+		let seqs: Vec<u64> = list_versions(&base)
+			.unwrap()
+			.iter()
+			.map(|v| v.seq)
+			.collect();
 		assert_eq!(seqs, vec![3, 4]);
-		assert!(!rt_root(&version_path(&base, 1)).exists(), "pruned .rt gone too");
+		assert!(
+			!rt_root(&version_path(&base, 1)).exists(),
+			"pruned .rt gone too"
+		);
 
 		assert_eq!(
 			resolve_version(&base, VersionSelect::Current).unwrap(),
@@ -496,8 +510,15 @@ mod tests {
 		touch_version(&base, 2);
 
 		assert!(release_version(&base, 1).unwrap());
-		assert!(!rt_root(&version_path(&base, 1)).exists(), "its .rt goes too");
-		let seqs: Vec<u64> = list_versions(&base).unwrap().iter().map(|v| v.seq).collect();
+		assert!(
+			!rt_root(&version_path(&base, 1)).exists(),
+			"its .rt goes too"
+		);
+		let seqs: Vec<u64> = list_versions(&base)
+			.unwrap()
+			.iter()
+			.map(|v| v.seq)
+			.collect();
 		assert_eq!(seqs, vec![2], "only the targeted version is gone");
 		assert!(!release_version(&base, 9).unwrap(), "absent seq → false");
 	}
@@ -510,7 +531,11 @@ mod tests {
 			touch_version(&base, seq);
 		}
 		assert_eq!(release_oldest(&base, 2).unwrap(), vec![1, 2]);
-		let seqs: Vec<u64> = list_versions(&base).unwrap().iter().map(|v| v.seq).collect();
+		let seqs: Vec<u64> = list_versions(&base)
+			.unwrap()
+			.iter()
+			.map(|v| v.seq)
+			.collect();
 		assert_eq!(seqs, vec![3, 4]);
 		// `n` beyond the count releases all remaining, reporting only what existed.
 		assert_eq!(release_oldest(&base, 10).unwrap(), vec![3, 4]);
