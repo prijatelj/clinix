@@ -141,13 +141,22 @@ impl New {
 			}
 			None => false,
 		};
-		let label = seeds
+		let seed_label = seeds
 			.iter()
 			.map(|(n, _)| n.as_str())
 			.collect::<Vec<_>>()
 			.join(" ");
 		// `-p` is a global flag (see `crate::cli`), so it arrives via `Context`.
 		let packages = ctx.options.packages.clone();
+		// A packages-only env (`new tools -p tokei`) has no seed to name it, so fall
+		// back to the package list — otherwise the generated shell gets an empty
+		// derivation `name` and exports an empty `$name`. Same fallback as
+		// [`crate::env::compose`]'s ad-hoc writer, for the same reason.
+		let label = if seed_label.is_empty() {
+			packages.join(" ")
+		} else {
+			seed_label.clone()
+		};
 		std::fs::write(
 			dest.join("shell.nix"),
 			render_composed_shell(&seeds, &label, with_config, &packages),
@@ -158,10 +167,10 @@ impl New {
 			"clinix: created registry env `{}` from {} seed(s){}",
 			self.name,
 			seeds.len(),
-			if label.is_empty() {
+			if seed_label.is_empty() {
 				String::new()
 			} else {
-				format!(": {label}")
+				format!(": {seed_label}")
 			}
 		);
 		if !packages.is_empty() {

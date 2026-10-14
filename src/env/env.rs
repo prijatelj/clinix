@@ -482,9 +482,6 @@ Command groups:
   management   init new rename add remove flake update outdated verify import export clean
   execution    shell run
   diagnostics  list info deps shared check roots")]
-// Args XOR subcommands, so `clinix env rust claude` parses as the flattened
-// `Shell` below — the same clap-native sugar the top level uses (`crate::cli`).
-#[command(args_conflicts_with_subcommands = true)]
 pub struct EnvArgs {
 	#[command(subcommand)]
 	pub cmd: Option<Cmd>,

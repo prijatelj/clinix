@@ -16,6 +16,13 @@
 //! `--prior`, …) rather than only the ones a hand-written splitter knew about: a
 //! flag is declared once, on `Shell`, and clap does the parsing at both levels.
 //!
+//! **Do not add `args_conflicts_with_subcommands`.** It reads like the right
+//! setting for "names XOR a verb", but it means args XOR subcommands *literally*:
+//! with it set, any global flag given before a verb (`clinix -o env shell …`)
+//! suppresses subcommand matching, and the verb is swallowed as an env name. It is
+//! unnecessary anyway — clap already prefers a matching subcommand over the
+//! flattened positional.
+//!
 //! Global flags (`-o`, `-r`, `-v`, `-p`/`--pkg`) are declared once here. `-p` is
 //! global rather than per verb because the ad-hoc package set is part of the
 //! composition *request*, which every verb reads from [`Context`].
@@ -35,9 +42,6 @@ use crate::sys::SysArgs;
 #[derive(Parser, Debug)]
 #[command(name = "clinix", version, propagate_version = true)]
 #[command(about = "Manage Nix environments (env) and a NixOS system (sys).")]
-// Args XOR subcommands: a token list matching no subcommand is parsed as the
-// flattened `Shell` below — the bare-name sugar, without a hand-rolled splitter.
-#[command(args_conflicts_with_subcommands = true)]
 pub struct Cli {
 	/// Increase verbosity (repeatable: `-v`, `-vv`).
 	#[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]

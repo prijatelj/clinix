@@ -43,24 +43,31 @@ clinix [-v] [-o] [-r] [--config DIR] [--state-dir DIR] <command | names…>
 | **diagnostics** | `list` `info` `deps` `shared` `check` `roots` |
 
 Global flags are declared once at the top level and read by whichever verb needs
-them, so the bare-name sugar can still carry them:
+them:
 
 | flag | meaning |
 |---|---|
 | `-o`, `--ordered` | compose in the order given instead of sorting lexically (later entries win on `PATH`) |
+| `-p`, `--pkgs` / `--pkg` | ad-hoc packages layered onto the composition — see §6 |
 | `-r`, `--runtime` | *accepted but currently inert* — see the note on project composition in §6 |
 | `-v`, `--verbose` | repeatable |
 | `--config DIR` | override the config dir (else `$CLINIX_CONFIG_DIR`, `$XDG_CONFIG_HOME/clinix`, `~/.config/clinix`) |
 | `--state-dir DIR` | override the state dir (else `$CLINIX_STATE_DIR`, `$XDG_STATE_HOME/clinix`, `~/.local/state/clinix`) |
 
-Two things worth knowing immediately:
+Three things worth knowing immediately:
 
 - **`clinix` with no arguments prints help** — it does *not* enter the current
   directory. Enter the cwd project explicitly with `clinix .` or `clinix env shell`.
-- **The bare-name form is terminal.** `clinix rust claude` composes those envs;
-  no verb may follow the names. A name that collides with a top-level command
-  (`env`, `sys`, `info`, `config`, …) is taken as that command — use
-  `clinix env <name>` for such an env.
+  Bare `clinix env` likewise prints the `env` help.
+- **The sugar takes every `env shell` flag.** `clinix <names…>` is not a
+  special-cased token list — it *is* `env shell`, parsed by the same argument
+  definition, so `clinix rust claude --pure`, `--prior 1`, `--root-version 4`,
+  and `-p` all work exactly as they do after `env shell`. The same holds one
+  level down for `clinix env <names…>`.
+- **A name that collides with a verb loses to the verb.** `clinix info` runs the
+  `info` command, not an env called `info`; use `clinix env shell info` for such
+  an env. Equally, no verb may follow the names — once the names start, every
+  later bare token is another name.
 
 ### Configuration
 
@@ -390,8 +397,14 @@ Two spellings, because the name list beside them is also variadic:
 
 | form | behaviour |
 |---|---|
-| `-p` / `--pkgs` | **greedy** — every remaining bare token is a package, not an env |
-| `--pkg <one>` | exactly one package; bare tokens after it are envs again |
+| `-p` / `--pkgs` | **greedy** — every remaining bare token is a package, not an env. Terminal, so its packages are always the trailing group |
+| `--pkg <one>` | exactly one package; bare tokens after it are envs again, so it can sit *between* env names |
+
+> **Not yet layered.** `--pkg` exists so its **position** can place a package in
+> the layering, between the envs either side of it. That part is unbuilt: the
+> interleaved form above parses correctly, but every ad-hoc package currently
+> lands in the composed shell's own `packages` list rather than at its slot in
+> `inputsFrom`. Envs still layer correctly among themselves. See `brief_todo.md`.
 
 **Which pin resolves them.** Whatever lock is active at the layer you are on: the
 env's own lock for a project/registry/file target, the shared lock of a mixed
@@ -669,6 +682,24 @@ key no longer has a GC root is deleted, since the next entry of that composition
 rewrites it. That covers both unions whose roots you just released and ephemeral
 `-p` shells, which never rooted one at all.
 
+### Legacy unversioned roots
+
+Roots written before versioning are a bare `roots/<key>` with no `@<seq>`. They
+are still live GC roots, but they are not versions, so the version-aware paths
+once stepped straight past them — `clean` would report "no GC root" while the
+symlink kept the whole closure alive, with no way to reclaim that disk.
+
+They are now handled wherever a key's roots are owned: a whole-env
+`clinix env clean <name>` releases them, `clean --dry-run` reports them, `rename`
+re-keys them instead of stranding them under the old name, and entering the env
+once drops the bare root as soon as the first versioned one is minted — so an env
+left over from an older clinix heals itself.
+
+Two caveats. The version-targeted selectors (`--root-version`, `--oldest`)
+deliberately skip them, since a legacy root has no `seq` to name; use the
+whole-env form. And `env roots` still lists such a key as `(0 versions)` — a
+cosmetic gap, not a functional one.
+
 ### Auditing the shell you are in
 
 ```sh
@@ -758,15 +789,24 @@ Every one of these **errors clearly** rather than degrading silently:
 | what | status |
 |---|---|
 | `env init --from <spec>` (adopt a `pyproject.toml`/`Cargo.toml`) | later phase |
-| `env init -p pkg=version`, `env add/remove pkg=version` | needs package-level version pinning |
+| `env init -p pkg=version`, `env add/remove pkg=version`, `-p pkg=version` | needs package-level version pinning; `nix-shell -p` has no version syntax either |
 | `env update <pkg>` (per-package version update) | later phase |
 | `env update` on a shell-only (embedded-lock) env | re-embedding is a later slice |
 | composing envs with **differing** `flake.lock`s | only a shared pin is supported |
+| a `--shell-only` env joining a union | the shared-pin check needs a lock *file*; `flake . wrap-shell` expands it |
 | implicit project composition (runtime ∪ dev seeds) and therefore `-r`/`--runtime` | name the seeds explicitly: `clinix python .` |
 | `env new <ns>:<member> --from <seeds…>` | register a single shell into a member instead |
+| `env new --from <dir-or-file> -p <pkgs…>` (register mode) | register mode wraps the source shell, so there is no `packages` list to splice into; `env add` after registering |
 | `sys init` / `sys switch` / `sys rollback` | use `nixos-rebuild --file` |
 | self-contained **seeds** (a seed bringing its own pin) and flake seeds | deferred together |
 | per-input `update`, per-input `freeze` | whole-env today; `flake rm` + `add` is the workaround |
+
+Two that do **not** error — they silently do less than the syntax suggests:
+
+| what | status |
+|---|---|
+| `--pkg` layering by position | parses correctly, but the package lands in the composed shell's own `packages` list rather than at its slot between the envs (§6) |
+| `env roots` on a legacy unversioned root | lists the key as `(0 versions)`; `clean` handles it correctly (§8) |
 
 ---
 
