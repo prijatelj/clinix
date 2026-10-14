@@ -243,6 +243,13 @@ pub fn release_oldest(base: &std::path::Path, n: usize) -> Result<Vec<u64>> {
 /// `.drv` + `.rt` roots (releasing their closures). `keep` = `keep_n_prior_roots + 1`.
 pub fn prune_versions(base: &std::path::Path, keep: usize) -> Result<()> {
 	let versions = list_versions(base)?;
+	// A legacy unversioned root predates every minted version by construction, so
+	// the first mint supersedes it: drop it here (before the `keep` check, which
+	// would otherwise return early) and an env written by an older clinix
+	// self-heals on its next entry instead of leaking that closure forever.
+	if !versions.is_empty() {
+		release_legacy_root(base)?;
+	}
 	if versions.len() <= keep {
 		return Ok(());
 	}
@@ -302,13 +309,59 @@ pub fn rename(cfg: &Config, old: &str, new: &str) -> Result<()> {
 			fs::rename(old_rt, rt_root(&new_drv))?;
 		}
 	}
+	// A legacy unversioned root (see [`release_legacy_root`]) is invisible to
+	// `list_versions`, so without this it would be stranded under the old name —
+	// reachable by no env, and so unreleasable by `clean <new>`.
+	if old_base.symlink_metadata().is_ok() {
+		fs::rename(&old_base, &new_base)?;
+	}
+	let old_rt = rt_root(&old_base);
+	if old_rt.symlink_metadata().is_ok() {
+		fs::rename(old_rt, rt_root(&new_base))?;
+	}
 	Ok(())
 }
 
+/// Whether a **legacy unversioned** root exists for this key: the bare
+/// `roots/<key>` that clinix wrote before roots were versioned.
+///
+/// [`list_versions`] matches only `<key>@<seq>`, by design — a bare file is not a
+/// version. The consequence was a hole: such a root is invisible to every
+/// version-aware path, so [`release_root`] reported "no GC root" while the bare
+/// symlink kept the env's entire closure alive, with no way to reclaim that disk
+/// through clinix at all. The three places that own a key's roots now close it —
+/// this function is the one implementation they share.
+///
+/// Reclaimed by a whole-env release ([`release_root`]) or automatically on the
+/// next entry ([`prune_versions`]). The version-targeted selectors
+/// (`--root-version`, `--oldest`) deliberately do **not** touch it: a legacy root
+/// has no `seq` to name.
+pub fn has_legacy_root(base: &std::path::Path) -> bool {
+	base.symlink_metadata().is_ok()
+}
+
+/// Release a legacy unversioned root. See [`has_legacy_root`] for the
+/// non-destructive check previews use.
+pub fn release_legacy_root(base: &std::path::Path) -> Result<bool> {
+	let mut released = false;
+	for p in [base.to_path_buf(), rt_root(base)] {
+		match fs::remove_file(&p) {
+			Ok(()) => released = true,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+			Err(e) => return Err(e.into()),
+		}
+	}
+	Ok(released)
+}
+
 /// Release a GC root **and its `.rt` sibling** so `nix-collect-garbage` can reap the
-/// env's store paths. Returns whether *either* was present (so callers can report a
+/// env's store paths. Returns whether *any* was present (so callers can report a
 /// no-op accurately). Removes the symlinks only — the env's `shell.nix`/`flake.lock`
 /// are untouched.
+///
+/// Covers every version **and** a legacy unversioned root
+/// ([`release_legacy_root`]), so a whole-env `clean` always reclaims everything
+/// keyed to that env.
 pub fn release_root(base: &std::path::Path) -> Result<bool> {
 	let mut released = false;
 	for v in list_versions(base)? {
@@ -320,6 +373,7 @@ pub fn release_root(base: &std::path::Path) -> Result<bool> {
 			}
 		}
 	}
+	released |= release_legacy_root(base)?;
 	Ok(released)
 }
 
@@ -399,6 +453,86 @@ mod tests {
 	fn touch_version(base: &Path, seq: u64) {
 		std::fs::write(version_path(base, seq), format!("drv{seq}")).unwrap();
 		std::fs::write(rt_root(&version_path(base, seq)), "rt").unwrap();
+	}
+
+	/// Write a **legacy unversioned** root pair (bare `<base>` + `<base>.rt`), the
+	/// shape clinix produced before roots were versioned.
+	fn touch_legacy(base: &Path) {
+		std::fs::write(base, "drv").unwrap();
+		std::fs::write(rt_root(base), "rt").unwrap();
+	}
+
+	#[test]
+	fn release_root_reclaims_a_legacy_unversioned_root() {
+		// The regression: `list_versions` sees no `<key>@<seq>`, so this used to
+		// report "nothing to release" while the bare symlink pinned the closure.
+		let dir = tempfile::tempdir().unwrap();
+		let base = dir.path().join("stack-base");
+		touch_legacy(&base);
+		assert!(list_versions(&base).unwrap().is_empty(), "not a version");
+
+		assert!(release_root(&base).unwrap(), "legacy root is reclaimable");
+		assert!(!base.exists() && !rt_root(&base).exists());
+		assert!(!release_root(&base).unwrap(), "second release is a no-op");
+	}
+
+	#[test]
+	fn release_root_reclaims_versions_and_a_legacy_root_together() {
+		let dir = tempfile::tempdir().unwrap();
+		let base = dir.path().join("env-mixed");
+		touch_legacy(&base);
+		touch_version(&base, 1);
+
+		assert!(release_root(&base).unwrap());
+		assert!(list_versions(&base).unwrap().is_empty());
+		assert!(!base.exists(), "the legacy root went too");
+	}
+
+	#[test]
+	fn prune_drops_a_legacy_root_once_a_version_exists() {
+		let dir = tempfile::tempdir().unwrap();
+		let base = dir.path().join("env-heal");
+		touch_legacy(&base);
+		touch_version(&base, 1);
+
+		// `keep` exceeds the version count, so the early return is the path under
+		// test: the legacy root must still go, since the mint superseded it.
+		prune_versions(&base, 5).unwrap();
+		assert!(!base.exists(), "superseded legacy root released");
+		assert!(rt_root(&base).symlink_metadata().is_err());
+		let seqs: Vec<u64> = list_versions(&base).unwrap().iter().map(|v| v.seq).collect();
+		assert_eq!(seqs, vec![1], "the real version is untouched");
+	}
+
+	#[test]
+	fn prune_keeps_a_legacy_root_when_nothing_has_superseded_it() {
+		let dir = tempfile::tempdir().unwrap();
+		let base = dir.path().join("env-lonely");
+		touch_legacy(&base);
+		prune_versions(&base, 2).unwrap();
+		assert!(base.exists(), "no version yet — nothing superseded it");
+	}
+
+	#[test]
+	fn rename_rekeys_a_legacy_root_instead_of_stranding_it() {
+		let dir = tempfile::tempdir().unwrap();
+		let cfg = Config {
+			config_dir: dir.path().join("c"),
+			state_dir: dir.path().to_path_buf(),
+		};
+		std::fs::create_dir_all(envs_dir(&cfg).join("old")).unwrap();
+		std::fs::create_dir_all(roots_dir(&cfg)).unwrap();
+		let old_base = roots_dir(&cfg).join("env-old");
+		touch_legacy(&old_base);
+
+		rename(&cfg, "old", "new").unwrap();
+
+		let new_base = roots_dir(&cfg).join("env-new");
+		assert!(new_base.exists(), "legacy root followed the rename");
+		assert!(rt_root(&new_base).exists());
+		assert!(!old_base.exists(), "nothing stranded under the old key");
+		// And it is now reachable by the new name.
+		assert!(release_root(&new_base).unwrap());
 	}
 
 	#[test]

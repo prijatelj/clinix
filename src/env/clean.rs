@@ -220,13 +220,22 @@ fn release_one(label: &str, base: &std::path::Path, args: &Clean) -> Result<()> 
 					ids.join(" ")
 				);
 			}
-		} else if versions.is_empty() {
-			println!("clinix: `{label}` had no GC root (nothing to release)");
 		} else {
-			println!(
-				"clinix: would release all {} version(s) of `{label}`",
-				versions.len()
-			);
+			// Predict exactly what the real release does — which includes a legacy
+			// unversioned root that `list_versions` cannot see.
+			let legacy = registry::has_legacy_root(base);
+			let mut what = Vec::new();
+			if !versions.is_empty() {
+				what.push(format!("all {} version(s)", versions.len()));
+			}
+			if legacy {
+				what.push("a legacy unversioned root".to_string());
+			}
+			if what.is_empty() {
+				println!("clinix: `{label}` had no GC root (nothing to release)");
+			} else {
+				println!("clinix: would release {} of `{label}`", what.join(" and "));
+			}
 		}
 		return Ok(());
 	}
