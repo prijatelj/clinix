@@ -193,7 +193,14 @@ pub(crate) fn warn_name_collision(cfg: &Config, name: &str) {
 pub(crate) enum Node {
 	Env(Env),
 	File { path: PathBuf },
-	Seed { name: String, path: PathBuf },
+	Seed {
+		name: String,
+		path: PathBuf,
+		/// The fragment asked for the declared `[env.pins]` set — carried from the
+		/// catalog ([`crate::env::seeds::Seed::wants_pins`]) so composition does not
+		/// re-parse the file.
+		wants_pins: bool,
+	},
 }
 
 /// A resolved env's human label: its registry name, else the resolved directory's
@@ -263,6 +270,7 @@ pub(crate) fn resolve_node(
 			Some(Resolved::One(seed)) => Ok(Node::Seed {
 				name: seed.name.clone(),
 				path: seed.path.clone(),
+				wants_pins: seed.wants_pins,
 			}),
 			Some(Resolved::Collision { chosen, others }) => {
 				// Prefer the `namespace:name` selector; a seed without a namespace
@@ -283,6 +291,7 @@ pub(crate) fn resolve_node(
 				Ok(Node::Seed {
 					name: chosen.name.clone(),
 					path: chosen.path.clone(),
+					wants_pins: chosen.wants_pins,
 				})
 			}
 			None => Err(ClinixError::UnknownEnv(name.to_string())),
@@ -306,22 +315,63 @@ pub(crate) fn node_label(node: &Node) -> String {
 /// `flake_lock` path, or a ref clinix lazily locks into `<config>/flake.lock`
 /// (default `nixos-26.05`). Never a channel (the design's §0).
 pub(crate) fn seed_lock(cfg: &Config, settings: &crate::env::config::Settings) -> Result<PathBuf> {
-	use crate::env::config::{NixpkgsPin, expand_tilde};
+	use crate::env::config::NixpkgsPin;
 	match &settings.env.nixpkgs {
-		Some(NixpkgsPin::FlakeLock { flake_lock }) => {
+		Some(pin) => pin_lock(cfg, pin, None),
+		// Unset ⇒ the latest stable, locked lazily like any other ref.
+		None => pin_lock(cfg, &NixpkgsPin::Ref("nixos-26.05".to_string()), None),
+	}
+}
+
+/// Resolve **any** nixpkgs pin — the stack pin (`[env].nixpkgs`, `name = None`) or a
+/// named alternate (`[env.pins].<name>`) — to the lockfile it denotes. One function
+/// so both kinds accept the identical two spellings and report errors identically:
+///
+/// - `{ flake_lock = "…" }` — an existing lock is authoritative, and must exist;
+/// - `"<ref>"` — a branch/tag/rev clinix lazily locks **once** (network) into
+///   `<config>/flake.lock` for the stack pin, or `<config>/locks/<name>.lock` for a
+///   named one. An existing file at that path is adopted as-is, never overwritten,
+///   so a lock you wrote yourself (or moved there) is picked up unchanged.
+pub(crate) fn pin_lock(
+	cfg: &Config,
+	pin: &crate::env::config::NixpkgsPin,
+	name: Option<&str>,
+) -> Result<PathBuf> {
+	use crate::env::config::{NixpkgsPin, expand_tilde};
+	// Where a `Ref` gets lazily locked, and how to name this pin in an error.
+	let (lazy_path, label) = match name {
+		Some(n) => (cfg.config_dir.join("locks").join(format!("{n}.lock")), format!("[env.pins].{n}")),
+		None => (cfg.config_dir.join("flake.lock"), "[env].nixpkgs".to_string()),
+	};
+	match pin {
+		NixpkgsPin::FlakeLock { flake_lock } => {
 			let p = expand_tilde(flake_lock);
 			if p.is_file() {
 				Ok(p)
 			} else {
 				Err(ClinixError::Config(format!(
-					"[env].nixpkgs.flake_lock not found: {}",
+					"{label}.flake_lock not found: {}",
 					p.display()
 				)))
 			}
 		}
-		Some(NixpkgsPin::Ref(r)) => ensure_seed_lock(cfg, r),
-		None => ensure_seed_lock(cfg, "nixos-26.05"),
+		NixpkgsPin::Ref(r) => ensure_lock(r, &lazy_path),
 	}
+}
+
+/// Every declared `[env.pins]` entry resolved to its lockfile, in config order.
+/// Called only when a composition member actually asked for `pins`, so an unused
+/// `[env.pins]` never triggers the lazy locking (and never touches the network).
+pub(crate) fn named_pins(
+	cfg: &Config,
+	settings: &crate::env::config::Settings,
+) -> Result<Vec<(String, PathBuf)>> {
+	settings
+		.env
+		.pins
+		.iter()
+		.map(|(name, pin)| Ok((name.clone(), pin_lock(cfg, pin, Some(name))?)))
+		.collect()
 }
 
 /// The optional nixpkgs `config` file (`[env].nixpkgs_config`, e.g. an
@@ -347,20 +397,23 @@ pub(crate) fn nixpkgs_config_path(
 	}
 }
 
-/// Lazily create `<config>/flake.lock` pinning nixpkgs to `nixpkgs_ref` (network,
-/// once), reusing `init`'s classic lock builder. Committable — the user's pin.
-fn ensure_seed_lock(cfg: &Config, nixpkgs_ref: &str) -> Result<PathBuf> {
-	let lock = cfg.config_dir.join("flake.lock");
+/// Lazily create `lock` pinning nixpkgs to `nixpkgs_ref` (network, **once**),
+/// reusing `init`'s classic lock builder. Committable — the user's pin. An existing
+/// file is returned untouched, which is what makes a hand-written or relocated lock
+/// adoptable: declare the ref, drop the lock at the path, and clinix uses it.
+fn ensure_lock(nixpkgs_ref: &str, lock: &Path) -> Result<PathBuf> {
 	if lock.is_file() {
-		return Ok(lock);
+		return Ok(lock.to_path_buf());
 	}
 	// Silent for now (no `--quiet` on launch); the same first-run lock could show
 	// progress if wanted — see `crate::progress`.
 	let built =
 		crate::env::init::build_nixpkgs_lock(nixpkgs_ref, &crate::progress::Progress::silent())?;
-	std::fs::create_dir_all(&cfg.config_dir)?;
-	std::fs::write(&lock, built.to_json())?;
-	Ok(lock)
+	if let Some(parent) = lock.parent() {
+		std::fs::create_dir_all(parent)?;
+	}
+	std::fs::write(lock, built.to_json())?;
+	Ok(lock.to_path_buf())
 }
 
 /// The unified verb set. Every verb takes an env name (or several, for the

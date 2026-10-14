@@ -16,6 +16,7 @@
 //! and avoiding the dependency keeps the single-static-binary property. The plan
 //! lists `etcetera` as an option; this is the deliberate minimal alternative.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -134,6 +135,15 @@ pub struct EnvSettings {
 	/// predicate), applied when building seeds. If unset, clinix passes no explicit
 	/// config, so nixpkgs uses its default (`~/.config/nixpkgs/config.nix`).
 	pub nixpkgs_config: Option<PathBuf>,
+	/// `[env.pins]` — **named alternate nixpkgs pins**, each the same shape as
+	/// [`Self::nixpkgs`] (a ref clinix locks, or an existing lockfile).
+	///
+	/// These do not change any stack's pin. They are offered to a seed that asks for
+	/// them (a `{ pkgs, pins }:` fragment), so one package can come from a different
+	/// nixpkgs than the rest of the stack — the narrow, declared form of the
+	/// otherwise-deferred multi-pin composition. A seed that does not name `pins` is
+	/// unaffected, and a declared-but-unreferenced pin is never fetched.
+	pub pins: BTreeMap<String, NixpkgsPin>,
 	pub seeds: SeedSettings,
 	/// `[env.gc]` — GC-root retention policy.
 	pub gc: GcSettings,
@@ -344,6 +354,25 @@ nixpkgs = "nixos-26.05"
 # If unset, nixpkgs uses its default (~/.config/nixpkgs/config.nix).
 # nixpkgs_config = "~/dev_env/nixpkgs-config.nix"
 
+# Named ALTERNATE nixpkgs pins, each the same shape as [env].nixpkgs above (a ref
+# clinix locks, or an existing lockfile). They never change a stack's pin: they are
+# handed to a seed that asks for them, so one package can come from a different
+# nixpkgs than everything else in the shell.
+#
+#   [env.pins]
+#   unstable = "nixos-unstable"                              # clinix locks it into
+#                                                            # <config>/locks/unstable.lock
+#   old      = { flake_lock = "~/.config/clinix/locks/old.lock" }   # existing lock
+#
+# A seed opts in by accepting the argument, and indexes the pin by name:
+#
+#   { pkgs, pins }:
+#   pkgs.mkShell { packages = [ pins.unstable.claude-code ]; }
+#
+# A seed that does not name `pins` is passed exactly what it was before, and a
+# declared pin nothing references is never fetched (nix attrsets are lazy).
+# Advance one with `clinix env update --pin unstable`.
+
 [env.gc]
 # How many PRIOR root versions to keep when a new version replaces the current one,
 # in addition to the current. 0 (default) releases the outgoing version immediately
@@ -414,6 +443,14 @@ impl Settings {
 				registry: other.env.registry.or(self.env.registry),
 				nixpkgs: other.env.nixpkgs.or(self.env.nixpkgs),
 				nixpkgs_config: other.env.nixpkgs_config.or(self.env.nixpkgs_config),
+				// Per-key merge (`other` wins a name collision), matching how the list
+				// settings concatenate `other` first: a local config can redefine one
+				// pin without restating the imported ones.
+				pins: {
+					let mut pins = self.env.pins;
+					pins.extend(other.env.pins);
+					pins
+				},
 				seeds: SeedSettings {
 					sources: concat_first(other.env.seeds.sources, self.env.seeds.sources),
 					ignore: concat_first(other.env.seeds.ignore, self.env.seeds.ignore),
@@ -591,6 +628,57 @@ ignore = ["_*.nix"]
 		assert_eq!(s.env.seeds.sources.len(), 2);
 		assert_eq!(s.env.seeds.sources[0].namespace.as_deref(), Some("dev"));
 		assert_eq!(s.env.seeds.ignore, vec!["_*.nix".to_string()]);
+	}
+
+	#[test]
+	fn env_pins_accept_both_spellings_and_default_to_none() {
+		let dir = tempfile::tempdir().unwrap();
+		write(
+			dir.path(),
+			"config.toml",
+			r#"
+[env]
+nixpkgs = { flake_lock = "~/nixos/flake.lock" }
+[env.pins]
+unstable = "nixos-unstable"
+held = { flake_lock = "~/.config/clinix/locks/held.lock" }
+"#,
+		);
+		let s = Settings::load(dir.path()).unwrap();
+		// A named pin takes the *same* two shapes as the stack pin — a ref clinix
+		// locks, or an existing lockfile — because both go through `pin_lock`.
+		assert!(matches!(s.env.pins.get("unstable"), Some(NixpkgsPin::Ref(r)) if r == "nixos-unstable"));
+		assert!(matches!(
+			s.env.pins.get("held"),
+			Some(NixpkgsPin::FlakeLock { .. })
+		));
+		assert_eq!(s.env.pins.len(), 2);
+		// Absent section ⇒ no pins, which is what keeps every existing config and
+		// every existing seed behaving exactly as before.
+		assert!(Settings::default().env.pins.is_empty());
+	}
+
+	#[test]
+	fn env_pins_merge_per_key_with_the_local_config_winning() {
+		let dir = tempfile::tempdir().unwrap();
+		write(
+			dir.path(),
+			"base.toml",
+			"[env.pins]\nunstable = \"nixos-unstable\"\nold = \"nixos-25.05\"\n",
+		);
+		write(
+			dir.path(),
+			"config.toml",
+			&format!(
+				"use = [\"{}/base.toml\"]\n[env.pins]\nold = \"nixos-24.11\"\n",
+				dir.path().display()
+			),
+		);
+		let s = Settings::load(dir.path()).unwrap();
+		// The imported pin survives; the redefined one takes the local value — so a
+		// local config can override one pin without restating the rest.
+		assert!(matches!(s.env.pins.get("unstable"), Some(NixpkgsPin::Ref(r)) if r == "nixos-unstable"));
+		assert!(matches!(s.env.pins.get("old"), Some(NixpkgsPin::Ref(r)) if r == "nixos-24.11"));
 	}
 
 	#[test]

@@ -252,7 +252,7 @@ fn new_from_materializes_seeds_into_a_portable_registry_env() {
 		"unions the local copy"
 	);
 	assert!(
-		shell.contains("builtins.readFile ./flake.lock"),
+		shell.contains("pkgs = pkgsOf ./flake.lock;"),
 		"reads the local lock"
 	);
 }
@@ -294,7 +294,7 @@ fn new_register_non_copy_references_source_and_establishes_pin() {
 	// Non-copy: the wrapper imports the source's absolute path and injects pkgs.
 	let wrapper = std::fs::read_to_string(p.env_dir("myenv").join("shell.nix")).unwrap();
 	assert!(wrapper.contains(&format!("import \"{}\" {{ inherit pkgs; }}", abs.display())));
-	assert!(wrapper.contains("builtins.readFile ./flake.lock"));
+	assert!(wrapper.contains("pkgs = pkgsOf ./flake.lock;"));
 	// The source's lock is established as the namespace pin.
 	assert!(p.env_dir("myenv").join("flake.lock").is_file());
 	assert!(
@@ -334,7 +334,7 @@ fn new_register_member_creates_empty_namespace_and_shares_the_pin() {
 	assert!(
 		std::fs::read_to_string(&member)
 			.unwrap()
-			.contains("builtins.readFile ../flake.lock")
+			.contains("pkgs = pkgsOf ../flake.lock;")
 	);
 	assert!(
 		p.env_dir("proj").join("flake.lock").is_file(),

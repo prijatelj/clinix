@@ -24,6 +24,11 @@ pub struct Seed {
 	pub name: String,
 	pub namespace: Option<String>,
 	pub path: PathBuf,
+	/// Whether this fragment's argument pattern accepts the declared `[env.pins]`
+	/// set (see [`accepts_pins`]). Clinix passes `pins` **only** to seeds that asked,
+	/// because a strict attrset pattern (`{ pkgs }:`) errors on an unexpected
+	/// argument — so every existing seed keeps being called exactly as before.
+	pub wants_pins: bool,
 }
 
 /// How a candidate `*.nix` classifies under the shell-file gate.
@@ -165,11 +170,13 @@ impl Catalog {
 				return;
 			}
 		};
-		match classify(&src) {
+		let info = inspect(&src);
+		match info.kind {
 			SeedKind::Shell => self.seeds.push(Seed {
 				name,
 				namespace: namespace.clone(),
 				path: file.to_path_buf(),
+				wants_pins: info.wants_pins,
 			}),
 			SeedKind::Flake => self.warnings.push(format!(
 				"{}: looks like a flake.nix (flake seeds not supported yet) — skipped",
@@ -186,15 +193,80 @@ impl Catalog {
 /// attrset carrying an `outputs` attribute → [`SeedKind::Flake`]; otherwise a
 /// usable [`SeedKind::Shell`]. Cheap: syntactic parse only, no eval.
 pub fn classify(src: &str) -> SeedKind {
+	inspect(src).kind
+}
+
+/// What one syntactic pass over a candidate `*.nix` tells us: whether it is a usable
+/// seed, and whether it asked for the declared `[env.pins]` set. Both answers come
+/// from the **same** `rnix` parse — the file is read and parsed once per catalog
+/// build, not once per question.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SeedInfo {
+	pub kind: SeedKind,
+	pub wants_pins: bool,
+}
+
+pub fn inspect(src: &str) -> SeedInfo {
 	let parse = rnix::Root::parse(src);
 	if parse.errors().first().is_some() {
-		return SeedKind::Invalid;
+		return SeedInfo {
+			kind: SeedKind::Invalid,
+			wants_pins: false,
+		};
 	}
-	if looks_like_flake(&parse.syntax()) {
-		SeedKind::Flake
-	} else {
-		SeedKind::Shell
+	let syntax = parse.syntax();
+	if looks_like_flake(&syntax) {
+		return SeedInfo {
+			kind: SeedKind::Flake,
+			wants_pins: false,
+		};
 	}
+	SeedInfo {
+		kind: SeedKind::Shell,
+		wants_pins: accepts_pins(&syntax),
+	}
+}
+
+/// Whether a fragment's top-level argument pattern would accept a `pins` argument:
+/// it names `pins` (`{ pkgs, pins }:`), or it ends in an ellipsis (`{ pkgs, ... }:`)
+/// and so accepts anything.
+///
+/// This is the opt-in gate, and it has to be syntactic: nix attrset patterns are
+/// strict, so passing `pins` to a `{ pkgs }:` fragment is an evaluation error rather
+/// than an ignored argument. Reading the formals is therefore the only way to stay
+/// backward compatible with every seed already on disk.
+fn accepts_pins(root: &SyntaxNode) -> bool {
+	let Some(lambda) = root
+		.first_child()
+		.filter(|n| n.kind() == SyntaxKind::NODE_LAMBDA)
+	else {
+		return false; // not a function at all (e.g. a bare `pkgs.mkShell { … }`)
+	};
+	let Some(pattern) = lambda
+		.children()
+		.find(|n| n.kind() == SyntaxKind::NODE_PATTERN)
+	else {
+		return false; // a simple `pkgs: …` binder takes no named arguments
+	};
+	// `...` accepts any extra argument; otherwise look for an explicit `pins` entry.
+	if pattern
+		.children_with_tokens()
+		.any(|e| e.kind() == SyntaxKind::TOKEN_ELLIPSIS)
+	{
+		return true;
+	}
+	pattern
+		.children()
+		.filter(|n| n.kind() == SyntaxKind::NODE_PAT_ENTRY)
+		.filter_map(|entry| {
+			// The entry's **first** ident is the formal's name; a later one would be
+			// part of a default value (`{ foo ? pins }` must not count as asking).
+			entry
+				.children()
+				.find(|n| n.kind() == SyntaxKind::NODE_IDENT)
+				.map(|n| n.text().to_string())
+		})
+		.any(|formal| formal.trim() == "pins")
 }
 
 /// A flake shape = the top-level expression is an attrset with an `outputs`
@@ -279,6 +351,50 @@ mod tests {
 
 	const FRAGMENT: &str = "{ pkgs }: pkgs.mkShell { packages = with pkgs; [ ripgrep ]; }\n";
 	const FLAKE: &str = "{\n  inputs.nixpkgs.url = \"github:NixOS/nixpkgs\";\n  outputs = { self, nixpkgs }: { };\n}\n";
+
+	#[test]
+	fn accepts_pins_reads_the_fragments_formals() {
+		let wants = |src: &str| inspect(src).wants_pins;
+		// Opted in explicitly, in either order, and with a default value.
+		assert!(wants("{ pkgs, pins }: pkgs.mkShell { }"));
+		assert!(wants("{ pins, pkgs }: pkgs.mkShell { }"));
+		assert!(wants("{ pkgs, pins ? { } }: pkgs.mkShell { }"));
+		// An ellipsis accepts anything, so it accepts `pins`.
+		assert!(wants("{ pkgs, ... }: pkgs.mkShell { }"));
+		assert!(wants("{ ... }@args: args.pkgs.mkShell { }"));
+		// Not opted in: the strict pattern every existing seed uses. Passing `pins`
+		// to one of these would be an evaluation error, which is why this gate exists.
+		assert!(!wants("{ pkgs }: pkgs.mkShell { }"));
+		assert!(!wants("{ pkgs, system }: pkgs.mkShell { }"));
+		// A simple binder takes no named arguments at all.
+		assert!(!wants("pkgs: pkgs.mkShell { }"));
+		// `pins` appearing as a default value — or anywhere in the body — is not a
+		// request for the argument; only a formal's own name counts.
+		assert!(!wants("{ pkgs, foo ? pins }: pkgs.mkShell { }"));
+		assert!(!wants("{ pkgs }: pkgs.mkShell { packages = [ pins ]; }"));
+		// A flake is classified before formals are considered.
+		assert!(!wants(FLAKE));
+	}
+
+	#[test]
+	fn a_cataloged_seed_carries_its_pins_opt_in() {
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("plain.nix"), FRAGMENT).unwrap();
+		std::fs::write(
+			dir.path().join("pinned.nix"),
+			"{ pkgs, pins }: pkgs.mkShell { packages = [ pins.unstable.hello ]; }\n",
+		)
+		.unwrap();
+		let settings = SeedSettings {
+			sources: vec![source(dir.path(), None)],
+			ignore: vec![],
+			namespace: None,
+		};
+		let cat = Catalog::build(&settings);
+		let by = |n: &str| cat.seeds.iter().find(|s| s.name == n).unwrap().wants_pins;
+		assert!(by("pinned"));
+		assert!(!by("plain"));
+	}
 
 	#[test]
 	fn classify_distinguishes_shell_flake_and_invalid() {

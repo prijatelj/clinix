@@ -274,7 +274,7 @@ mod tests {
 			"myimg",
 			&[PathBuf::from("/data/model.bin")],
 		);
-		assert!(s.contains("builtins.readFile \"/e/flake.lock\""));
+		assert!(s.contains("pkgs = pkgsOf \"/e/flake.lock\";"));
 		assert!(s.contains("import \"/e/shell.nix\" { }"));
 		assert!(s.contains("name = \"myimg\";"));
 		assert!(s.contains("streamLayeredImage"));

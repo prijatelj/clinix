@@ -7,7 +7,8 @@
 //! 1. resolve each token to a [`Node`] ([`crate::env::resolve_node`]);
 //! 2. decide the pin — a self-contained member's own `flake.lock`, else the seed
 //!    pin — and reject a union whose members disagree;
-//! 3. assemble the expression ([`compose_expr`] over [`crate::env::nix_expr`]);
+//! 3. assemble the expression ([`imports_frag`] over
+//!    [`crate::env::nix_expr::ComposeSpec`]);
 //! 4. GC-root it as a new version when the derivation changed ([`mint_current`]),
 //!    or skip rooting entirely for an ephemeral ad-hoc `-p` shell;
 //! 5. enter it via classic `nix-shell` ([`launch`]).
@@ -24,8 +25,8 @@ use crate::env::config::Config;
 use crate::env::registry;
 // Resolution lives next door; composition consumes it (see the module docs).
 use super::env::{
-	Context, Env, Node, env_label, env_shell_file, file_label, nixpkgs_config_path, node_label,
-	resolve, resolve_node, seed_lock,
+	Context, Env, Node, env_label, env_shell_file, file_label, named_pins, nixpkgs_config_path,
+	node_label, resolve, resolve_node, seed_lock,
 };
 use crate::error::{ClinixError, Result};
 
@@ -168,8 +169,15 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 		items.sort_by(|a, b| a.label.cmp(&b.label));
 	}
 	let labels: Vec<String> = items.iter().map(|i| i.label.clone()).collect();
-	let imports: Vec<(PathBuf, bool)> = items.iter().map(|i| (i.shell.clone(), i.inject)).collect();
-	adhoc_composition(cfg, &settings, &labels, &imports, lock, packages)
+	let members: Vec<Member> = items
+		.iter()
+		.map(|i| Member {
+			path: i.shell.clone(),
+			pkgs: i.inject,
+			pins: i.wants_pins,
+		})
+		.collect();
+	adhoc_composition(cfg, &settings, &labels, &members, lock, packages)
 }
 
 /// Write a generated compose expression and describe it as a [`Composition`]. The
@@ -184,7 +192,7 @@ fn adhoc_composition(
 	cfg: &Config,
 	settings: &crate::env::config::Settings,
 	labels: &[String],
-	imports: &[(PathBuf, bool)],
+	members: &[Member],
 	lock: PathBuf,
 	packages: &[String],
 ) -> Result<Composition> {
@@ -194,7 +202,31 @@ fn adhoc_composition(
 		labels.join(" ")
 	};
 	let nixpkgs_config = nixpkgs_config_path(settings)?;
-	let expr = compose_expr(&lock, imports, &label, nixpkgs_config.as_deref(), packages);
+	// Alternate pins are resolved (and lazily locked) **only** when a member asked
+	// for them, so a declared-but-unused `[env.pins]` costs nothing — not even the
+	// one-time network lock of a `Ref` pin.
+	let pins = if members.iter().any(|m| m.pins) {
+		let declared = named_pins(cfg, settings)?;
+		if declared.is_empty() {
+			eprintln!(
+				"clinix: warning: `{label}` asks for `pins` but [env.pins] declares none — \
+				 `pins.<name>` will fail to evaluate"
+			);
+		}
+		declared
+	} else {
+		Vec::new()
+	};
+	let expr = crate::env::nix_expr::ComposeSpec {
+		lock_ref: &crate::env::nix_expr::nix_str(&lock),
+		config_frag: &crate::env::nix_expr::nixpkgs_config_frag(nixpkgs_config.as_deref()),
+		name: &label.replace(' ', "-"),
+		imports: &imports_frag(members),
+		label: &label,
+		packages,
+		pins: &pins,
+	}
+	.render();
 
 	// Key: the stack key, plus `-p<hash>` when ad-hoc so the two never collide.
 	let base = if labels.is_empty() {
@@ -247,15 +279,22 @@ struct UnionItem {
 	label: String,
 	shell: PathBuf,
 	inject: bool,
+	/// The member asked for the declared `[env.pins]` set (seeds only).
+	wants_pins: bool,
 	lock: Option<PathBuf>,
 }
 
 fn union_item(node: &Node) -> Result<UnionItem> {
 	Ok(match node {
-		Node::Seed { name, path } => UnionItem {
+		Node::Seed {
+			name,
+			path,
+			wants_pins,
+		} => UnionItem {
 			label: name.clone(),
 			shell: path.clone(),
 			inject: true,
+			wants_pins: *wants_pins,
 			lock: None,
 		},
 		Node::Env(env) => {
@@ -269,6 +308,7 @@ fn union_item(node: &Node) -> Result<UnionItem> {
 				label: env_label(env),
 				shell: env_shell_file(&env.root)?,
 				inject: false,
+				wants_pins: false,
 				lock: Some(lock),
 			}
 		}
@@ -287,6 +327,7 @@ fn union_item(node: &Node) -> Result<UnionItem> {
 				label: file_label(path),
 				shell: path.clone(),
 				inject: false,
+				wants_pins: false,
 				lock: Some(lock),
 			}
 		}
@@ -435,41 +476,45 @@ pub(crate) fn node_root(
 	})
 }
 
-/// A nix compose expression that imports the pinned nixpkgs (read from `lock`) and
-/// **unions** the imported shells via `inputsFrom` (the `compose-dev.nix`
-/// mechanism), in composition order; `label` is the human name (e.g.
-/// `"claude rust"`). One `lock` = a single nixpkgs instance.
+/// One member of a generated composition: the shell file to import, plus which of
+/// the prelude's bindings to hand it.
 ///
-/// Each import is `(shell_file, inject_pkgs)`: a **seed** fragment takes the shared
-/// `pkgs` (`inject_pkgs = true` → `{ inherit pkgs; }`); a **self-contained** env's
-/// shell computes its own `pkgs` from its own (byte-identical, shared) `flake.lock`
-/// (`inject_pkgs = false` → `{ }`), so mixing a project with seeds is coherent when
-/// they share a pin (the shared-`flake.lock` union).
-pub fn compose_expr(
-	lock: &Path,
-	imports: &[(PathBuf, bool)],
-	label: &str,
-	nixpkgs_config: Option<&Path>,
-	packages: &[String],
-) -> String {
-	use crate::env::nix_expr;
-	let imports = imports
+/// Named fields rather than a tuple because what a member receives is now two
+/// independent decisions, and a `(PathBuf, bool, bool)` at the call site says
+/// nothing about which bool is which.
+pub(crate) struct Member {
+	pub path: PathBuf,
+	/// Pass the stack's `pkgs` — a **seed** fragment (`{ pkgs }:`) takes it; a
+	/// **self-contained** env shell computes its own from its own (byte-identical,
+	/// shared) `flake.lock` and takes `{ }`, which is what makes mixing a project
+	/// with seeds coherent under the shared-`flake.lock` union.
+	pub pkgs: bool,
+	/// Also pass the declared `pins` set — only for a seed whose argument pattern
+	/// accepts it ([`crate::env::seeds::Seed::wants_pins`]).
+	pub pins: bool,
+}
+
+/// The newline-joined `(import <file> { … })` lines for `@IMPORTS@`, in composition
+/// order. Pure — the `*_frag` counterpart to [`crate::env::nix_expr::packages_frag`]
+/// and [`crate::env::nix_expr::pins_frag`], so each slot of the generated file has
+/// exactly one builder.
+fn imports_frag(members: &[Member]) -> String {
+	members
 		.iter()
-		.map(|(p, inject)| {
-			let args = if *inject { "{ inherit pkgs; }" } else { "{ }" };
-			format!("    (import {} {args})", nix_expr::nix_str(p))
+		.map(|m| {
+			let args = match (m.pkgs, m.pins) {
+				(true, true) => "{ inherit pkgs pins; }",
+				(true, false) => "{ inherit pkgs; }",
+				(false, true) => "{ inherit pins; }",
+				(false, false) => "{ }",
+			};
+			format!(
+				"    (import {} {args})",
+				crate::env::nix_expr::nix_str(&m.path)
+			)
 		})
 		.collect::<Vec<_>>()
-		.join("\n");
-	nix_expr::ComposeSpec {
-		lock_ref: &nix_expr::nix_str(lock),
-		config_frag: &nix_expr::nixpkgs_config_frag(nixpkgs_config),
-		name: &label.replace(' ', "-"),
-		imports: &imports,
-		label,
-		packages,
-	}
-	.render()
+		.join("\n")
 }
 
 #[cfg(test)]
@@ -487,17 +532,42 @@ mod tests {
 		);
 	}
 
+	/// The union shape: a seed (takes the shared `pkgs`) and a self-contained project
+	/// shell (reads its own shared lock → takes `{ }`).
+	fn union_members() -> Vec<Member> {
+		vec![
+			Member {
+				path: PathBuf::from("/s/rust.nix"),
+				pkgs: true,
+				pins: false,
+			},
+			Member {
+				path: PathBuf::from("/proj/shell.nix"),
+				pkgs: false,
+				pins: false,
+			},
+		]
+	}
+
+	/// Render as [`adhoc_composition`] does, without its filesystem side effects.
+	fn render(members: &[Member], label: &str, config: Option<&Path>, packages: &[String]) -> String {
+		crate::env::nix_expr::ComposeSpec {
+			lock_ref: &crate::env::nix_expr::nix_str(Path::new("/cfg/flake.lock")),
+			config_frag: &crate::env::nix_expr::nixpkgs_config_frag(config),
+			name: &label.replace(' ', "-"),
+			imports: &imports_frag(members),
+			label,
+			packages,
+			pins: &[],
+		}
+		.render()
+	}
+
 	#[test]
 	fn compose_expr_unions_fragments_in_order_against_one_pin() {
-		let lock = PathBuf::from("/cfg/flake.lock");
-		// A seed (inject pkgs) and a self-contained project shell (reads its own
-		// shared lock → no injection): the shared-flake.lock union shape.
-		let imports = vec![
-			(PathBuf::from("/s/rust.nix"), true),
-			(PathBuf::from("/proj/shell.nix"), false),
-		];
-		let expr = compose_expr(&lock, &imports, "rust proj", None, &[]);
-		assert!(expr.contains("builtins.readFile \"/cfg/flake.lock\""));
+		let members = union_members();
+		let expr = render(&members, "rust proj", None, &[]);
+		assert!(expr.contains("pkgs = pkgsOf \"/cfg/flake.lock\";"));
 		assert!(expr.contains("import \"/s/rust.nix\" { inherit pkgs; }"));
 		assert!(
 			expr.contains("import \"/proj/shell.nix\" { }"),
@@ -517,11 +587,59 @@ mod tests {
 
 		// A nixpkgs config file is applied to the nixpkgs import (allowUnfree etc.).
 		let cfg = PathBuf::from("/cfg/nixpkgs-config.nix");
-		let expr2 = compose_expr(&lock, &imports, "rust proj", Some(&cfg), &[]);
+		let expr2 = render(&members, "rust proj", Some(&cfg), &[]);
 		assert!(expr2.contains("config = import \"/cfg/nixpkgs-config.nix\";"));
 
 		// Ad-hoc `-p` packages ride along in the composed shell's own list.
-		let expr3 = compose_expr(&lock, &imports, "rust proj", None, &["tokei".to_string()]);
+		let expr3 = render(&members, "rust proj", None, &["tokei".to_string()]);
 		assert!(expr3.contains("packages = with pkgs; [ tokei ];"));
+	}
+
+	#[test]
+	fn imports_frag_passes_pins_only_to_the_member_that_asked() {
+		// A seed that opted in (`{ pkgs, pins }:`) beside one that did not: the
+		// opt-out keeps the exact argument it got before `[env.pins]` existed, which
+		// is what makes the feature backward compatible with seeds on disk.
+		let members = vec![
+			Member {
+				path: PathBuf::from("/s/claude-latest.nix"),
+				pkgs: true,
+				pins: true,
+			},
+			Member {
+				path: PathBuf::from("/s/rust.nix"),
+				pkgs: true,
+				pins: false,
+			},
+		];
+		let frag = imports_frag(&members);
+		assert!(frag.contains("(import \"/s/claude-latest.nix\" { inherit pkgs pins; })"));
+		assert!(frag.contains("(import \"/s/rust.nix\" { inherit pkgs; })"));
+	}
+
+	#[test]
+	fn a_composition_binds_pins_once_for_every_declared_pin() {
+		let pins = [(
+			"unstable".to_string(),
+			PathBuf::from("/c/locks/unstable.lock"),
+		)];
+		let expr = crate::env::nix_expr::ComposeSpec {
+			lock_ref: "\"/cfg/flake.lock\"",
+			name: "claude-latest",
+			imports: &imports_frag(&[Member {
+				path: PathBuf::from("/s/claude-latest.nix"),
+				pkgs: true,
+				pins: true,
+			}]),
+			label: "claude-latest",
+			pins: &pins,
+			..Default::default()
+		}
+		.render();
+		// Both pins come from the one `pkgsOf` reader, and the stack's pin is still
+		// the lock the shared-pin check settled on.
+		assert!(expr.contains("pkgs = pkgsOf \"/cfg/flake.lock\";"));
+		assert!(expr.contains("unstable = pkgsOf \"/c/locks/unstable.lock\";"));
+		assert_eq!(expr.matches("fetchTarball").count(), 1);
 	}
 }

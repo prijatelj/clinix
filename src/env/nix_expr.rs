@@ -8,7 +8,7 @@
 //!
 //! Pure `&str`/`&Path` → `String` — no I/O — so callers stay unit-testable.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A path as an escaped, double-quoted nix string literal (nix coerces it to a
 /// path where one is expected, e.g. `readFile`/`import`). Escapes `\`, `"`, and
@@ -32,35 +32,77 @@ pub fn nixpkgs_config_frag(config: Option<&Path>) -> String {
 }
 
 /// The `let`-prelude shared by every clinix-generated nix file: the
-/// `{ system ? … }:` header plus the `flake.lock` reader (`lock`/`fetch`/`sources`)
-/// and the `pkgs` binding. It stops **before** `in`, so a caller appends any extra
-/// `let` bindings (e.g. docker's `shell`/`envPackages`) and then its own
+/// `{ system ? … }:` header plus the `flake.lock` reader (`fetch`/`sourcesOf`/
+/// `pkgsOf`), the `pkgs` binding, and — when any member asked for them — the
+/// named alternate pins as `pins`. It stops **before** `in`, so a caller appends
+/// any extra `let` bindings (e.g. docker's `shell`/`envPackages`) and then its own
 /// `in <body>`. Substituted by [`lock_prelude`]:
 /// - `@LOCK@` — the lock reference placed after `readFile ` (a [`nix_str`] path, or
 ///   a bare relative literal like `./flake.lock`);
 /// - `@CONFIG@` — the optional nixpkgs `config` fragment ([`nixpkgs_config_frag`]),
-///   empty when none.
+///   empty when none;
+/// - `@PINS@` — the optional `pins = { … };` block ([`pins_frag`]), empty when no
+///   member requested an alternate pin (so the generated file is byte-identical to
+///   one without the feature).
+///
+/// The reader is **lock-parameterized** (`sourcesOf`/`pkgsOf` take the lockfile)
+/// rather than closing over a single `lock` binding, because that is what lets one
+/// generated file instantiate nixpkgs from more than one pin — the stack's pin for
+/// `pkgs`, plus one per `[env.pins]` entry — from a single definition of the fetch
+/// logic. `fetch` therefore takes a node's `locked` attrset, not its node name.
 pub const LOCK_PRELUDE: &str = r##"{ system ? builtins.currentSystem }:
 let
-  lock = builtins.fromJSON (builtins.readFile @LOCK@);
-  fetch = node:
-    let i = lock.nodes.${node}.locked; in
+  fetch = i:
     if i.type == "github" then
       builtins.fetchTarball { url = "https://github.com/${i.owner}/${i.repo}/archive/${i.rev}.tar.gz"; sha256 = i.narHash; }
     else if i.type == "git" then
       (builtins.fetchGit { inherit (i) url rev; }).outPath
     else throw "clinix: unsupported input type '${i.type}'";
-  sources = builtins.mapAttrs (_: fetch) lock.nodes.root.inputs;
-  pkgs = import sources.nixpkgs { inherit system;@CONFIG@ };
-"##;
+  sourcesOf = lockFile:
+    let lock = builtins.fromJSON (builtins.readFile lockFile); in
+    builtins.mapAttrs (_: node: fetch lock.nodes.${node}.locked) lock.nodes.root.inputs;
+  pkgsOf = lockFile: import (sourcesOf lockFile).nixpkgs { inherit system;@CONFIG@ };
+  pkgs = pkgsOf @LOCK@;
+@PINS@"##;
 
-/// Fill [`LOCK_PRELUDE`]: `lock_ref` is the exact text after `readFile ` (already a
-/// [`nix_str`] result or a bare path); `config_frag` is the `@CONFIG@` fragment
-/// (`""` or a [`nixpkgs_config_frag`] string).
+/// Fill [`LOCK_PRELUDE`] with no alternate pins — the shape every generated file
+/// had before `[env.pins]` existed. `lock_ref` is the exact text after `readFile `
+/// (already a [`nix_str`] result or a bare path); `config_frag` is the `@CONFIG@`
+/// fragment (`""` or a [`nixpkgs_config_frag`] string).
 pub fn lock_prelude(lock_ref: &str, config_frag: &str) -> String {
+	lock_prelude_with_pins(lock_ref, config_frag, &[])
+}
+
+/// Fill [`LOCK_PRELUDE`], additionally binding `pins` to one nixpkgs instance per
+/// entry of `pins` (see [`pins_frag`]). Empty `pins` ⇒ identical to
+/// [`lock_prelude`].
+pub fn lock_prelude_with_pins(
+	lock_ref: &str,
+	config_frag: &str,
+	pins: &[(String, PathBuf)],
+) -> String {
 	LOCK_PRELUDE
 		.replace("@LOCK@", lock_ref)
 		.replace("@CONFIG@", config_frag)
+		.replace("@PINS@", &pins_frag(pins))
+}
+
+/// The `pins = { <name> = pkgsOf "<lock>"; … };` block for the declared alternate
+/// nixpkgs pins, or **empty** when there are none. Goes in `@PINS@`.
+///
+/// Every declared pin is bound, not just the ones a seed names, because nix
+/// attribute sets are lazy: an unreferenced entry is never forced, so it costs no
+/// fetch and no evaluation. That keeps clinix out of the business of working out
+/// which seed touches which pin.
+pub fn pins_frag(pins: &[(String, PathBuf)]) -> String {
+	if pins.is_empty() {
+		return String::new();
+	}
+	let entries: String = pins
+		.iter()
+		.map(|(name, lock)| format!("    {name} = pkgsOf {};\n", nix_str(lock)))
+		.collect();
+	format!("  pins = {{\n{entries}  }};\n")
 }
 
 /// The `mkShell` tail shared by the seed-stack compose file and the `new` composed
@@ -123,18 +165,24 @@ pub struct ComposeSpec<'a> {
 	pub label: &'a str,
 	/// Ad-hoc package attribute names; empty ⇒ no `packages` line at all.
 	pub packages: &'a [String],
+	/// Declared alternate nixpkgs pins to bind as `pins` ([`pins_frag`]); empty ⇒ no
+	/// `pins` binding at all.
+	pub pins: &'a [(String, PathBuf)],
 }
 
 impl ComposeSpec<'_> {
-	/// Assemble the composition: [`lock_prelude`] + [`MKSHELL_TAIL`] with every slot
-	/// filled.
+	/// Assemble the composition: [`lock_prelude_with_pins`] + [`MKSHELL_TAIL`] with
+	/// every slot filled.
 	pub fn render(&self) -> String {
 		let tail = MKSHELL_TAIL
 			.replace("@NAME@", self.name)
 			.replace("@IMPORTS@", self.imports)
 			.replace("@LABEL@", self.label)
 			.replace("@PACKAGES@", &packages_frag(self.packages));
-		format!("{}{tail}", lock_prelude(self.lock_ref, self.config_frag))
+		format!(
+			"{}{tail}",
+			lock_prelude_with_pins(self.lock_ref, self.config_frag, self.pins)
+		)
 	}
 }
 
@@ -162,17 +210,50 @@ mod tests {
 	#[test]
 	fn lock_prelude_substitutes_lock_and_config() {
 		let p = lock_prelude("\"/cfg/flake.lock\"", " config = import \"/c.nix\";");
-		assert!(p.contains("builtins.readFile \"/cfg/flake.lock\""));
-		assert!(
-			p.contains("import sources.nixpkgs { inherit system; config = import \"/c.nix\"; };")
-		);
+		assert!(p.contains("pkgs = pkgsOf \"/cfg/flake.lock\";"));
+		assert!(p.contains(
+			"pkgsOf = lockFile: import (sourcesOf lockFile).nixpkgs \
+			 { inherit system; config = import \"/c.nix\"; };"
+		));
 		// A bare relative lock literal (composed env) is placed verbatim.
-		assert!(lock_prelude("./flake.lock", "").contains("builtins.readFile ./flake.lock"));
+		assert!(lock_prelude("./flake.lock", "").contains("pkgs = pkgsOf ./flake.lock;"));
 		// Empty config leaves a bare `{ inherit system; }`.
 		assert!(
 			lock_prelude("./flake.lock", "")
-				.contains("import sources.nixpkgs { inherit system; };")
+				.contains("import (sourcesOf lockFile).nixpkgs { inherit system; };")
 		);
+		// No pins requested ⇒ no `pins` binding at all, and the prelude still stops
+		// before `in` so callers can append their own bindings.
+		assert!(!lock_prelude("./flake.lock", "").contains("pins"));
+		assert!(lock_prelude("./flake.lock", "").ends_with(";\n"));
+	}
+
+	#[test]
+	fn pins_frag_is_empty_or_one_pkgs_of_per_declared_pin() {
+		assert_eq!(pins_frag(&[]), "");
+		let pins = [
+			("unstable".to_string(), PathBuf::from("/c/locks/unstable.lock")),
+			("old".to_string(), PathBuf::from("/c/locks/old.lock")),
+		];
+		assert_eq!(
+			pins_frag(&pins),
+			"  pins = {\n    unstable = pkgsOf \"/c/locks/unstable.lock\";\n    \
+			 old = pkgsOf \"/c/locks/old.lock\";\n  };\n"
+		);
+	}
+
+	#[test]
+	fn lock_prelude_with_pins_binds_every_pin_through_the_one_reader() {
+		let pins = [(
+			"unstable".to_string(),
+			PathBuf::from("/c/locks/unstable.lock"),
+		)];
+		let p = lock_prelude_with_pins("\"/cfg/flake.lock\"", "", &pins);
+		// The stack's pin and the alternate pin both go through `pkgsOf` — the fetch
+		// logic is defined exactly once no matter how many pins are in play.
+		assert_eq!(p.matches("fetchTarball").count(), 1);
+		assert!(p.contains("pkgs = pkgsOf \"/cfg/flake.lock\";"));
+		assert!(p.contains("    unstable = pkgsOf \"/c/locks/unstable.lock\";"));
 	}
 
 	#[test]
@@ -186,7 +267,7 @@ mod tests {
 			..Default::default()
 		}
 		.render();
-		assert!(s.contains("builtins.readFile ./flake.lock"));
+		assert!(s.contains("pkgs = pkgsOf ./flake.lock;"));
 		assert!(
 			s.contains("inputsFrom = [\n    (import ./seeds/rust.nix { inherit pkgs; })\n  ];")
 		);

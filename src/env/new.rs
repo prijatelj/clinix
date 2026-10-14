@@ -572,6 +572,9 @@ fn render_composed_shell(
 		imports: &imports,
 		label,
 		packages,
+		// A materialized env is self-contained: it carries copies of its seeds and
+		// its own lock, so it deliberately does not inherit the host's `[env.pins]`.
+		pins: &[],
 	}
 	.render()
 }
@@ -611,11 +614,11 @@ mod tests {
 	fn wrapper_with_lock_injects_pkgs_from_the_pin() {
 		// A member reads the shared `../flake.lock` and injects pkgs into the source.
 		let w = render_wrapper_with_lock("../flake.lock", "\"/abs/dev.nix\"");
-		assert!(w.contains("builtins.readFile ../flake.lock"));
+		assert!(w.contains("pkgs = pkgsOf ../flake.lock;"));
 		assert!(w.contains("import \"/abs/dev.nix\" { inherit pkgs; }"));
 		// A runtime env reads its own `./flake.lock`; copy mode imports the copy.
 		let w2 = render_wrapper_with_lock("./flake.lock", "./source.nix");
-		assert!(w2.contains("builtins.readFile ./flake.lock"));
+		assert!(w2.contains("pkgs = pkgsOf ./flake.lock;"));
 		assert!(w2.contains("import ./source.nix { inherit pkgs; }"));
 	}
 
@@ -634,7 +637,7 @@ mod tests {
 			("claude".to_string(), PathBuf::from("/src/claude.nix")),
 		];
 		let s = render_composed_shell(&seeds, "rust claude", false, &[]);
-		assert!(s.contains("builtins.readFile ./flake.lock"));
+		assert!(s.contains("pkgs = pkgsOf ./flake.lock;"));
 		assert!(s.contains("import ./seeds/rust.nix { inherit pkgs; }"));
 		assert!(!s.contains("/src/"), "must not reference source paths");
 		assert!(s.contains("name = \"rust-claude\";"));
