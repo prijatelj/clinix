@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
-use crate::env::{Context, Pkg, RunCmd};
+use crate::env::{Context, RunCmd};
 use crate::error::{ClinixError, Result, unimplemented};
 use crate::model::lock::{FlakeLock, InputRef, Node, Source};
 use crate::progress::Progress;
@@ -23,11 +23,6 @@ use crate::progress::Progress;
 pub struct Init {
 	/// Directory to scaffold the project in (default: the current directory).
 	pub path: Option<PathBuf>,
-	/// Seed packages (`-p ripgrep -p nodejs`) written into the `packages` list.
-	/// Versioned specs (`nodejs=20.11`) need package-level pinning (phase 4) and
-	/// are rejected until then.
-	#[arg(short = 'p', long = "pkg")]
-	pub packages: Vec<Pkg>,
 	/// nixpkgs ref to pin: a branch/tag (default `nixos-26.05`, the latest
 	/// stable) or a 40-hex rev (frozen). clinix resolves and locks it classically
 	/// (`git ls-remote` + `nix-prefetch-url`).
@@ -54,6 +49,13 @@ impl RunCmd for Init {
 	/// `flake.lock` (and `flake.nix` under `--flake`). Never clobbers existing
 	/// project files, and does the network resolution *before* any write so a
 	/// failure leaves the directory untouched.
+	///
+	/// Seed packages come from the **shared** `-p`/`--pkg` flag
+	/// ([`crate::env::PkgArgs`], declared once in [`crate::cli`]) rather than a
+	/// flag of init's own: one spelling for "packages", interpreted per verb —
+	/// init writes them into the new `shell.nix`, `shell`/`run` layer them onto a
+	/// composition, `new` bakes them into a registered env. Versioned specs are
+	/// rejected centrally, so there is no check for them here.
 	fn run(self, context: &Context) -> Result<()> {
 		// `--from` adopt (ADR-2 state detection) and package-level version pins
 		// are later slices; reject rather than silently drop their semantics.
@@ -61,12 +63,6 @@ impl RunCmd for Init {
 			return Err(unimplemented(
 				"env init --from",
 				"plan phase 3+: adopt existing spec (ADR-2)",
-			));
-		}
-		if self.packages.iter().any(|p| p.version.is_some()) {
-			return Err(unimplemented(
-				"env init with a versioned package",
-				"plan phase 4: package-level version pinning",
 			));
 		}
 
@@ -102,6 +98,9 @@ impl RunCmd for Init {
 		// Resolve nixpkgs and build the lock (network); nothing written on error.
 		let lock = build_nixpkgs_lock(&self.nixpkgs, &progress)?;
 
+		// The one shared `-p`/`--pkg` set (see this verb's doc comment).
+		let packages = &context.options.packages;
+
 		let mut files = vec!["shell.nix"];
 		if !self.shell_only {
 			files.push("flake.lock");
@@ -115,10 +114,10 @@ impl RunCmd for Init {
 			// flake.lock (like `--flake` adds a file, this removes one).
 			std::fs::write(
 				&shell_nix,
-				render_shell_nix(&self.packages, Some(&lock.to_json())),
+				render_shell_nix(&packages, Some(&lock.to_json())),
 			)?;
 		} else {
-			std::fs::write(&shell_nix, render_shell_nix(&self.packages, None))?;
+			std::fs::write(&shell_nix, render_shell_nix(&packages, None))?;
 			std::fs::write(&flake_lock, lock.to_json())?;
 		}
 		if self.flake {
@@ -161,13 +160,13 @@ const PACKAGES_PLACEHOLDER: &str = "    # project dependencies go here";
 /// known template, so this string splice is sufficient — span-preserving
 /// `rnix-parser` editing (phase 5, `add`) is only needed for existing,
 /// hand-edited files.
-fn render_shell_nix(packages: &[Pkg], embedded_lock: Option<&str>) -> String {
+fn render_shell_nix(packages: &[String], embedded_lock: Option<&str>) -> String {
 	let mut shell = if packages.is_empty() {
 		SHELL_NIX_TEMPLATE.to_string()
 	} else {
 		let list = packages
 			.iter()
-			.map(|p| format!("    {}", p.name))
+			.map(|name| format!("    {name}"))
 			.collect::<Vec<_>>()
 			.join("\n");
 		SHELL_NIX_TEMPLATE.replacen(PACKAGES_PLACEHOLDER, &list, 1)
@@ -297,16 +296,9 @@ pub(crate) fn is_rev(s: &str) -> bool {
 mod tests {
 	use super::*;
 
-	fn pkg(name: &str) -> Pkg {
-		Pkg {
-			name: name.to_string(),
-			version: None,
-		}
-	}
-
 	#[test]
 	fn render_shell_nix_splices_packages() {
-		let shell = render_shell_nix(&[pkg("ripgrep"), pkg("nodejs")], None);
+		let shell = render_shell_nix(&["ripgrep".to_string(), "nodejs".to_string()], None);
 		assert!(
 			shell.contains("    ripgrep\n    nodejs"),
 			"packages spliced"

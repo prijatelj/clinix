@@ -80,10 +80,11 @@ impl PkgArgs {
 			.collect();
 		if !versioned.is_empty() {
 			return Err(ClinixError::Resolve(format!(
-				"ad-hoc packages take an attribute name, not a version ({}). \
-				 `nix-shell -p` has no `name=version` form either — use the versioned \
-				 attribute (e.g. `nodejs_20`), or pin it declaratively with \
-				 `clinix env add <env> <pkg>` against the env's flake.lock",
+				"packages take an attribute name, not a version ({}). package-level \
+				 version pinning is a later phase, and `nix-shell -p` has no \
+				 `name=version` form either — use the versioned attribute (e.g. \
+				 `nodejs_20`), or pin it declaratively with `clinix env add <env> <pkg>` \
+				 against the env's flake.lock",
 				versioned.join(", ")
 			)));
 		}
