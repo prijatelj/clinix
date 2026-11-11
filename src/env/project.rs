@@ -185,16 +185,22 @@ impl LockTarget {
 					 or a lockfile"
 				)));
 			}
-			let path = fs::canonicalize(path)?;
-			let lock = FlakeLock::from_json(&fs::read_to_string(&path)?).map_err(|e| {
-				ClinixError::Target(format!("{} is not a flake lock: {e}", path.display()))
-			})?;
-			return Ok(Self::File { path, lock });
+			return Self::file(path);
 		}
 		Ok(Self::Env(Project::load(crate::env::resolve(
 			cfg,
 			Some(token),
 		)?)?))
+	}
+
+	/// A bare lockfile at `path`, parsed — the shared tail of a lockfile token and
+	/// a `--lock <name>` selector.
+	pub fn file(path: &Path) -> Result<Self> {
+		let path = fs::canonicalize(path)?;
+		let lock = FlakeLock::from_json(&fs::read_to_string(&path)?).map_err(|e| {
+			ClinixError::Target(format!("{} is not a flake lock: {e}", path.display()))
+		})?;
+		Ok(Self::File { path, lock })
 	}
 
 	pub fn lock(&self) -> &FlakeLock {

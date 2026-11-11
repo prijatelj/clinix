@@ -34,21 +34,21 @@ pub fn nixpkgs_config_frag(config: Option<&Path>) -> String {
 /// The `let`-prelude shared by every clinix-generated nix file: the
 /// `{ system ? … }:` header plus the `flake.lock` reader (`fetch`/`sourcesOf`/
 /// `pkgsOf`), the `pkgs` binding, and — when any member asked for them — the
-/// named alternate pins as `pins`. It stops **before** `in`, so a caller appends
+/// named `[env.locks]` nixpkgs as `nixpkgsFrom`. It stops **before** `in`, so a caller appends
 /// any extra `let` bindings (e.g. docker's `shell`/`envPackages`) and then its own
 /// `in <body>`. Substituted by [`lock_prelude`]:
 /// - `@LOCK@` — the lock reference placed after `readFile ` (a [`nix_str`] path, or
 ///   a bare relative literal like `./flake.lock`);
 /// - `@CONFIG@` — the optional nixpkgs `config` fragment ([`nixpkgs_config_frag`]),
 ///   empty when none;
-/// - `@PINS@` — the optional `pins = { … };` block ([`pins_frag`]), empty when no
-///   member requested an alternate pin (so the generated file is byte-identical to
-///   one without the feature).
+/// - `@NIXPKGS_FROM@` — the optional `nixpkgsFrom = { … };` block
+///   ([`nixpkgs_from_frag`]), empty when no member asked for it (so the generated
+///   file is byte-identical to one without the feature).
 ///
 /// The reader is **lock-parameterized** (`sourcesOf`/`pkgsOf` take the lockfile)
 /// rather than closing over a single `lock` binding, because that is what lets one
-/// generated file instantiate nixpkgs from more than one pin — the stack's pin for
-/// `pkgs`, plus one per `[env.pins]` entry — from a single definition of the fetch
+/// generated file instantiate nixpkgs from more than one lock — the stack's lock
+/// for `pkgs`, plus one per `[env.locks]` entry — from a single definition of the fetch
 /// logic. `fetch` therefore takes a node's `locked` attrset, not its node name.
 pub const LOCK_PRELUDE: &str = r##"{ system ? builtins.currentSystem }:
 let
@@ -63,32 +63,32 @@ let
     builtins.mapAttrs (_: node: fetch lock.nodes.${node}.locked) lock.nodes.root.inputs;
   pkgsOf = lockFile: import (sourcesOf lockFile).nixpkgs { inherit system;@CONFIG@ };
   pkgs = pkgsOf @LOCK@;
-@PINS@"##;
+@NIXPKGS_FROM@"##;
 
-/// Fill [`LOCK_PRELUDE`] with no alternate pins — the shape every generated file
-/// had before `[env.pins]` existed. `lock_ref` is the exact text after `readFile `
+/// Fill [`LOCK_PRELUDE`] with no `nixpkgsFrom` — the shape every generated file
+/// has when no member asks for it. `lock_ref` is the exact text after `readFile `
 /// (already a [`nix_str`] result or a bare path); `config_frag` is the `@CONFIG@`
 /// fragment (`""` or a [`nixpkgs_config_frag`] string).
 pub fn lock_prelude(lock_ref: &str, config_frag: &str) -> String {
-	lock_prelude_with_pins(lock_ref, config_frag, &[])
+	lock_prelude_with_locks(lock_ref, config_frag, &[])
 }
 
-/// Fill [`LOCK_PRELUDE`], additionally binding `pins` to one nixpkgs instance per
-/// entry of `pins` (see [`pins_frag`]). Empty `pins` ⇒ identical to
-/// [`lock_prelude`].
-pub fn lock_prelude_with_pins(
+/// Fill [`LOCK_PRELUDE`], additionally binding `nixpkgsFrom` to one nixpkgs
+/// instance per entry of `locks` (see [`nixpkgs_from_frag`]). Empty `locks` ⇒
+/// identical to [`lock_prelude`].
+pub fn lock_prelude_with_locks(
 	lock_ref: &str,
 	config_frag: &str,
-	pins: &[(String, String)],
+	locks: &[(String, String)],
 ) -> String {
 	LOCK_PRELUDE
 		.replace("@LOCK@", lock_ref)
 		.replace("@CONFIG@", config_frag)
-		.replace("@PINS@", &pins_frag(pins))
+		.replace("@NIXPKGS_FROM@", &nixpkgs_from_frag(locks))
 }
 
-/// The `pins = { <name> = pkgsOf <lock>; … };` block for the alternate nixpkgs
-/// pins, or **empty** when there are none. Goes in `@PINS@`.
+/// The `nixpkgsFrom = { <name> = pkgsOf <lock>; … };` block for the
+/// `[env.locks]` entries, or **empty** when there are none. Goes in `@NIXPKGS_FROM@`.
 ///
 /// Each `lock` is spliced **verbatim**, so the caller chooses the reference form:
 /// the live composition passes [`nix_str`] of an absolute path, while `new`'s
@@ -99,15 +99,15 @@ pub fn lock_prelude_with_pins(
 ///
 /// Within one composition the set is bound whole and nix attrsets are lazy, so an
 /// entry nothing references costs no fetch and no evaluation.
-pub fn pins_frag(pins: &[(String, String)]) -> String {
-	if pins.is_empty() {
+pub fn nixpkgs_from_frag(locks: &[(String, String)]) -> String {
+	if locks.is_empty() {
 		return String::new();
 	}
-	let entries: String = pins
+	let entries: String = locks
 		.iter()
 		.map(|(name, lock)| format!("    {name} = pkgsOf {lock};\n"))
 		.collect();
-	format!("  pins = {{\n{entries}  }};\n")
+	format!("  nixpkgsFrom = {{\n{entries}  }};\n")
 }
 
 /// The `mkShell` tail shared by the seed-stack compose file and the `new` composed
@@ -170,15 +170,15 @@ pub struct ComposeSpec<'a> {
 	pub label: &'a str,
 	/// Ad-hoc package attribute names; empty ⇒ no `packages` line at all.
 	pub packages: &'a [String],
-	/// Alternate nixpkgs pins to bind as `pins` ([`pins_frag`]); empty ⇒ no `pins`
-	/// binding at all. `(name, already-rendered lock ref)` — rendered, like
+	/// `[env.locks]` entries to bind as `nixpkgsFrom` ([`nixpkgs_from_frag`]); empty
+	/// ⇒ no `nixpkgsFrom` binding at all. `(name, already-rendered lock ref)` — rendered, like
 	/// [`Self::lock_ref`] and for the same reason: the live compose path writes
 	/// quoted absolute paths while a materialized env writes bare relative literals.
-	pub pins: &'a [(String, String)],
+	pub nixpkgs_from: &'a [(String, String)],
 }
 
 impl ComposeSpec<'_> {
-	/// Assemble the composition: [`lock_prelude_with_pins`] + [`MKSHELL_TAIL`] with
+	/// Assemble the composition: [`lock_prelude_with_locks`] + [`MKSHELL_TAIL`] with
 	/// every slot filled.
 	pub fn render(&self) -> String {
 		let tail = MKSHELL_TAIL
@@ -188,7 +188,7 @@ impl ComposeSpec<'_> {
 			.replace("@PACKAGES@", &packages_frag(self.packages));
 		format!(
 			"{}{tail}",
-			lock_prelude_with_pins(self.lock_ref, self.config_frag, self.pins)
+			lock_prelude_with_locks(self.lock_ref, self.config_frag, self.nixpkgs_from)
 		)
 	}
 }
@@ -229,17 +229,17 @@ mod tests {
 			lock_prelude("./flake.lock", "")
 				.contains("import (sourcesOf lockFile).nixpkgs { inherit system; };")
 		);
-		// No pins requested ⇒ no `pins` binding at all, and the prelude still stops
+		// No locks requested ⇒ no `nixpkgsFrom` binding at all, and the prelude still stops
 		// before `in` so callers can append their own bindings.
-		assert!(!lock_prelude("./flake.lock", "").contains("pins"));
+		assert!(!lock_prelude("./flake.lock", "").contains("nixpkgsFrom"));
 		assert!(lock_prelude("./flake.lock", "").ends_with(";\n"));
 	}
 
 	#[test]
-	fn pins_frag_is_empty_or_one_pkgs_of_per_declared_pin() {
-		assert_eq!(pins_frag(&[]), "");
+	fn nixpkgs_from_frag_is_empty_or_one_pkgs_of_per_declared_lock() {
+		assert_eq!(nixpkgs_from_frag(&[]), "");
 		// Quoted absolute refs — the live composition's form.
-		let pins = [
+		let locks = [
 			(
 				"unstable".to_string(),
 				nix_str(Path::new("/c/locks/unstable.lock")),
@@ -247,28 +247,28 @@ mod tests {
 			("old".to_string(), nix_str(Path::new("/c/locks/old.lock"))),
 		];
 		assert_eq!(
-			pins_frag(&pins),
-			"  pins = {\n    unstable = pkgsOf \"/c/locks/unstable.lock\";\n    \
+			nixpkgs_from_frag(&locks),
+			"  nixpkgsFrom = {\n    unstable = pkgsOf \"/c/locks/unstable.lock\";\n    \
 			 old = pkgsOf \"/c/locks/old.lock\";\n  };\n"
 		);
 		// Bare relative refs — a materialized env's form, which must NOT be quoted
 		// (nix rejects a quoted relative path).
 		let rel = [("unstable".to_string(), "./locks/unstable.lock".to_string())];
 		assert_eq!(
-			pins_frag(&rel),
-			"  pins = {\n    unstable = pkgsOf ./locks/unstable.lock;\n  };\n"
+			nixpkgs_from_frag(&rel),
+			"  nixpkgsFrom = {\n    unstable = pkgsOf ./locks/unstable.lock;\n  };\n"
 		);
 	}
 
 	#[test]
-	fn lock_prelude_with_pins_binds_every_pin_through_the_one_reader() {
-		let pins = [(
+	fn lock_prelude_with_locks_binds_every_lock_through_the_one_reader() {
+		let locks = [(
 			"unstable".to_string(),
 			nix_str(Path::new("/c/locks/unstable.lock")),
 		)];
-		let p = lock_prelude_with_pins("\"/cfg/flake.lock\"", "", &pins);
-		// The stack's pin and the alternate pin both go through `pkgsOf` — the fetch
-		// logic is defined exactly once no matter how many pins are in play.
+		let p = lock_prelude_with_locks("\"/cfg/flake.lock\"", "", &locks);
+		// The stack's lock and the named lock both go through `pkgsOf` — the fetch
+		// logic is defined exactly once no matter how many locks are in play.
 		assert_eq!(p.matches("fetchTarball").count(), 1);
 		assert!(p.contains("pkgs = pkgsOf \"/cfg/flake.lock\";"));
 		assert!(p.contains("    unstable = pkgsOf \"/c/locks/unstable.lock\";"));

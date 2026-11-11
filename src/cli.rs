@@ -329,12 +329,19 @@ impl Cli {
 					// stop this report, so fall back to the defaults it would imply.
 					let settings =
 						crate::env::config::Settings::load(&cfg.config_dir).unwrap_or_default();
-					let (pin, how) = crate::env::seed_lock_location(cfg, &settings);
-					println!("pin lock: {}   seed nixpkgs pin ({how})", pin.display());
 					println!(
-						"  locks:   {}   [env.pins] alternates created from a ref",
+						"locks:    {}   [env].locks_dir",
 						settings.env.locks_dir(&cfg.config_dir).display()
 					);
+					let (default, how) = crate::env::default_lock_location(cfg, &settings);
+					println!("  default: {}   {how}", default.display());
+					for (name, path) in &settings.env.locks {
+						if name != crate::env::config::DEFAULT_LOCK {
+							let path = crate::env::config::resolve_path(path, &cfg.config_dir);
+							let state = if path.is_file() { "" } else { " (MISSING)" };
+							println!("  {name}: {}   [env.locks].{name}{state}", path.display());
+						}
+					}
 					Ok(())
 				}
 			},

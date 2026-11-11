@@ -325,7 +325,7 @@ fn wrap_shell_refuses_a_lockfile_target() {
 	p.clinix(&["env", "flake", "unstable.lock", "wrap-shell"])
 		.assert()
 		.failure()
-		.stderr(predicate::str::contains("target its directory"));
+		.stderr(predicate::str::contains("target the env's directory"));
 }
 
 #[test]
@@ -353,6 +353,136 @@ fn sys_info_accepts_a_lockfile_path() {
 		.stdout(predicate::str::contains("nixos-26.05"));
 }
 
+// ---- named locks: [env.locks] + --lock ---------------------------------------
+
+/// Write `config.toml` into the sandbox's config dir.
+fn write_config(p: &Project, body: &str) {
+	std::fs::create_dir_all(p.config_dir()).unwrap();
+	std::fs::write(p.config_dir().join("config.toml"), body).unwrap();
+}
+
+#[test]
+fn lock_flag_targets_a_declared_lock_offline() {
+	let p = Project::new();
+	let lock = p.config_dir().join("locks/unstable.lock");
+	std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+	std::fs::write(&lock, common::MINIMAL_LOCK).unwrap();
+	// Relative to the config dir, like every config-side path.
+	write_config(&p, "[env.locks]\nunstable = \"locks/unstable.lock\"\n");
+
+	p.clinix(&["env", "flake", "--lock", "unstable", "freeze"])
+		.assert()
+		.success();
+	assert_eq!(nixpkgs_original(&lock)["rev"], "abc1234567890def");
+	p.clinix(&["env", "info", "--lock", "unstable"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("unstable.lock"));
+}
+
+#[test]
+fn lock_flag_default_is_the_implicit_default_lock() {
+	let p = Project::new();
+	let lock = write_default_lock(&p);
+	p.clinix(&["env", "info", "--lock", "default"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains(lock.to_str().unwrap()));
+}
+
+#[test]
+fn lock_flag_unknown_name_lists_the_declared_ones() {
+	let p = Project::new();
+	write_config(&p, "[env.locks]\nunstable = \"u.lock\"\n");
+	p.clinix(&["env", "update", "--lock", "nope"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("no lock named `nope`"))
+		.stderr(predicate::str::contains("declared: unstable"));
+}
+
+#[test]
+fn lock_flag_and_a_positional_target_conflict() {
+	let p = Project::new();
+	p.clinix(&["env", "update", ".", "--lock", "default"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("cannot be used with"));
+	// Neither is also an error: one target is required.
+	p.clinix(&["env", "outdated"]).assert().failure();
+}
+
+#[test]
+fn a_declared_default_lock_that_is_missing_errors_rather_than_being_created() {
+	let p = Project::new();
+	write_config(&p, "[env.locks]\ndefault = \"gone.lock\"\n");
+	p.clinix(&["env", "info", "--lock", "default"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("a declared lock must exist"));
+	assert!(!p.config_dir().join("gone.lock").exists());
+}
+
+#[test]
+fn a_default_lock_at_the_retired_location_is_an_error_naming_the_mv() {
+	let p = Project::new();
+	std::fs::create_dir_all(p.config_dir()).unwrap();
+	std::fs::write(p.config_dir().join("flake.lock"), common::MINIMAL_LOCK).unwrap();
+	p.clinix(&["env", "info", "--lock", "default"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("retired location"))
+		.stderr(predicate::str::contains("locks/default.lock"));
+	// Nothing was created beside it.
+	assert!(!p.config_dir().join("locks/default.lock").exists());
+}
+
+#[test]
+fn retired_pin_config_is_rejected_naming_its_replacement() {
+	let p = Project::new();
+	write_config(&p, "[env.pins]\nunstable = \"nixos-unstable\"\n");
+	p.clinix(&["env", "info", "--lock", "unstable"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("renamed `[env.locks]`"));
+}
+
+#[test]
+fn flake_init_refuses_an_existing_file_and_a_directory_offline() {
+	let p = Project::new();
+	std::fs::write(p.file("x.lock"), common::MINIMAL_LOCK).unwrap();
+	p.clinix(&["env", "flake", "x.lock", "init"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("refusing to overwrite"));
+	assert_eq!(
+		std::fs::read_to_string(p.file("x.lock")).unwrap(),
+		common::MINIMAL_LOCK
+	);
+	p.clinix(&["env", "flake", ".", "init"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("is a directory"));
+	// An undeclared name has no path to create.
+	p.clinix(&["env", "flake", "--lock", "nope", "init"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("declare `nope"));
+}
+
+#[test]
+fn config_state_reports_the_default_and_declared_locks() {
+	let p = Project::new();
+	write_config(&p, "[env.locks]\nunstable = \"locks/unstable.lock\"\n");
+	p.clinix(&["config", "state"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("locks/default.lock"))
+		.stdout(predicate::str::contains("not created yet"))
+		.stdout(predicate::str::contains("unstable"))
+		.stdout(predicate::str::contains("(MISSING)"));
+}
+
 // ---- launcher & diagnostics: error paths ------------------------------------
 
 #[test]
@@ -377,13 +507,22 @@ fn env_bare_name_routes_to_shell() {
 		.stderr(predicate::str::contains("not registered"));
 }
 
+/// The implicit default lock (`<config>/locks/default.lock`), pre-created so a
+/// test that needs it touches no network.
+fn write_default_lock(p: &Project) -> PathBuf {
+	let locks = p.config_dir().join("locks");
+	std::fs::create_dir_all(&locks).unwrap();
+	let lock = locks.join("default.lock");
+	std::fs::write(&lock, common::MINIMAL_LOCK).unwrap();
+	lock
+}
+
 #[test]
 fn new_from_materializes_seeds_into_a_portable_registry_env() {
 	let p = Project::new();
 	p.seed("tool", "{ pkgs }: pkgs.mkShell { }\n");
-	// Pre-create the config nixpkgs lock so `new` needs no network.
-	std::fs::create_dir_all(p.config_dir()).unwrap();
-	std::fs::write(p.config_dir().join("flake.lock"), common::MINIMAL_LOCK).unwrap();
+	// Pre-create the implicit default lock so `new` needs no network.
+	write_default_lock(&p);
 
 	p.clinix(&["env", "new", "mytools", "--from", "tool"])
 		.assert()
@@ -408,8 +547,7 @@ fn new_from_materializes_seeds_into_a_portable_registry_env() {
 #[test]
 fn new_from_a_non_seed_name_is_rejected() {
 	let p = Project::new();
-	std::fs::create_dir_all(p.config_dir()).unwrap();
-	std::fs::write(p.config_dir().join("flake.lock"), common::MINIMAL_LOCK).unwrap();
+	write_default_lock(&p);
 	// No seeds configured → "ghost" resolves to nothing.
 	p.clinix(&["env", "new", "x", "--from", "ghost"])
 		.assert()

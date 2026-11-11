@@ -6,7 +6,7 @@ use clap::Args;
 
 use crate::env::project::LockTarget;
 use crate::env::wrap_shell::WrapShell;
-use crate::env::{Context, Env, RunCmd, Target, resolve};
+use crate::env::{Context, Env, RunCmd, resolve};
 use crate::error::{ClinixError, Result, unimplemented};
 use crate::model::lock::{FlakeLock, Source};
 
@@ -111,15 +111,18 @@ pub struct Pkgs {
 /// than hand-edited.
 #[derive(Args, Debug)]
 pub struct Flake {
-	/// Target env (name, path, or `.`), or a lockfile by path (every action but
-	/// `wrap-shell`, which needs a `shell.nix`).
-	pub name: String,
+	/// The env or lockfile (or `--lock <name>`). Every action but `wrap-shell`,
+	/// which needs a `shell.nix`, accepts a lockfile.
+	#[command(flatten)]
+	pub target: LockArgs,
 	#[command(subcommand)]
 	pub action: FlakeAction,
 }
 
 #[derive(clap::Subcommand, Debug)]
 pub enum FlakeAction {
+	/// Create a new lockfile holding only nixpkgs (refuses an existing file).
+	Init(FlakeInit),
 	/// Add a flake input (github or git) to the lock.
 	Add(FlakeAdd),
 	/// Remove a flake input from the lock by node name.
@@ -132,6 +135,56 @@ pub enum FlakeAction {
 	/// develop`/flake users consume it. Wraps clinix envs (reusing/expanding their
 	/// lock) and foreign shells (auto-detecting how to pass `pkgs`).
 	WrapShell(WrapShell),
+}
+
+/// `flake <path> init` — create a new lockfile holding only nixpkgs.
+#[derive(Args, Debug)]
+pub struct FlakeInit {
+	/// nixpkgs ref to lock: a branch/tag (tracked) or a 40-hex rev (frozen).
+	#[arg(long = "nixpkgs", default_value = crate::env::config::DEFAULT_NIXPKGS_REF)]
+	pub nixpkgs: String,
+}
+
+/// `flake <path> init` / `flake --lock <name> init` — create a new lockfile holding
+/// only nixpkgs at `nixpkgs_ref` (network). The target is a **path that does not
+/// exist yet**, or a `[env.locks]` name whose declared file is missing — the one
+/// way a declared lock comes into being. Never overwrites.
+fn flake_init(target: &LockArgs, nixpkgs_ref: &str, context: &Context) -> Result<()> {
+	let path = match (&target.lock, &target.name) {
+		(Some(name), _) => {
+			let settings = crate::env::config::Settings::load(&context.config.config_dir)?;
+			settings
+				.env
+				.lock_path(name, &context.config.config_dir)
+				.ok_or_else(|| {
+					ClinixError::Config(format!(
+						"no lock named `{name}` in [env.locks] — declare `{name} = \"<path>\"` \
+						 first, or pass the path directly"
+					))
+				})?
+		}
+		(None, Some(token)) => {
+			let path = std::path::PathBuf::from(token);
+			if path.is_dir() {
+				return Err(ClinixError::Target(format!(
+					"{token} is a directory — name the lockfile to create (e.g. \
+					 {token}/flake.lock), or scaffold an env with `clinix env init`"
+				)));
+			}
+			path
+		}
+		(None, None) => unreachable!("clap requires a target or --lock"),
+	};
+	// One step for a frozen rev, two for a tracked branch (resolve, then hash).
+	let steps = if crate::env::init::is_rev(nixpkgs_ref) {
+		1
+	} else {
+		2
+	};
+	let progress = crate::progress::Progress::new(steps);
+	crate::env::init::write_new_lock(&path, nixpkgs_ref, &progress)?;
+	println!("clinix: created {} (nixpkgs/{nixpkgs_ref})", path.display());
+	Ok(())
 }
 
 /// `flake <env> add <github|git> …` — resolve + add one input.
@@ -179,10 +232,35 @@ pub struct FlakeUnfreeze {
 	pub branch: String,
 }
 
+/// A lock verb's target: an env or lockfile given positionally, **or** a named
+/// lock from `[env.locks]` (`--lock <name>`; `default` always exists). Exactly one.
+#[derive(Args, Debug, Clone)]
+pub struct LockArgs {
+	/// Target env (name, path, or `.`), or a lockfile by path.
+	#[arg(required_unless_present = "lock", conflicts_with = "lock")]
+	pub name: Option<String>,
+	/// A named lock from `[env.locks]` (or `default`) instead of a target.
+	#[arg(long, value_name = "NAME")]
+	pub lock: Option<String>,
+}
+
+impl LockArgs {
+	/// Resolve to the lock this verb acts on.
+	pub fn target(&self, context: &Context) -> Result<LockTarget> {
+		match (&self.lock, &self.name) {
+			(Some(name), _) => {
+				LockTarget::file(&crate::env::env::lock_by_name(&context.config, name)?)
+			}
+			(None, Some(token)) => LockTarget::resolve(&context.config, token),
+			(None, None) => unreachable!("clap requires a target or --lock"),
+		}
+	}
+}
+
 #[derive(Args, Debug)]
 pub struct Update {
-	/// Target env (name, path, or `.`), or a lockfile by path.
-	pub name: String,
+	#[command(flatten)]
+	pub target: LockArgs,
 	/// Packages to update — **not yet supported** (per-package version update is a
 	/// later phase; naming any package is rejected). Omit them to advance every
 	/// tracked `flake.lock` input.
@@ -206,7 +284,7 @@ impl RunCmd for Update {
 			));
 		}
 
-		let mut target = LockTarget::resolve(&context.config, &self.name)?;
+		let mut target = self.target.target(context)?;
 		// Refuse an unwritable lock before any network work. (A `--dry-run` writes
 		// nothing, but the intent to mutate still doesn't apply.)
 		target.require_writable("env update")?;
@@ -225,8 +303,8 @@ impl RunCmd for Update {
 /// `env outdated <name>` — report which tracked github inputs have a newer upstream
 /// rev than the lock, **without writing** (like tack `look` / npins). Read-only, so it
 /// works on shell-only (embedded-lock) envs too. Advance them with `env update`.
-pub fn outdated(target: Target, context: &Context) -> Result<()> {
-	let lock_target = LockTarget::resolve(&context.config, &target.name)?;
+pub fn outdated(target: LockArgs, context: &Context) -> Result<()> {
+	let lock_target = target.target(context)?;
 	let targets = crate::relock::tracking_github_inputs(lock_target.lock())?;
 	if targets.is_empty() {
 		println!("clinix: no tracked github inputs to check");
@@ -266,8 +344,8 @@ pub fn outdated(target: Target, context: &Context) -> Result<()> {
 /// `env verify <name>` — re-check every locked github input still hashes to its
 /// recorded `narHash` (detects drift/tampering, like npins `verify`). Read-only;
 /// exits nonzero if any input fails.
-pub fn verify(target: Target, context: &Context) -> Result<()> {
-	let lock_target = LockTarget::resolve(&context.config, &target.name)?;
+pub fn verify(target: LockArgs, context: &Context) -> Result<()> {
+	let lock_target = target.target(context)?;
 	let targets = crate::relock::locked_github_inputs(lock_target.lock());
 	if targets.is_empty() {
 		println!("clinix: no locked github inputs to verify");
@@ -315,7 +393,10 @@ mod tests {
 		std::fs::write(dir.path().join("flake.lock"), lock.to_json()).unwrap();
 
 		Update {
-			name: dir.path().to_str().unwrap().to_string(),
+			target: LockArgs {
+				name: Some(dir.path().to_str().unwrap().to_string()),
+				lock: None,
+			},
 			packages: vec![],
 			dry_run: false,
 		}
@@ -454,25 +535,29 @@ fn report(changed_label: &str, skipped_label: &str, edit: &super::nix_edit::Edit
 /// `flake` dispatch: add/remove a flake input, or freeze/unfreeze the whole env.
 pub fn flake(args: Flake, context: &Context) -> Result<()> {
 	match args.action {
-		FlakeAction::Add(add) => flake_add(&args.name, add, context),
-		FlakeAction::Rm(rm) => flake_rm(&args.name, &rm.input, context),
-		FlakeAction::Freeze => flake_freeze(&args.name, context),
-		FlakeAction::Unfreeze(u) => flake_unfreeze(&args.name, &u.branch, context),
-		FlakeAction::WrapShell(_) if std::path::Path::new(&args.name).is_file() => {
-			Err(ClinixError::Target(format!(
-				"wrap-shell wraps an env's shell.nix; {} is a file — target its directory",
-				args.name
-			)))
-		}
-		FlakeAction::WrapShell(ws) => crate::env::wrap_shell::wrap_shell(&args.name, ws, context),
+		FlakeAction::Init(init) => flake_init(&args.target, &init.nixpkgs, context),
+		FlakeAction::Add(add) => flake_add(&args.target, add, context),
+		FlakeAction::Rm(rm) => flake_rm(&args.target, &rm.input, context),
+		FlakeAction::Freeze => flake_freeze(&args.target, context),
+		FlakeAction::Unfreeze(u) => flake_unfreeze(&args.target, &u.branch, context),
+		FlakeAction::WrapShell(ws) => match (&args.target.lock, &args.target.name) {
+			(None, Some(name)) if !std::path::Path::new(name).is_file() => {
+				crate::env::wrap_shell::wrap_shell(name, ws, context)
+			}
+			_ => Err(ClinixError::Target(
+				"wrap-shell wraps an env's shell.nix — target the env's directory, not a \
+				 lockfile"
+					.into(),
+			)),
+		},
 	}
 }
 
 /// `flake <env> add <github|git> …` — resolve one input and splice it into the lock
 /// (a machine-edited `flake.lock`; the user never hand-edits). github reuses the
 /// tested `resolve_github`; git uses `nix-prefetch-git`.
-fn flake_add(name: &str, add: FlakeAdd, context: &Context) -> Result<()> {
-	let mut target = LockTarget::resolve(&context.config, name)?;
+fn flake_add(target: &LockArgs, add: FlakeAdd, context: &Context) -> Result<()> {
+	let mut target = target.target(context)?;
 	target.require_writable("env flake add")?;
 
 	let (node, locked, original, summary) = match add.kind {
@@ -533,8 +618,8 @@ fn flake_add(name: &str, add: FlakeAdd, context: &Context) -> Result<()> {
 
 /// `flake <env> rm <input>` — drop a flake input's root edge (and its node when
 /// nothing else references it).
-fn flake_rm(name: &str, input: &str, context: &Context) -> Result<()> {
-	let mut target = LockTarget::resolve(&context.config, name)?;
+fn flake_rm(target: &LockArgs, input: &str, context: &Context) -> Result<()> {
+	let mut target = target.target(context)?;
 	target.require_writable("env flake rm")?;
 	if !target.lock_mut().remove_input(input) {
 		return Err(ClinixError::Resolve(format!(
@@ -565,8 +650,8 @@ fn git_basename(url: &str) -> String {
 /// `flake <env> freeze` — pin every tracked input at its current rev. A standard
 /// `flake.lock` edit (`original`: drop `ref`, add `rev`) + the `flake.nix` URL swap
 /// for `--flake` envs. Offline (copies `locked.rev`; no resolve).
-fn flake_freeze(name: &str, context: &Context) -> Result<()> {
-	let mut target = LockTarget::resolve(&context.config, name)?;
+fn flake_freeze(target: &LockArgs, context: &Context) -> Result<()> {
+	let mut target = target.target(context)?;
 	target.require_writable("env flake freeze")?;
 
 	let changes = freeze(target.lock_mut());
@@ -589,8 +674,8 @@ fn flake_freeze(name: &str, context: &Context) -> Result<()> {
 
 /// `flake <env> unfreeze --branch <ref>` — resume tracking `ref` for every frozen
 /// input. Requires `--branch` for now (no remembered ref yet).
-fn flake_unfreeze(name: &str, branch: &str, context: &Context) -> Result<()> {
-	let mut target = LockTarget::resolve(&context.config, name)?;
+fn flake_unfreeze(target: &LockArgs, branch: &str, context: &Context) -> Result<()> {
+	let mut target = target.target(context)?;
 	target.require_writable("env flake unfreeze")?;
 
 	let changes = unfreeze(target.lock_mut(), branch);

@@ -216,13 +216,31 @@ fn ensure_absent(path: &Path, root: &Path) -> Result<()> {
 	Ok(())
 }
 
+/// Create a new lockfile at `path` holding only nixpkgs at `nixpkgs_ref`
+/// ([`build_nixpkgs_lock`]; network). Refuses an existing file — a lock is never
+/// overwritten here — and creates missing parent directories. Shared by the
+/// implicit default lock (created on first use) and `env flake <path> init`.
+pub(crate) fn write_new_lock(path: &Path, nixpkgs_ref: &str, progress: &Progress) -> Result<()> {
+	if path.exists() {
+		return Err(ClinixError::AmbiguousInit {
+			path: path.display().to_string(),
+			detail: "a file already exists there; refusing to overwrite a lock".into(),
+		});
+	}
+	let lock = build_nixpkgs_lock(nixpkgs_ref, progress)?;
+	if let Some(parent) = path.parent() {
+		std::fs::create_dir_all(parent)?;
+	}
+	std::fs::write(path, lock.to_json())?;
+	Ok(())
+}
+
 /// Resolve the nixpkgs ref and assemble a classic `flake.lock` for it — clinix
 /// owns this state; no `nix flake`. A 40-hex `nixpkgs_ref` is recorded as a
 /// frozen `original.rev`; anything else is a tracked `original.ref` resolved via
 /// `git ls-remote`. The single node is a github source
 /// (`{narHash, owner, repo, rev, type}`), mirroring `pin init` + `pin update`.
-/// Also reused to lazily lock the seed catalog's nixpkgs pin (`env::env::launch`),
-/// which passes [`Progress::silent`]. Emits one progress step (frozen) or two
+/// Also reused by [`write_new_lock`]. Emits one progress step (frozen) or two
 /// (tracked: resolve then hash), each **before** its network call.
 pub(crate) fn build_nixpkgs_lock(nixpkgs_ref: &str, progress: &Progress) -> Result<FlakeLock> {
 	const OWNER: &str = "NixOS";

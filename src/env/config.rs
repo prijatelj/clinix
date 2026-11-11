@@ -160,55 +160,116 @@ pub struct EnvSettings {
 	/// `[env].registry` — relocate the registry (env store); default `<state>/envs`.
 	/// See [`Self::registry_dir`], folded into [`Config::registry_dir`] once.
 	pub registry: Option<PathBuf>,
-	/// The nixpkgs pin fragments build against (a ref clinix locks, or a lockfile).
-	pub nixpkgs: Option<NixpkgsPin>,
 	/// A nix file evaluating to a nixpkgs `config` attrset (e.g. an `allowUnfree`
 	/// predicate), applied when building seeds. If unset, clinix passes no explicit
 	/// config, so nixpkgs uses its default (`~/.config/nixpkgs/config.nix`).
 	pub nixpkgs_config: Option<PathBuf>,
-	/// `[env].locks` — the directory every lockfile clinix owns lives in, as
-	/// `<locks>/<name>.lock` (the stack pin is `default`). Default `<config>/locks`.
-	/// See [`Self::locks_dir`] and [`Self::pin_lock_path`].
-	pub locks: Option<PathBuf>,
-	/// `[env.pins]` — **named alternate nixpkgs pins**, each the same shape as
-	/// [`Self::nixpkgs`] (a ref clinix locks, or an existing lockfile).
+	/// `[env].locks_dir` — the directory holding the lock clinix creates itself
+	/// (`<locks_dir>/default.lock`). Default `<config>/locks`. See
+	/// [`Self::locks_dir`].
+	pub locks_dir: Option<PathBuf>,
+	/// `[env.locks]` — **named lockfiles**, `name = "path/to/name.lock"`. Every
+	/// value is a lockfile path ([`resolve_path`] against the config dir); clinix
+	/// never writes a declared one implicitly.
 	///
-	/// These do not change any stack's pin. They are offered to a seed that asks for
-	/// them (a `{ pkgs, pins }:` fragment), so one package can come from a different
-	/// nixpkgs than the rest of the stack — the narrow, declared form of the
-	/// otherwise-deferred multi-pin composition. A seed that does not name `pins` is
-	/// unaffected, and a declared-but-unreferenced pin is never fetched.
-	pub pins: BTreeMap<String, NixpkgsPin>,
+	/// - `default` is reserved: the lock seeds, all-seed unions, `-p` outside a
+	///   project, and `env new --from <seeds>` build against ([`Self::default_lock`]).
+	/// - Every entry is offered to a seed that asks for it as
+	///   `nixpkgsFrom.<name>` (a `{ pkgs, nixpkgsFrom }:` fragment), so one package
+	///   can come from a different nixpkgs than the rest of the stack. A seed that
+	///   does not name `nixpkgsFrom` is unaffected, and an entry nothing references
+	///   is never fetched.
+	#[serde(deserialize_with = "de_locks")]
+	pub locks: BTreeMap<String, PathBuf>,
 	pub seeds: SeedSettings,
 	/// `[env.gc]` — GC-root retention policy.
 	pub gc: GcSettings,
+	/// Retired `[env].nixpkgs` and `[env.pins]`, read only so [`Self::reject_retired`]
+	/// can name their replacement instead of silently ignoring them.
+	#[serde(rename = "nixpkgs")]
+	retired_nixpkgs: Option<toml::Value>,
+	#[serde(rename = "pins")]
+	retired_pins: Option<toml::Value>,
+}
+
+/// The reserved `[env.locks]` name of the default lock.
+pub const DEFAULT_LOCK: &str = "default";
+
+/// The branch the implicit default lock tracks when clinix creates it.
+pub const DEFAULT_NIXPKGS_REF: &str = "nixos-26.05";
+
+/// Where the default lock is, and whether it was declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultLock {
+	/// `[env.locks].default` — must exist; clinix never creates it.
+	Declared(PathBuf),
+	/// `<locks_dir>/default.lock` — created on first use, tracking
+	/// [`DEFAULT_NIXPKGS_REF`].
+	Implicit(PathBuf),
+}
+
+impl DefaultLock {
+	pub fn path(&self) -> &Path {
+		match self {
+			Self::Declared(p) | Self::Implicit(p) => p,
+		}
+	}
 }
 
 impl EnvSettings {
-	/// Where clinix's own lockfiles live: `[env].locks` ([`resolve_path`]) if set,
-	/// else `<config_dir>/locks`.
+	/// Where clinix's own lockfiles live: `[env].locks_dir` ([`resolve_path`]) if
+	/// set, else `<config_dir>/locks`.
 	///
 	/// A method on the settings rather than a constant, so the layout is stated once
 	/// and every caller agrees. Pure — no I/O, so unit-testable.
 	pub fn locks_dir(&self, config_dir: &Path) -> PathBuf {
-		match &self.locks {
+		match &self.locks_dir {
 			Some(p) => resolve_path(p, config_dir),
 			None => config_dir.join("locks"),
 		}
 	}
 
-	/// The lockfile a pin's **ref** form is lazily locked into:
-	/// `<locks>/<name>.lock`, with the **stack** pin ([`Self::nixpkgs`]) named
-	/// `default`.
-	///
-	/// The stack pin is just the pin every seed gets when it asks for none, so it
-	/// lives beside the named ones instead of at its own `<config>/flake.lock` —
-	/// one directory holds every lock clinix owns, and `<locks>` relocates them all
-	/// together. [`crate::env::pin_lock`] still honours a legacy
-	/// `<config>/flake.lock` if one is there, so an existing setup is not orphaned.
-	pub fn pin_lock_path(&self, config_dir: &Path, name: Option<&str>) -> PathBuf {
-		self.locks_dir(config_dir)
-			.join(format!("{}.lock", name.unwrap_or("default")))
+	/// The default lock: `[env.locks].default` if declared, else the implicit
+	/// `<locks_dir>/default.lock`. Pure — whether it exists is the caller's concern.
+	pub fn default_lock(&self, config_dir: &Path) -> DefaultLock {
+		match self.locks.get(DEFAULT_LOCK) {
+			Some(p) => DefaultLock::Declared(resolve_path(p, config_dir)),
+			None => DefaultLock::Implicit(
+				self.locks_dir(config_dir)
+					.join(format!("{DEFAULT_LOCK}.lock")),
+			),
+		}
+	}
+
+	/// A named lock's path: a declared `[env.locks]` entry, or — for `default` —
+	/// the implicit default lock. `None` for an undeclared name. Pure.
+	pub fn lock_path(&self, name: &str, config_dir: &Path) -> Option<PathBuf> {
+		if name == DEFAULT_LOCK {
+			return Some(self.default_lock(config_dir).path().to_path_buf());
+		}
+		self.locks.get(name).map(|p| resolve_path(p, config_dir))
+	}
+
+	/// Reject the retired lock settings, naming what replaced each. Called per
+	/// config file, so the error names the file holding the retired key.
+	fn reject_retired(&self) -> std::result::Result<(), String> {
+		if self.retired_nixpkgs.is_some() {
+			return Err(format!(
+				"`[env].nixpkgs` was removed — declare the default lock as `[env.locks] \
+				 {DEFAULT_LOCK} = \"<path>\"` (a lockfile path), or declare none and clinix \
+				 creates <locks_dir>/{DEFAULT_LOCK}.lock tracking {DEFAULT_NIXPKGS_REF} on \
+				 first use. To lock another branch: `clinix env flake <path> init --nixpkgs <ref>`"
+			));
+		}
+		if self.retired_pins.is_some() {
+			return Err(
+				"`[env.pins]` was renamed `[env.locks]`, whose entries are lockfile \
+				 paths: `name = \"path/to/name.lock\"`. Seeds take them as \
+				 `{ pkgs, nixpkgsFrom }:` instead of `{ pkgs, pins }:`"
+					.to_string(),
+			);
+		}
+		Ok(())
 	}
 
 	/// Where registry envs live: `[env].registry` ([`resolve_path`], relative to the
@@ -371,15 +432,58 @@ impl<'de> Deserialize<'de> for SeedSource {
 	}
 }
 
-/// The nixpkgs pin: a git **ref** clinix locks to a rev, or a path to an existing
-/// **lockfile** (never a channel — the design's §0).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum NixpkgsPin {
-	/// e.g. `nixos-26.05` — a branch/tag/rev clinix resolves and locks.
-	Ref(String),
-	/// `{ flake_lock = "path" }` — an existing lockfile is authoritative.
-	FlakeLock { flake_lock: PathBuf },
+/// Deserialize `[env.locks]`: a table of `name = "lockfile path"`. Each value must
+/// be a path string, and each name a nix identifier (it becomes the attribute
+/// `nixpkgsFrom.<name>` in generated nix). The retired shapes get a pointer to
+/// their replacement rather than serde's generic type error.
+fn de_locks<'de, D>(deserializer: D) -> std::result::Result<BTreeMap<String, PathBuf>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	use serde::de::Error;
+	let table = match toml::Value::deserialize(deserializer)? {
+		toml::Value::Table(t) => t,
+		toml::Value::String(_) => {
+			return Err(D::Error::custom(
+				"`[env].locks` is now the `[env.locks]` table of named lockfiles; the lock \
+				 directory setting moved to `[env].locks_dir`",
+			));
+		}
+		other => {
+			return Err(D::Error::custom(format!(
+				"`[env.locks]` must be a table of `name = \"path\"`, not a {}",
+				other.type_str()
+			)));
+		}
+	};
+	table
+		.into_iter()
+		.map(|(name, value)| {
+			if !is_nix_ident(&name) {
+				return Err(D::Error::custom(format!(
+					"`[env.locks].{name}`: a lock name must be a nix identifier \
+					 ([A-Za-z_][A-Za-z0-9_'-]*) — it becomes `nixpkgsFrom.{name}`"
+				)));
+			}
+			match value {
+				toml::Value::String(path) => Ok((name, PathBuf::from(path))),
+				_ => Err(D::Error::custom(format!(
+					"`[env.locks].{name}` must be a lockfile path string, e.g. \
+					 `{name} = \"locks/{name}.lock\"` (the `{{ flake_lock = … }}` and ref \
+					 forms are gone)"
+				))),
+			}
+		})
+		.collect()
+}
+
+/// Whether `name` is a plain nix identifier, safe to splice as an attribute name.
+fn is_nix_ident(name: &str) -> bool {
+	let mut chars = name.chars();
+	chars
+		.next()
+		.is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+		&& chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'' | '-'))
 }
 
 /// A minimal `config.toml` scaffold — the common case (a seed source to fill in).
@@ -421,45 +525,37 @@ shorthand = true
 # compose/ are its siblings there.
 # registry = "envs"
 
-# The nixpkgs pin seed fragments build against — a git ref clinix locks into
-# <locks>/default.lock (never a nix-channel), or a path to an existing lockfile
-# (relative to the config dir, or absolute).
-nixpkgs = "nixos-26.05"
-# nixpkgs = { flake_lock = "~/dev_env/flake.lock" }
-
 # A nix file evaluating to a nixpkgs `config` attrset applied when building seeds
 # — e.g. an allowUnfree predicate (like dev_env's nixpkgs-config.nix) or CUDA.
 # If unset, nixpkgs uses its default (~/.config/nixpkgs/config.nix).
 # nixpkgs_config = "~/dev_env/nixpkgs-config.nix"
 
-# Where the lockfiles clinix owns live, as <locks>/<name>.lock. The pin below is
-# named `default`, so the stack pin is <locks>/default.lock.
+# Where the lock clinix creates itself lives: <locks_dir>/default.lock.
 # Default: <config>/locks. A relative path resolves against the CONFIG dir, so the
 # whole config directory stays relocatable; an absolute path is used as given.
-# locks = "locks"
+# locks_dir = "locks"
 
-# Named ALTERNATE nixpkgs pins, each the same shape as [env].nixpkgs above (a ref
-# clinix locks, or an existing lockfile). They never change a stack's pin: they are
-# handed to a seed that asks for them, so one package can come from a different
-# nixpkgs than everything else in the shell.
+# Named lockfiles, `name = "path"` — always a path to an existing lockfile
+# (relative to the config dir, or absolute). clinix never writes one implicitly.
 #
-#   [env.pins]
-#   old      = { flake_lock = "~/.config/clinix/locks/old.lock" }   # existing lock
-#   unstable = "nixos-unstable"   # clinix locks it into <locks>/unstable.lock
+# `default` is reserved: the lock seeds, all-seed unions, `-p` outside a project,
+# and `env new --from <seeds>` build against. Undeclared, it is
+# <locks_dir>/default.lock, which clinix creates on first use tracking nixos-26.05.
+# A declared `default` that is missing is an error.
 #
-# PREFER the `flake_lock` form for a lock that already exists. A bare ref is only
-# used to CREATE the lock: once <locks>/<name>.lock is there, clinix returns it
-# untouched and the declared ref is never read again. clinix warns when the two
-# disagree, but the lock always wins.
+# [env.locks]
+# default  = "~/nixos/flake.lock"      # one lock for the system and the seeds
+# unstable = "locks/unstable.lock"     # create with: clinix env flake <path> init --nixpkgs nixos-unstable
 #
-# A seed opts in by accepting the argument, and indexes the pin by name:
+# Every entry is also handed to a seed that asks for it, so one package can come
+# from a different nixpkgs than everything else in the shell:
 #
-#   { pkgs, pins }:
-#   pkgs.mkShell { packages = [ pins.unstable.claude-code ]; }
+#   { pkgs, nixpkgsFrom }:
+#   pkgs.mkShell { packages = [ nixpkgsFrom.unstable.claude-code ]; }
 #
-# A seed that does not name `pins` is passed exactly what it was before, and a
-# declared pin nothing references is never fetched (nix attrsets are lazy).
-# Advance one with `clinix env update --pin unstable`.
+# A seed that does not name `nixpkgsFrom` is passed exactly what it was before, and
+# an entry nothing references is never fetched (nix attrsets are lazy).
+# Advance one with `clinix env update --lock unstable`.
 
 [env.gc]
 # How many PRIOR root versions to keep when a new version replaces the current one,
@@ -529,17 +625,19 @@ impl Settings {
 			},
 			env: EnvSettings {
 				registry: other.env.registry.or(self.env.registry),
-				nixpkgs: other.env.nixpkgs.or(self.env.nixpkgs),
 				nixpkgs_config: other.env.nixpkgs_config.or(self.env.nixpkgs_config),
-				locks: other.env.locks.or(self.env.locks),
+				locks_dir: other.env.locks_dir.or(self.env.locks_dir),
 				// Per-key merge (`other` wins a name collision), matching how the list
 				// settings concatenate `other` first: a local config can redefine one
-				// pin without restating the imported ones.
-				pins: {
-					let mut pins = self.env.pins;
-					pins.extend(other.env.pins);
-					pins
+				// lock without restating the imported ones.
+				locks: {
+					let mut locks = self.env.locks;
+					locks.extend(other.env.locks);
+					locks
 				},
+				// Already rejected per file by `reject_retired`.
+				retired_nixpkgs: None,
+				retired_pins: None,
 				seeds: SeedSettings {
 					sources: concat_first(other.env.seeds.sources, self.env.seeds.sources),
 					ignore: concat_first(other.env.seeds.ignore, self.env.seeds.ignore),
@@ -592,6 +690,9 @@ fn load_config_file(path: &Path, stack: &mut Vec<PathBuf>) -> Result<Settings> {
 	let text = fs::read_to_string(path)
 		.map_err(|e| ClinixError::Config(format!("{}: {e}", path.display())))?;
 	let this: Settings = toml::from_str(&text)
+		.map_err(|e| ClinixError::Config(format!("{}: {e}", path.display())))?;
+	this.env
+		.reject_retired()
 		.map_err(|e| ClinixError::Config(format!("{}: {e}", path.display())))?;
 
 	stack.push(canon);
@@ -648,15 +749,15 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 /// absolute path used as given, a **relative** path joined onto `base`.
 ///
 /// One rule for every configured path, with `base` being the directory that
-/// setting's default lives in — the **config** dir for config-side paths (`locks`,
-/// `flake_lock`, `nixpkgs_config`), the **state** dir for state-side ones
+/// setting's default lives in — the **config** dir for config-side paths
+/// (`locks_dir`, `[env.locks]` entries, `nixpkgs_config`), the **state** dir for state-side ones
 /// (`registry`).
 ///
 /// Resolving relative paths against the *process cwd* would make one config file
 /// mean different things depending on where clinix was invoked — the opposite of a
 /// declarative config. Resolving against `base` is what keeps a config directory
 /// relocatable and committable, which is the whole point of `--config` /
-/// `$CLINIX_CONFIG_DIR`: `flake_lock = "locks/unstable.lock"` keeps working after
+/// `$CLINIX_CONFIG_DIR`: `unstable = "locks/unstable.lock"` keeps working after
 /// the directory moves, while an absolute path still reaches a lock kept outside it.
 pub fn resolve_path(path: &Path, base: &Path) -> PathBuf {
 	let expanded = expand_tilde(path);
@@ -727,8 +828,8 @@ mod tests {
 			r#"
 [clinix]
 shorthand = false
-[env]
-nixpkgs = "nixos-26.05"
+[env.locks]
+default = "~/nixos/flake.lock"
 [env.seeds]
 sources = [ { path = "~/dev_env/shells", namespace = "dev" }, { path = "/abs/one.nix" } ]
 ignore = ["_*.nix"]
@@ -736,7 +837,10 @@ ignore = ["_*.nix"]
 		);
 		let s = Settings::load(dir.path()).unwrap();
 		assert!(!s.shorthand());
-		assert!(matches!(s.env.nixpkgs, Some(NixpkgsPin::Ref(ref r)) if r == "nixos-26.05"));
+		assert_eq!(
+			s.env.locks.get("default"),
+			Some(&PathBuf::from("~/nixos/flake.lock"))
+		);
 		assert_eq!(s.env.seeds.sources.len(), 2);
 		assert_eq!(s.env.seeds.sources[0].namespace.as_deref(), Some("dev"));
 		assert_eq!(s.env.seeds.ignore, vec!["_*.nix".to_string()]);
@@ -774,44 +878,62 @@ ignore = ["_*.nix"]
 		// Relative → under the config dir (the locks are part of the committable
 		// config, so that is the useful base).
 		let rel = EnvSettings {
-			locks: Some(PathBuf::from("pins")),
+			locks_dir: Some(PathBuf::from("my-locks")),
 			..Default::default()
 		};
-		assert_eq!(rel.locks_dir(cfg), PathBuf::from("/cfg/pins"));
+		assert_eq!(rel.locks_dir(cfg), PathBuf::from("/cfg/my-locks"));
 		// Absolute → used as given.
 		let abs = EnvSettings {
-			locks: Some(PathBuf::from("/var/lib/clinix/locks")),
+			locks_dir: Some(PathBuf::from("/var/lib/clinix/locks")),
 			..Default::default()
 		};
 		assert_eq!(abs.locks_dir(cfg), PathBuf::from("/var/lib/clinix/locks"));
 	}
 
 	#[test]
-	fn pin_lock_path_names_the_stack_pin_default_beside_the_named_ones() {
+	fn default_lock_is_declared_or_implicit_under_locks_dir() {
 		let cfg = Path::new("/cfg");
+		// Undeclared ⇒ the implicit lock clinix may create, under `locks_dir`.
 		let s = EnvSettings::default();
-		// The stack pin is just the unnamed pin, so it sits in the same directory.
 		assert_eq!(
-			s.pin_lock_path(cfg, None),
-			PathBuf::from("/cfg/locks/default.lock")
+			s.default_lock(cfg),
+			DefaultLock::Implicit(PathBuf::from("/cfg/locks/default.lock"))
 		);
-		assert_eq!(
-			s.pin_lock_path(cfg, Some("unstable")),
-			PathBuf::from("/cfg/locks/unstable.lock")
-		);
-		// `locks` relocates every one of them together.
 		let moved = EnvSettings {
-			locks: Some(PathBuf::from("/srv/pins")),
+			locks_dir: Some(PathBuf::from("/srv/locks")),
 			..Default::default()
 		};
 		assert_eq!(
-			moved.pin_lock_path(cfg, None),
-			PathBuf::from("/srv/pins/default.lock")
+			moved.default_lock(cfg),
+			DefaultLock::Implicit(PathBuf::from("/srv/locks/default.lock"))
+		);
+		// Declared ⇒ that path, resolved against the config dir.
+		let declared = EnvSettings {
+			locks: BTreeMap::from([("default".into(), PathBuf::from("mine.lock"))]),
+			..Default::default()
+		};
+		assert_eq!(
+			declared.default_lock(cfg),
+			DefaultLock::Declared(PathBuf::from("/cfg/mine.lock"))
+		);
+	}
+
+	#[test]
+	fn lock_path_resolves_declared_names_and_the_default() {
+		let cfg = Path::new("/cfg");
+		let s = EnvSettings {
+			locks: BTreeMap::from([("unstable".into(), PathBuf::from("locks/u.lock"))]),
+			..Default::default()
+		};
+		assert_eq!(
+			s.lock_path("unstable", cfg),
+			Some(PathBuf::from("/cfg/locks/u.lock"))
 		);
 		assert_eq!(
-			moved.pin_lock_path(cfg, Some("unstable")),
-			PathBuf::from("/srv/pins/unstable.lock")
+			s.lock_path("default", cfg),
+			Some(PathBuf::from("/cfg/locks/default.lock"))
 		);
+		assert_eq!(s.lock_path("nope", cfg), None);
 	}
 
 	#[test]
@@ -854,11 +976,10 @@ ignore = ["_*.nix"]
 	}
 
 	#[test]
-	fn env_locks_parses_and_merges_like_the_other_scalars() {
+	fn env_locks_dir_parses() {
 		let dir = tempfile::tempdir().unwrap();
-		write(dir.path(), "config.toml", "[env]\nlocks = \"my-locks\"\n");
+		write(dir.path(), "config.toml", "[env]\nlocks_dir = \"my-locks\"\n");
 		let s = Settings::load(dir.path()).unwrap();
-		assert_eq!(s.env.locks.as_deref(), Some(Path::new("my-locks")));
 		assert_eq!(
 			s.env.locks_dir(Path::new("/cfg")),
 			PathBuf::from("/cfg/my-locks")
@@ -866,54 +987,58 @@ ignore = ["_*.nix"]
 	}
 
 	#[test]
-	fn env_pins_accept_both_spellings_and_default_to_none() {
+	fn env_locks_are_name_to_path_and_default_to_none() {
 		let dir = tempfile::tempdir().unwrap();
 		write(
 			dir.path(),
 			"config.toml",
-			r#"
-[env]
-nixpkgs = { flake_lock = "~/nixos/flake.lock" }
-[env.pins]
-unstable = "nixos-unstable"
-held = { flake_lock = "~/.config/clinix/locks/held.lock" }
-"#,
+			"[env.locks]\ndefault = \"~/nixos/flake.lock\"\nunstable = \"locks/unstable.lock\"\n",
 		);
 		let s = Settings::load(dir.path()).unwrap();
-		// A named pin takes the *same* two shapes as the stack pin — a ref clinix
-		// locks, or an existing lockfile — because both go through `pin_lock`.
-		assert!(matches!(s.env.pins.get("unstable"), Some(NixpkgsPin::Ref(r)) if r == "nixos-unstable"));
-		assert!(matches!(
-			s.env.pins.get("held"),
-			Some(NixpkgsPin::FlakeLock { .. })
-		));
-		assert_eq!(s.env.pins.len(), 2);
-		// Absent section ⇒ no pins, which is what keeps every existing config and
-		// every existing seed behaving exactly as before.
-		assert!(Settings::default().env.pins.is_empty());
+		assert_eq!(s.env.locks.len(), 2);
+		assert_eq!(
+			s.env.locks.get("unstable"),
+			Some(&PathBuf::from("locks/unstable.lock"))
+		);
+		assert!(Settings::default().env.locks.is_empty());
 	}
 
 	#[test]
-	fn env_pins_merge_per_key_with_the_local_config_winning() {
+	fn env_locks_merge_per_key_with_the_local_config_winning() {
 		let dir = tempfile::tempdir().unwrap();
 		write(
 			dir.path(),
 			"base.toml",
-			"[env.pins]\nunstable = \"nixos-unstable\"\nold = \"nixos-25.05\"\n",
+			"[env.locks]\nunstable = \"u.lock\"\nold = \"old-base.lock\"\n",
 		);
 		write(
 			dir.path(),
 			"config.toml",
-			&format!(
-				"use = [\"{}/base.toml\"]\n[env.pins]\nold = \"nixos-24.11\"\n",
-				dir.path().display()
-			),
+			"use = [\"base.toml\"]\n[env.locks]\nold = \"old-local.lock\"\n",
 		);
 		let s = Settings::load(dir.path()).unwrap();
-		// The imported pin survives; the redefined one takes the local value — so a
-		// local config can override one pin without restating the rest.
-		assert!(matches!(s.env.pins.get("unstable"), Some(NixpkgsPin::Ref(r)) if r == "nixos-unstable"));
-		assert!(matches!(s.env.pins.get("old"), Some(NixpkgsPin::Ref(r)) if r == "nixos-24.11"));
+		// The imported entry survives; the redefined one takes the local value.
+		assert_eq!(s.env.locks.get("unstable"), Some(&PathBuf::from("u.lock")));
+		assert_eq!(s.env.locks.get("old"), Some(&PathBuf::from("old-local.lock")));
+	}
+
+	#[test]
+	fn retired_lock_settings_are_rejected_with_their_replacement() {
+		let err = |body: &str| {
+			let dir = tempfile::tempdir().unwrap();
+			write(dir.path(), "config.toml", body);
+			Settings::load(dir.path()).unwrap_err().to_string()
+		};
+		let e = err("[env]\nnixpkgs = \"nixos-26.05\"\n");
+		assert!(e.contains("[env].nixpkgs` was removed"), "{e}");
+		let e = err("[env.pins]\nunstable = \"nixos-unstable\"\n");
+		assert!(e.contains("renamed `[env.locks]`"), "{e}");
+		let e = err("[env]\nlocks = \"locks\"\n");
+		assert!(e.contains("`[env].locks_dir`"), "{e}");
+		let e = err("[env.locks]\nheld = { flake_lock = \"x.lock\" }\n");
+		assert!(e.contains("must be a lockfile path string"), "{e}");
+		let e = err("[env.locks]\n\"a.b\" = \"x.lock\"\n");
+		assert!(e.contains("nix identifier"), "{e}");
 	}
 
 	#[test]
@@ -997,7 +1122,7 @@ sources = [ "~/a/shells", { path = "~/b/seeds", namespace = "bee" }, "/abs/one.n
 [clinix]
 shorthand = true
 [env]
-nixpkgs = "nixos-26.05"
+locks_dir = "base-locks"
 [env.seeds]
 sources = [ { path = "/base/a" } ]
 "#,
@@ -1015,8 +1140,9 @@ sources = [ { path = "/local/b" } ]
 		);
 		let s = Settings::load(dir.path()).unwrap();
 		assert!(!s.shorthand(), "local scalar overrides base");
-		assert!(
-			matches!(s.env.nixpkgs, Some(NixpkgsPin::Ref(ref r)) if r == "nixos-26.05"),
+		assert_eq!(
+			s.env.locks_dir(Path::new("/cfg")),
+			PathBuf::from("/cfg/base-locks"),
 			"unset-in-local scalar is inherited from base"
 		);
 		let paths: Vec<String> = s
@@ -1097,7 +1223,8 @@ sources = [ { path = "/local/b" } ]
 		let full: Settings = toml::from_str(FULL_TEMPLATE).expect("full template parses");
 		// The full template documents the real defaults.
 		assert!(full.shorthand());
-		assert!(matches!(full.env.nixpkgs, Some(NixpkgsPin::Ref(ref r)) if r == "nixos-26.05"));
+		// No lock declared: the implicit default lock applies.
+		assert!(full.env.locks.is_empty());
 		// Unedited templates are warning-free: no live sources.
 		assert!(full.env.seeds.sources.is_empty());
 	}

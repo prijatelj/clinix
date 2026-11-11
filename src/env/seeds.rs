@@ -24,11 +24,11 @@ pub struct Seed {
 	pub name: String,
 	pub namespace: Option<String>,
 	pub path: PathBuf,
-	/// Whether this fragment's argument pattern accepts the declared `[env.pins]`
-	/// set (see [`accepts_pins`]). Clinix passes `pins` **only** to seeds that asked,
+	/// Whether this fragment's argument pattern accepts the declared `[env.locks]`
+	/// set (see [`accepts_nixpkgs_from`]). Clinix passes `nixpkgsFrom` **only** to seeds that asked,
 	/// because a strict attrset pattern (`{ pkgs }:`) errors on an unexpected
 	/// argument — so every existing seed keeps being called exactly as before.
-	pub wants_pins: bool,
+	pub wants_nixpkgs_from: bool,
 }
 
 /// How a candidate `*.nix` classifies under the shell-file gate.
@@ -176,7 +176,7 @@ impl Catalog {
 				name,
 				namespace: namespace.clone(),
 				path: file.to_path_buf(),
-				wants_pins: info.wants_pins,
+				wants_nixpkgs_from: info.wants_nixpkgs_from,
 			}),
 			SeedKind::Flake => self.warnings.push(format!(
 				"{}: looks like a flake.nix (flake seeds not supported yet) — skipped",
@@ -197,13 +197,13 @@ pub fn classify(src: &str) -> SeedKind {
 }
 
 /// What one syntactic pass over a candidate `*.nix` tells us: whether it is a usable
-/// seed, and whether it asked for the declared `[env.pins]` set. Both answers come
+/// seed, and whether it asked for the declared `[env.locks]` set. Both answers come
 /// from the **same** `rnix` parse — the file is read and parsed once per catalog
 /// build, not once per question.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SeedInfo {
 	pub kind: SeedKind,
-	pub wants_pins: bool,
+	pub wants_nixpkgs_from: bool,
 }
 
 pub fn inspect(src: &str) -> SeedInfo {
@@ -211,41 +211,41 @@ pub fn inspect(src: &str) -> SeedInfo {
 	if parse.errors().first().is_some() {
 		return SeedInfo {
 			kind: SeedKind::Invalid,
-			wants_pins: false,
+			wants_nixpkgs_from: false,
 		};
 	}
 	let syntax = parse.syntax();
 	if looks_like_flake(&syntax) {
 		return SeedInfo {
 			kind: SeedKind::Flake,
-			wants_pins: false,
+			wants_nixpkgs_from: false,
 		};
 	}
 	SeedInfo {
 		kind: SeedKind::Shell,
-		wants_pins: accepts_pins(&syntax),
+		wants_nixpkgs_from: accepts_nixpkgs_from(&syntax),
 	}
 }
 
-/// Which `[env.pins]` entries a fragment indexes, as far as a syntactic pass can
+/// Which `[env.locks]` entries a fragment indexes, as far as a syntactic pass can
 /// tell. Used by `env new --from` to copy **only the locks an env actually reads**
-/// into the materialized env, instead of every declared pin.
+/// into the materialized env, instead of every declared lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PinRefs {
-	/// Every use of `pins` was a static `pins.<name>` select, and these are the
+pub enum LockRefs {
+	/// Every use of `nixpkgsFrom` was a static `nixpkgsFrom.<name>` select, and these are the
 	/// names. A complete set — nothing else can be reached at eval time.
 	Named(std::collections::BTreeSet<String>),
-	/// `pins` is used in a form this pass cannot resolve to a fixed set of names.
-	/// Callers must assume **any** declared pin may be read.
+	/// `nixpkgsFrom` is used in a form this pass cannot resolve to a fixed set of names.
+	/// Callers must assume **any** declared lock may be read.
 	Unknown,
 }
 
-/// The pins a fragment indexes ([`PinRefs`]).
+/// The `[env.locks]` names a fragment indexes ([`LockRefs`]).
 ///
-/// Deliberately conservative: a name is collected only from `pins.<ident>`, and
-/// **any other** appearance of the `pins` identifier yields [`PinRefs::Unknown`] —
-/// `with pins;`, `pins.${n}`, `let p = pins;`, `builtins.getAttr n pins`, or handing
-/// `pins` to a function. Each of those can reach a name this pass never sees, and a
+/// Deliberately conservative: a name is collected only from `nixpkgsFrom.<ident>`, and
+/// **any other** appearance of the `nixpkgsFrom` identifier yields [`LockRefs::Unknown`] —
+/// `with nixpkgsFrom;`, `nixpkgsFrom.${n}`, `let p = nixpkgsFrom;`, `builtins.getAttr n nixpkgsFrom`, or handing
+/// `nixpkgsFrom` to a function. Each of those can reach a name this pass never sees, and a
 /// missed name is not a cosmetic slip: it is a materialized env that fails to
 /// evaluate. Over-copying a lock costs a few hundred bytes, so the asymmetry in
 /// consequences decides the direction of the guess.
@@ -253,22 +253,23 @@ pub enum PinRefs {
 /// Separate from [`inspect`] rather than a field on [`SeedInfo`]: only `env new`
 /// needs this, and it already reads each fragment in order to copy it, so the
 /// catalog — rebuilt on every composition — does not carry the cost.
-pub fn pin_refs(src: &str) -> PinRefs {
+pub fn lock_refs(src: &str) -> LockRefs {
 	let parse = rnix::Root::parse(src);
 	if parse.errors().first().is_some() {
-		return PinRefs::Unknown; // unparseable: assume the worst
+		return LockRefs::Unknown; // unparseable: assume the worst
 	}
 	let mut named = std::collections::BTreeSet::new();
 	for node in parse.syntax().descendants() {
-		if node.kind() != SyntaxKind::NODE_IDENT || node.text().to_string().trim() != "pins" {
+		if node.kind() != SyntaxKind::NODE_IDENT || node.text().to_string().trim() != "nixpkgsFrom"
+		{
 			continue;
 		}
-		// Two positions spell `pins` without *referencing* our argument, and must not
+		// Two positions spell `nixpkgsFrom` without *referencing* our argument, and must not
 		// be mistaken for a use of it:
 		match node.parent().map(|p| p.kind()) {
-			// the formal itself, `{ pkgs, pins }:`
+			// the formal itself, `{ pkgs, nixpkgsFrom }:`
 			Some(SyntaxKind::NODE_PAT_ENTRY) => continue,
-			// an attribute *name* — `pkgs.lib.pins`, or `{ pins = …; }`
+			// an attribute *name* — `pkgs.lib.nixpkgsFrom`, or `{ nixpkgsFrom = …; }`
 			Some(SyntaxKind::NODE_ATTRPATH) => continue,
 			_ => {}
 		}
@@ -277,19 +278,19 @@ pub fn pin_refs(src: &str) -> PinRefs {
 			Some(name) => {
 				named.insert(name);
 			}
-			None => return PinRefs::Unknown,
+			None => return LockRefs::Unknown,
 		}
 	}
-	PinRefs::Named(named)
+	LockRefs::Named(named)
 }
 
-/// For a `pins` reference, the first attrpath component of the select it heads —
-/// `pins.unstable.hello` → `unstable`. `None` whenever the name cannot be read off
-/// the syntax: the ident is not a select head at all (`with pins;`, `inherit pins;`,
-/// a bare `pins`), or the component is dynamic (`pins.${n}`) or a quoted string.
+/// For a `nixpkgsFrom` reference, the first attrpath component of the select it heads —
+/// `nixpkgsFrom.unstable.hello` → `unstable`. `None` whenever the name cannot be read off
+/// the syntax: the ident is not a select head at all (`with nixpkgsFrom;`, `inherit nixpkgsFrom;`,
+/// a bare `nixpkgsFrom`), or the component is dynamic (`nixpkgsFrom.${n}`) or a quoted string.
 fn static_select_name(ident: &SyntaxNode) -> Option<String> {
 	let select = ident.parent().filter(|p| p.kind() == SyntaxKind::NODE_SELECT)?;
-	// Only the select's *head* is a reference; `foo.pins` is an attribute name, and
+	// Only the select's *head* is a reference; `foo.nixpkgsFrom` is an attribute name, and
 	// is already excluded above.
 	if select.first_child().as_ref() != Some(ident) {
 		return None;
@@ -301,15 +302,15 @@ fn static_select_name(ident: &SyntaxNode) -> Option<String> {
 	(first.kind() == SyntaxKind::NODE_IDENT).then(|| first.text().to_string().trim().to_string())
 }
 
-/// Whether a fragment's top-level argument pattern would accept a `pins` argument:
-/// it names `pins` (`{ pkgs, pins }:`), or it ends in an ellipsis (`{ pkgs, ... }:`)
+/// Whether a fragment's top-level argument pattern would accept a `nixpkgsFrom` argument:
+/// it names `nixpkgsFrom` (`{ pkgs, nixpkgsFrom }:`), or it ends in an ellipsis (`{ pkgs, ... }:`)
 /// and so accepts anything.
 ///
 /// This is the opt-in gate, and it has to be syntactic: nix attrset patterns are
-/// strict, so passing `pins` to a `{ pkgs }:` fragment is an evaluation error rather
+/// strict, so passing `nixpkgsFrom` to a `{ pkgs }:` fragment is an evaluation error rather
 /// than an ignored argument. Reading the formals is therefore the only way to stay
 /// backward compatible with every seed already on disk.
-fn accepts_pins(root: &SyntaxNode) -> bool {
+fn accepts_nixpkgs_from(root: &SyntaxNode) -> bool {
 	let Some(lambda) = root
 		.first_child()
 		.filter(|n| n.kind() == SyntaxKind::NODE_LAMBDA)
@@ -322,7 +323,7 @@ fn accepts_pins(root: &SyntaxNode) -> bool {
 	else {
 		return false; // a simple `pkgs: …` binder takes no named arguments
 	};
-	// `...` accepts any extra argument; otherwise look for an explicit `pins` entry.
+	// `...` accepts any extra argument; otherwise look for an explicit `nixpkgsFrom` entry.
 	if pattern
 		.children_with_tokens()
 		.any(|e| e.kind() == SyntaxKind::TOKEN_ELLIPSIS)
@@ -334,13 +335,13 @@ fn accepts_pins(root: &SyntaxNode) -> bool {
 		.filter(|n| n.kind() == SyntaxKind::NODE_PAT_ENTRY)
 		.filter_map(|entry| {
 			// The entry's **first** ident is the formal's name; a later one would be
-			// part of a default value (`{ foo ? pins }` must not count as asking).
+			// part of a default value (`{ foo ? nixpkgsFrom }` must not count as asking).
 			entry
 				.children()
 				.find(|n| n.kind() == SyntaxKind::NODE_IDENT)
 				.map(|n| n.text().to_string())
 		})
-		.any(|formal| formal.trim() == "pins")
+		.any(|formal| formal.trim() == "nixpkgsFrom")
 }
 
 /// A flake shape = the top-level expression is an attrset with an `outputs`
@@ -427,73 +428,83 @@ mod tests {
 	const FLAKE: &str = "{\n  inputs.nixpkgs.url = \"github:NixOS/nixpkgs\";\n  outputs = { self, nixpkgs }: { };\n}\n";
 
 	#[test]
-	fn accepts_pins_reads_the_fragments_formals() {
-		let wants = |src: &str| inspect(src).wants_pins;
+	fn accepts_nixpkgs_from_reads_the_fragments_formals() {
+		let wants = |src: &str| inspect(src).wants_nixpkgs_from;
 		// Opted in explicitly, in either order, and with a default value.
-		assert!(wants("{ pkgs, pins }: pkgs.mkShell { }"));
-		assert!(wants("{ pins, pkgs }: pkgs.mkShell { }"));
-		assert!(wants("{ pkgs, pins ? { } }: pkgs.mkShell { }"));
-		// An ellipsis accepts anything, so it accepts `pins`.
+		assert!(wants("{ pkgs, nixpkgsFrom }: pkgs.mkShell { }"));
+		assert!(wants("{ nixpkgsFrom, pkgs }: pkgs.mkShell { }"));
+		assert!(wants("{ pkgs, nixpkgsFrom ? { } }: pkgs.mkShell { }"));
+		// An ellipsis accepts anything, so it accepts `nixpkgsFrom`.
 		assert!(wants("{ pkgs, ... }: pkgs.mkShell { }"));
 		assert!(wants("{ ... }@args: args.pkgs.mkShell { }"));
-		// Not opted in: the strict pattern every existing seed uses. Passing `pins`
+		// Not opted in: the strict pattern every existing seed uses. Passing `nixpkgsFrom`
 		// to one of these would be an evaluation error, which is why this gate exists.
 		assert!(!wants("{ pkgs }: pkgs.mkShell { }"));
 		assert!(!wants("{ pkgs, system }: pkgs.mkShell { }"));
 		// A simple binder takes no named arguments at all.
 		assert!(!wants("pkgs: pkgs.mkShell { }"));
-		// `pins` appearing as a default value — or anywhere in the body — is not a
+		// `nixpkgsFrom` appearing as a default value — or anywhere in the body — is not a
 		// request for the argument; only a formal's own name counts.
-		assert!(!wants("{ pkgs, foo ? pins }: pkgs.mkShell { }"));
-		assert!(!wants("{ pkgs }: pkgs.mkShell { packages = [ pins ]; }"));
+		assert!(!wants("{ pkgs, foo ? nixpkgsFrom }: pkgs.mkShell { }"));
+		assert!(!wants(
+			"{ pkgs }: pkgs.mkShell { packages = [ nixpkgsFrom ]; }"
+		));
 		// A flake is classified before formals are considered.
 		assert!(!wants(FLAKE));
 	}
 
 	#[test]
 	fn pin_refs_collects_static_selects_and_gives_up_on_anything_else() {
-		let named = |src: &str| match pin_refs(src) {
-			PinRefs::Named(n) => n.into_iter().collect::<Vec<_>>(),
-			PinRefs::Unknown => panic!("expected Named for: {src}"),
+		let named = |src: &str| match lock_refs(src) {
+			LockRefs::Named(n) => n.into_iter().collect::<Vec<_>>(),
+			LockRefs::Unknown => panic!("expected Named for: {src}"),
 		};
 
-		// No pins at all → an empty, complete set (nothing to copy).
+		// No nixpkgsFrom at all → an empty, complete set (nothing to copy).
 		assert!(named("{ pkgs }: pkgs.mkShell { }").is_empty());
-		// The ordinary form, including a deeper attrpath: only the pin name counts.
+		// The ordinary form, including a deeper attrpath: only the lock name counts.
 		assert_eq!(
-			named("{ pkgs, pins }: pkgs.mkShell { packages = [ pins.unstable.claude-code ]; }"),
+			named(
+				"{ pkgs, nixpkgsFrom }: pkgs.mkShell { packages = [ nixpkgsFrom.unstable.claude-code ]; }"
+			),
 			vec!["unstable"]
 		);
-		// Several pins, de-duplicated and sorted.
+		// Several nixpkgsFrom, de-duplicated and sorted.
 		assert_eq!(
-			named("{ pkgs, pins }: [ pins.old.a pins.unstable.b pins.old.c ]"),
+			named(
+				"{ pkgs, nixpkgsFrom }: [ nixpkgsFrom.old.a nixpkgsFrom.unstable.b nixpkgsFrom.old.c ]"
+			),
 			vec!["old", "unstable"]
 		);
-		// `pins` as an attrpath component, not a head, is unrelated to our argument.
-		assert!(named("{ pkgs }: pkgs.lib.pins").is_empty());
+		// `nixpkgsFrom` as an attrpath component, not a head, is unrelated to our argument.
+		assert!(named("{ pkgs }: pkgs.lib.nixpkgsFrom").is_empty());
 
 		// Everything that can reach a name this pass cannot see.
 		for src in [
-			"{ pkgs, pins }: with pins; [ unstable.hello ]", // bare names
-			"{ pkgs, pins }: pins.${pkgs.system}.hello",     // dynamic component
-			"{ pkgs, pins }: let p = pins; in p.unstable",   // aliased
-			"{ pkgs, pins }: builtins.getAttr \"unstable\" pins", // indirect
-			"{ pkgs, pins }: pkgs.callPackage ./x.nix { inherit pins; }", // handed on
-			"{ pkgs, pins }: pins",                          // returned whole
+			"{ pkgs, nixpkgsFrom }: with nixpkgsFrom; [ unstable.hello ]",              // bare names
+			"{ pkgs, nixpkgsFrom }: nixpkgsFrom.${pkgs.system}.hello",                  // dynamic component
+			"{ pkgs, nixpkgsFrom }: let p = nixpkgsFrom; in p.unstable",                // aliased
+			"{ pkgs, nixpkgsFrom }: builtins.getAttr \"unstable\" nixpkgsFrom",         // indirect
+			"{ pkgs, nixpkgsFrom }: pkgs.callPackage ./x.nix { inherit nixpkgsFrom; }", // handed on
+			"{ pkgs, nixpkgsFrom }: nixpkgsFrom",                                       // returned whole
 		] {
-			assert_eq!(pin_refs(src), PinRefs::Unknown, "should be Unknown: {src}");
+			assert_eq!(
+				lock_refs(src),
+				LockRefs::Unknown,
+				"should be Unknown: {src}"
+			);
 		}
 		// Unparseable → Unknown, never a false "complete set".
-		assert_eq!(pin_refs("{ ( broken"), PinRefs::Unknown);
+		assert_eq!(lock_refs("{ ( broken"), LockRefs::Unknown);
 	}
 
 	#[test]
-	fn a_cataloged_seed_carries_its_pins_opt_in() {
+	fn a_cataloged_seed_carries_its_nixpkgs_from_opt_in() {
 		let dir = tempfile::tempdir().unwrap();
 		std::fs::write(dir.path().join("plain.nix"), FRAGMENT).unwrap();
 		std::fs::write(
 			dir.path().join("pinned.nix"),
-			"{ pkgs, pins }: pkgs.mkShell { packages = [ pins.unstable.hello ]; }\n",
+			"{ pkgs, nixpkgsFrom }: pkgs.mkShell { packages = [ nixpkgsFrom.unstable.hello ]; }\n",
 		)
 		.unwrap();
 		let settings = SeedSettings {
@@ -502,7 +513,13 @@ mod tests {
 			namespace: None,
 		};
 		let cat = Catalog::build(&settings);
-		let by = |n: &str| cat.seeds.iter().find(|s| s.name == n).unwrap().wants_pins;
+		let by = |n: &str| {
+			cat.seeds
+				.iter()
+				.find(|s| s.name == n)
+				.unwrap()
+				.wants_nixpkgs_from
+		};
 		assert!(by("pinned"));
 		assert!(!by("plain"));
 	}

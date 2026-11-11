@@ -20,14 +20,22 @@ use super::{kind_str, nixpkgs_pin};
 pub struct Info {
 	/// Env to summarize (name, path, or `.`), or a lockfile by path; defaults to
 	/// the cwd project. A lockfile reports its pinned inputs only.
+	#[arg(conflicts_with = "lock")]
 	pub name: Option<String>,
+	/// A named lock from `[env.locks]` (or `default`): report its inputs.
+	#[arg(long, value_name = "NAME")]
+	pub lock: Option<String>,
 	/// Emit machine-readable JSON instead of a table.
 	#[arg(long)]
 	pub json: bool,
 }
 impl RunCmd for Info {
 	fn run(self, context: &Context) -> Result<()> {
-		// A bare lockfile has no packages to resolve — report its inputs.
+		// A lockfile has no packages to resolve — report its inputs.
+		if let Some(name) = &self.lock {
+			let path = crate::env::env::lock_by_name(&context.config, name)?;
+			return print_lockfile(LockTarget::file(&path)?, self.json);
+		}
 		if let Some(name) = self.name.as_deref()
 			&& std::path::Path::new(name).is_file()
 		{

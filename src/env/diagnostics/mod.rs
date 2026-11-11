@@ -186,6 +186,7 @@ fn report_active(context: &Context) -> Result<()> {
 				println!("not in a nix shell — reporting the cwd project:\n");
 				Info {
 					name: None,
+					lock: None,
 					json: false,
 				}
 				.run(context)
