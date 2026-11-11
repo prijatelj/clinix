@@ -16,6 +16,7 @@
 mod clean;
 mod compose;
 pub mod config;
+pub mod config_show;
 mod diagnostics;
 mod env;
 mod execution;
@@ -33,7 +34,7 @@ pub mod seeds;
 mod wrap_shell;
 
 pub(crate) use compose::{compose_nodes, launch, node_root, resolve_stack_key};
-pub(crate) use env::default_lock_location;
+pub(crate) use env::{LockOrigin, all_locks, default_lock_location};
 pub use diagnostics::{Deps, Info, InfoVerb, context_report};
 pub use env::{
 	Cmd, Context, Env, EnvArgs, Kind, OptionalTarget, Rename, RunCmd, ShellOptions, Target,

@@ -227,6 +227,11 @@ pub enum ConfigVerb {
 	},
 	/// Print the resolved config file path clinix reads.
 	Path,
+	/// Print the effective config as TOML — every setting, defaults included.
+	/// Values are grouped per section by source, highest precedence first: one
+	/// `# <file>` comment per file in the `use` chain, then `# discovered` (locks
+	/// found in locks_dir), then `# defaults`.
+	Show,
 	/// Show where clinix keeps its state on disk (registry envs, GC roots, the
 	/// generated compose files, and the seed nixpkgs pin).
 	State,
@@ -302,6 +307,10 @@ impl Cli {
 					print!("{tmpl}");
 					Ok(())
 				}
+				ConfigVerb::Show => {
+					println!("{}", crate::env::config_show::show(&context.config)?);
+					Ok(())
+				}
 				ConfigVerb::Path => {
 					println!(
 						"{}",
@@ -335,12 +344,20 @@ impl Cli {
 					);
 					let (default, how) = crate::env::default_lock_location(cfg, &settings);
 					println!("  default: {}   {how}", default.display());
-					for (name, path) in &settings.env.locks {
-						if name != crate::env::config::DEFAULT_LOCK {
-							let path = crate::env::config::resolve_path(path, &cfg.config_dir);
-							let state = if path.is_file() { "" } else { " (MISSING)" };
-							println!("  {name}: {}   [env.locks].{name}{state}", path.display());
+					for (name, (path, origin)) in crate::env::all_locks(cfg, &settings) {
+						if name == crate::env::config::DEFAULT_LOCK {
+							continue;
 						}
+						let how = match origin {
+							crate::env::LockOrigin::Declared if path.is_file() => {
+								format!("[env.locks].{name}")
+							}
+							crate::env::LockOrigin::Declared => {
+								format!("[env.locks].{name} (MISSING)")
+							}
+							crate::env::LockOrigin::Discovered => "discovered in locks_dir".into(),
+						};
+						println!("  {name}: {}   {how}", path.display());
 					}
 					Ok(())
 				}

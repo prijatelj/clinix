@@ -73,6 +73,7 @@ Three things worth knowing immediately:
 
 ```sh
 clinix config path                      # which config.toml clinix reads
+clinix config show                      # the effective config: every setting, defaults included
 clinix config state                     # where envs, GC roots, compose files, and the locks live
 clinix config example --full > ~/.config/clinix/config.toml
 ```
@@ -82,6 +83,13 @@ clinix config example --full > ~/.config/clinix/config.toml
 imports are the base, the importing file overrides them, later `use` entries win
 over earlier, list fields concatenate with the local file first, maps (`[env.locks]`)
 merge per key with the local file winning, and cycles error.
+
+**`clinix config show`** prints the merged result as valid TOML, values as
+written. Within each section, values are grouped by source, highest precedence
+first — a `# <file>` comment per file in the `use` chain, then `# discovered`
+(locks found in `locks_dir`), then `# defaults` — so everything you set reads
+first. A list merged from several files labels the items from each other file.
+`use` itself is omitted, since its imports are already folded in.
 
 **Paths in `config.toml`.** `~` expands; an absolute path is used as given; a
 **relative** path resolves against the directory that setting's default lives in —
@@ -107,7 +115,7 @@ which you are holding explains every behavioural difference that follows.
                     ┌──────────────────────────────────────────────┐
    seed             │ a *.nix FRAGMENT in your seed sources        │
                     │   `{ pkgs }: pkgs.mkShell { … }`             │
-                    │   (or `{ pkgs, nixpkgsFrom }:` — §4)         │
+                    │   (or `{ pkgs, envLocks }:` — §4)         │
                     │   read in place; named by basename           │
                     │   NOT self-contained: clinix supplies pkgs   │
                     └──────────────────────────────────────────────┘
@@ -232,11 +240,10 @@ without baking them into any of them.
 ```toml
 [env]
 # nixpkgs_config = "~/.config/nixpkgs/config.nix"    # allowUnfree/CUDA for seed builds
-# locks_dir = "locks"                                # where clinix creates default.lock (default <config>/locks)
+# locks_dir = "locks"                                # each <locks_dir>/<name>.lock is the lock <name> (default <config>/locks)
 
-[env.locks]                                          # optional: named lockfiles, `name = "path"`
-# default  = "~/nixos/flake.lock"                    # the lock seeds build against (below)
-# unstable = "locks/unstable.lock"                   # a lock a seed can take one package from (below)
+[env.locks]                                          # optional: locks kept elsewhere, `name = "path"`
+# default = "~/nixos/flake.lock"                     # the lock seeds build against (below)
 
 [env.seeds]
 sources = [
@@ -305,13 +312,23 @@ lock serves all-seed unions, `-p` outside a project (§6), and `env new --from
   must exist — clinix never writes a lock you declared, and a missing one is an
   error. This is how one lock governs your system *and* your seeds.
 
-Every `[env.locks]` value is a **path to a lockfile** — never a branch name — so
-the config and the file it names cannot disagree. To make a new lock from a
-branch, create it explicitly:
+**Named locks.** A lock is found by name in one of two ways, and a declared name
+wins over a discovered one:
+
+- **Discovered:** every `<locks_dir>/<name>.lock` is the lock `<name>`, with no
+  config entry. A file whose stem is not a nix identifier is skipped with a
+  warning, since it could not be named.
+- **Declared:** `[env.locks].<name> = "<path>"`, for a lock kept elsewhere (or to
+  override a discovered one). It must exist; clinix never writes a declared lock
+  implicitly.
+
+Every value is a **path to a lockfile** — never a branch name — so the config and
+the file it names cannot disagree. To make a new lock from a branch, create it
+explicitly:
 
 ```sh
-clinix env flake ~/.config/clinix/locks/unstable.lock init --nixpkgs nixos-unstable
-clinix env flake --lock unstable init --nixpkgs nixos-unstable   # same, for a declared name
+clinix env flake --lock unstable init --nixpkgs nixos-unstable   # → <locks_dir>/unstable.lock (or its declared path)
+clinix env flake ~/elsewhere/x.lock init --nixpkgs nixos-unstable
 ```
 
 `flake … init` refuses an existing file. Advance any lock with
@@ -337,37 +354,41 @@ move *every* package; a registry env with its own lock would do the same to ever
 seed unioned with it (§6). The narrow tool is a **named lock** that a seed opts
 into:
 
-```toml
-[env.locks]
-unstable = "locks/unstable.lock"   # relative → <config>/locks/unstable.lock
+```sh
+clinix env flake --lock unstable init --nixpkgs nixos-unstable   # → <locks_dir>/unstable.lock; no config needed
 ```
 
 ```nix
 # ~/.config/clinix/seeds/claude-latest.nix
-{ pkgs, nixpkgsFrom }:
+{ pkgs, envLocks }:
 pkgs.mkShell {
   name = "claude-latest";
-  packages = [ nixpkgsFrom.unstable.claude-code ];   # this one package from unstable
+  packages = [ envLocks.unstable.nixpkgs.claude-code ];   # this one package from unstable
 }
 ```
 
 How it composes:
 
 - **Opt-in is the argument pattern.** clinix reads each seed's formals; a seed
-  naming `nixpkgsFrom` (or ending in `...`) is passed
-  `{ inherit pkgs nixpkgsFrom; }`, every other seed exactly `{ inherit pkgs; }`
+  naming `envLocks` (or ending in `...`) is passed
+  `{ inherit pkgs envLocks; }`, every other seed exactly `{ inherit pkgs; }`
   as before. Nix attrset patterns are strict, so this is what keeps existing
   `{ pkgs }:` seeds working untouched.
-- **`nixpkgsFrom.<name>` is always a nixpkgs package set** — the named lock's
-  `nixpkgs` input, imported with `[env].nixpkgs_config`. Every `[env.locks]`
-  entry is offered, including `default` when declared.
+- **`envLocks.<lock>.<input>` is any input of that lock.** The input named
+  `nixpkgs` is a **package set** (imported with `[env].nixpkgs_config`); every
+  other input is its fetched **source path** (`envLocks.default.nixos-hardware`).
+  Every named lock — declared or discovered, `default` included once it exists —
+  is offered.
+- **A nixpkgs input under another name** stays a path; import it yourself:
+  `import envLocks.default.nixpkgs-edge { system = pkgs.stdenv.hostPlatform.system; }`.
+  That import does not apply `[env].nixpkgs_config`.
 - **The stack's lock does not move.** `pkgs` — and `pkgs.mkShell` itself, and
   every other seed in the union — still comes from the stack's lock. Only what the
-  fragment explicitly takes from `nixpkgsFrom.<name>` diverges.
-- **Unused entries cost nothing.** `nixpkgsFrom` is a lazy attrset, so a declared
-  lock no seed reads is never fetched or evaluated. A declared lock that is
+  fragment explicitly takes from `envLocks.<lock>` diverges.
+- **Unused entries cost nothing.** `envLocks` is lazy at every level, so a lock or
+  input no seed reads is never fetched or evaluated. A declared lock that is
   missing gets a warning, and fails only if a seed actually reads it.
-- A seed asking for `nixpkgsFrom` when `[env.locks]` declares nothing gets a
+- A seed asking for `envLocks` when no lock is declared or discovered gets a
   warning, and the composition then fails to evaluate.
 
 The worked case this exists for — current Claude Code without moving anything
@@ -412,18 +433,18 @@ does not change it. Refresh by re-running `new --from`.
 Contrast with `clinix rust claude python`, which reads the fragments **live** —
 Nix re-evaluates on every entry, so a seed edit takes effect immediately.
 
-**Named locks are materialised too.** A copied `{ pkgs, nixpkgsFrom }:` fragment
+**Named locks are materialised too.** A copied `{ pkgs, envLocks }:` fragment
 keeps its argument contract, so the env carries the locks it reads in
 `state/envs/<name>/locks/<name>.lock`, referenced by bare relative path — the env
 still evaluates after being copied anywhere. Only the locks the fragments actually
 index are copied:
 
-- clinix reads the `nixpkgsFrom.<name>` selections off each fragment's syntax;
-- a use it cannot resolve statically (`with nixpkgsFrom;`, `nixpkgsFrom.${x}`,
-  `let p = nixpkgsFrom;`, handing `nixpkgsFrom` to a function) falls back to
+- clinix reads the `envLocks.<lock>` selections off each fragment's syntax;
+- a use it cannot resolve statically (`with envLocks;`, `envLocks.${x}`,
+  `let p = envLocks;`, handing `envLocks` to a function) falls back to
   copying **every** declared lock, with a note — over-copying a few hundred bytes
   beats an env that cannot evaluate;
-- a fragment naming a lock `[env.locks]` does not declare, or a selected lock that
+- a fragment naming a lock that is neither declared nor discovered, or a selected lock that
   is missing, is an **error**, raised before anything is written, so a failed
   `new` leaves nothing behind;
 - each lock is copied byte-for-byte, unused inputs included.
@@ -587,7 +608,7 @@ clinix: not yet implemented: composing envs with differing flake.locks
 
 A seed's **named lock is not part of this check** (§4). It never governs
 `pkgs`, so `clinix claude-latest .` composes under the project's lock with only
-`claude-code` taken from `nixpkgsFrom.unstable` — exactly what a registry env
+`claude-code` taken from `envLocks.unstable` — exactly what a registry env
 carrying an unstable `flake.lock` could not do, since its lock would become the
 whole union's lock.
 
@@ -631,7 +652,7 @@ one construct: the `packages` list. Anything else is a normal file you own:
 - `shellHook`, environment variables, `VIRTUAL_ENV` wiring
 - `buildInputs` / `nativeBuildInputs` distinctions, `inputsFrom`
 - overlays, `overrideAttrs`, a package from a second nixpkgs input (for a
-  **seed**, prefer `[env.locks]` + `nixpkgsFrom` — §4 — which keeps the lock reader written once)
+  **seed**, prefer `[env.locks]` + `envLocks` — §4 — which keeps the lock reader written once)
 - any non-`mkShell` shape
 
 Versioned specs (`clinix env add work nodejs=20.11`) are **rejected**, not
@@ -668,9 +689,10 @@ clinix env update   ~/.config/clinix/locks/unstable.lock
 clinix env info     ~/.config/clinix/locks/unstable.lock   # its inputs: NAME / TYPE / REV / TRACKING
 ```
 
-A lock declared in `[env.locks]` can be named instead of pathed, with `--lock`
-in place of the target (the two are mutually exclusive). `default` always
-resolves — to the declared default, or the implicit one (§4):
+A named lock (§4: declared in `[env.locks]`, or discovered in `locks_dir`) can be
+named instead of pathed, with `--lock` in place of the target (the two are
+mutually exclusive). `default` always resolves — to the declared default, or the
+implicit one:
 
 ```sh
 clinix env update --lock unstable
@@ -956,7 +978,7 @@ Every one of these **errors clearly** rather than degrading silently:
 | `env new <ns>:<member> --from <seeds…>` | register a single shell into a member instead |
 | `env new --from <dir-or-file> -p <pkgs…>` (register mode) | register mode wraps the source shell, so there is no `packages` list to splice into; `env add` after registering |
 | `sys init` / `sys switch` / `sys rollback` | use `nixos-rebuild --file` |
-| a seed whose **whole** `pkgs` comes from its own pin, and flake seeds | deferred; for one package from another nixpkgs, use `[env.locks]` + `nixpkgsFrom` (§4) |
+| a seed whose **whole** `pkgs` comes from its own pin, and flake seeds | deferred; for one package from another nixpkgs, use `[env.locks]` + `envLocks` (§4) |
 | per-input `update`, per-input `freeze` | whole-env today; `flake rm` + `add` is the workaround |
 
 Two that do **not** error — they silently do less than the syntax suggests:
@@ -965,9 +987,9 @@ Two that do **not** error — they silently do less than the syntax suggests:
 |---|---|
 | `--pkg` layering by position | parses correctly, but the package lands in the composed shell's own `packages` list rather than at its slot between the envs (§6) |
 | `env roots` on a legacy unversioned root | lists the key as `(0 versions)`; `clean` handles it correctly (§8) |
-| `env new --from <file.nix>` (register mode) on a `{ pkgs, nixpkgsFrom }:` file | registers, but the wrapper passes only `pkgs`, so entering it fails to evaluate. Compose mode (`--from <seed>`) handles `nixpkgsFrom` (§5) |
-| `env flake <env> wrap-shell` on a `{ pkgs, nixpkgsFrom }:` shell | classified `conventional` and passed only `pkgs`; the flake fails to evaluate |
-| `env list` and named locks | `[env.locks]` is not listed there — `clinix config state` reports each entry; a registry env's materialised `locks/` are not reported |
+| `env new --from <file.nix>` (register mode) on a `{ pkgs, envLocks }:` file | registers, but the wrapper passes only `pkgs`, so entering it fails to evaluate. Compose mode (`--from <seed>`) handles `envLocks` (§5) |
+| `env flake <env> wrap-shell` on a `{ pkgs, envLocks }:` shell | classified `conventional` and passed only `pkgs`; the flake fails to evaluate |
+| `env list` and named locks | not listed there — `clinix config state` and `config show` report each one; a registry env's materialised `locks/` are not reported |
 
 ---
 
@@ -977,7 +999,8 @@ Two that do **not** error — they silently do less than the syntax suggests:
 |---|---|
 | `~/.config/clinix/config.toml` | the config (`clinix config path`) |
 | `<locks_dir>/default.lock` | the implicit default lock (seeds, all-seed unions, `-p` outside a project) — created on first use tracking `nixos-26.05`, committable; unused when `[env.locks].default` is declared. `<locks_dir>` = `[env].locks_dir`, default `~/.config/clinix/locks` |
-| `[env.locks].<name>` | a named lockfile, wherever its path points — never created implicitly (`clinix env flake <path> init`) |
+| `<locks_dir>/<name>.lock` | the named lock `<name>`, discovered without a config entry (`clinix env flake --lock <name> init`) |
+| `[env.locks].<name>` | a declared lockfile, wherever its path points — never created implicitly |
 | `<registry>/<name>/` | registry envs (`shell.nix`, `flake.lock`, `seeds/`, `locks/`, members). `<registry>` = `[env].registry`, default `~/.local/state/clinix/envs` |
 | `~/.local/state/clinix/roots/` | GC roots: `<key>@<seq>` + `<key>@<seq>.rt` |
 | `~/.local/state/clinix/compose/` | generated seed-stack compose expressions |

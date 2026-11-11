@@ -122,7 +122,7 @@ impl New {
 
 		let lock = super::env::default_lock(cfg, &settings)?;
 		// Decide which `[env.locks]` entries this env needs **before** the first write:
-		// a copied `{ pkgs, nixpkgsFrom }:` fragment still demands the argument, and an
+		// a copied `{ pkgs, envLocks }:` fragment still demands the argument, and an
 		// undeclared or missing lock is an error. `init` follows the same order (resolve, then write) so a failure
 		// leaves no half-built directory to block a retry.
 		let selected_locks = select_locks(cfg, &settings, &seeds)?;
@@ -146,7 +146,7 @@ impl New {
 		};
 		// Copy them in, for the same reason the lock and the nixpkgs config are copied
 		// above: the env must not reach back into the user's config dir.
-		let nixpkgs_from = copy_locks(&dest, &selected_locks)?;
+		let env_locks = copy_locks(&dest, &selected_locks)?;
 		let seed_label = seeds
 			.iter()
 			.map(|s| s.name.as_str())
@@ -165,7 +165,7 @@ impl New {
 		};
 		std::fs::write(
 			dest.join("shell.nix"),
-			render_composed_shell(&seeds, &label, with_config, &packages, &nixpkgs_from),
+			render_composed_shell(&seeds, &label, with_config, &packages, &env_locks),
 		)?;
 
 		super::env::warn_name_collision(cfg, &self.name);
@@ -557,12 +557,12 @@ fn render_wrapper_no_lock(source_expr: &str) -> String {
 /// from then on.
 /// One seed being materialized into a registry env: its catalog name (which becomes
 /// `seeds/<name>.nix`), the source fragment to copy, and whether that fragment asked
-/// for `nixpkgsFrom`. The flag is carried from the catalog rather than re-derived, so the
+/// for `envLocks`. The flag is carried from the catalog rather than re-derived, so the
 /// copy is called with exactly the arguments the live composition would use.
 struct SeedCopy {
 	name: String,
 	source: PathBuf,
-	wants_nixpkgs_from: bool,
+	wants_env_locks: bool,
 }
 
 impl SeedCopy {
@@ -570,25 +570,25 @@ impl SeedCopy {
 		SeedCopy {
 			name: seed.name.clone(),
 			source: seed.path.clone(),
-			wants_nixpkgs_from: seed.wants_nixpkgs_from,
+			wants_env_locks: seed.wants_env_locks,
 		}
 	}
 }
 
 /// Which `[env.locks]` entries a materialized env will need: the declared locks
 /// its copied fragments actually index, resolved to their source lockfiles. Empty
-/// when no copied seed asked for `nixpkgsFrom`.
+/// when no copied seed asked for `envLocks`.
 ///
 /// Only the referenced locks, not every declared one:
-/// [`crate::env::seeds::lock_refs`] reads the `nixpkgsFrom.<name>` selections off
-/// the syntax. A fragment using `nixpkgsFrom` in a form analysis cannot resolve
+/// [`crate::env::seeds::lock_refs`] reads the `envLocks.<name>` selections off
+/// the syntax. A fragment using `envLocks` in a form analysis cannot resolve
 /// falls back to **all** declared locks — over-copying a few hundred bytes is
 /// strictly better than an env that fails to evaluate.
 ///
 /// A seed naming a lock `[env.locks]` does not declare, or a selected lock that is
 /// missing, is an **error**, and this runs before `new` writes anything, so that
 /// error leaves no half-built env behind. The alternative would be an env whose
-/// `nixpkgsFrom.<name>` is a missing attribute, discovered only on first entry.
+/// `envLocks.<name>` is a missing attribute, discovered only on first entry.
 fn select_locks(
 	cfg: &crate::env::config::Config,
 	settings: &Settings,
@@ -596,15 +596,15 @@ fn select_locks(
 ) -> Result<Vec<(String, PathBuf)>> {
 	use crate::env::seeds::{LockRefs, lock_refs};
 
-	if !seeds.iter().any(|s| s.wants_nixpkgs_from) {
+	if !seeds.iter().any(|s| s.wants_env_locks) {
 		return Ok(Vec::new());
 	}
 	let declared = super::env::named_locks(cfg, settings);
 	let names = || -> String {
 		match declared.is_empty() {
-			true => "none declared".to_string(),
+			true => "none known".to_string(),
 			false => format!(
-				"declared: {}",
+				"known: {}",
 				declared
 					.iter()
 					.map(|(n, _)| n.as_str())
@@ -617,7 +617,7 @@ fn select_locks(
 	// Union the references across the fragments; one unresolvable use widens the
 	// whole set, since any declared lock might then be reached.
 	let mut wanted: Option<std::collections::BTreeSet<String>> = Some(Default::default());
-	for seed in seeds.iter().filter(|s| s.wants_nixpkgs_from) {
+	for seed in seeds.iter().filter(|s| s.wants_env_locks) {
 		match lock_refs(&std::fs::read_to_string(&seed.source)?) {
 			LockRefs::Named(found) => {
 				if let Some(set) = wanted.as_mut() {
@@ -626,7 +626,7 @@ fn select_locks(
 			}
 			LockRefs::Unknown => {
 				eprintln!(
-					"clinix: note: `{}` indexes `nixpkgsFrom` dynamically — copying every \
+					"clinix: note: `{}` indexes `envLocks` dynamically — copying every \
 					 declared lock ({}) into the env",
 					seed.name,
 					names()
@@ -648,8 +648,8 @@ fn select_locks(
 					.cloned()
 					.ok_or_else(|| {
 						ClinixError::Config(format!(
-							"a seed reads `nixpkgsFrom.{name}`, but [env.locks] declares no \
-							 `{name}` ({})",
+							"a seed reads `envLocks.{name}`, but no lock `{name}` is declared \
+							 in [env.locks] or found in locks_dir ({})",
 							names()
 						))
 					})
@@ -672,7 +672,7 @@ fn select_locks(
 
 /// Copy the [`select_locks`] locks into `<dest>/locks/<name>.lock` and return the
 /// **bare relative** refs the generated `shell.nix` reads (`./locks/<name>.lock`).
-/// Empty input ⇒ no `locks/` dir and no `nixpkgsFrom` binding, so an env without
+/// Empty input ⇒ no `locks/` dir and no `envLocks` binding, so an env without
 /// named locks is byte-identical to one built before this existed.
 ///
 /// Locks are copied byte-for-byte: a lock's own unused inputs are part of the
@@ -696,15 +696,15 @@ fn render_composed_shell(
 	label: &str,
 	with_config: bool,
 	packages: &[String],
-	nixpkgs_from: &[(String, String)],
+	env_locks: &[(String, String)],
 ) -> String {
-	// A seed is handed `nixpkgsFrom` iff it asked — the same gate as the live composition
+	// A seed is handed `envLocks` iff it asked — the same gate as the live composition
 	// ([`crate::env::compose`]), applied to the copies.
 	let imports = seeds
 		.iter()
 		.map(|s| {
-			let args = if s.wants_nixpkgs_from {
-				"{ inherit pkgs nixpkgsFrom; }"
+			let args = if s.wants_env_locks {
+				"{ inherit pkgs envLocks; }"
 			} else {
 				"{ inherit pkgs; }"
 			};
@@ -725,7 +725,7 @@ fn render_composed_shell(
 		label,
 		packages,
 		// Relative to this file, so the env stays portable (see `copy_locks`).
-		nixpkgs_from,
+		env_locks,
 	}
 	.render()
 }
@@ -782,11 +782,11 @@ mod tests {
 	}
 
 	/// A seed copy as `compose_seeds` builds it, without touching the catalog.
-	fn copy_of(name: &str, wants_nixpkgs_from: bool) -> SeedCopy {
+	fn copy_of(name: &str, wants_env_locks: bool) -> SeedCopy {
 		SeedCopy {
 			name: name.to_string(),
 			source: PathBuf::from(format!("/src/{name}.nix")),
-			wants_nixpkgs_from,
+			wants_env_locks,
 		}
 	}
 
@@ -798,8 +798,8 @@ mod tests {
 		assert!(s.contains("import ./seeds/rust.nix { inherit pkgs; }"));
 		assert!(!s.contains("/src/"), "must not reference source paths");
 		assert!(s.contains("name = \"rust-claude\";"));
-		// No locks requested ⇒ no `nixpkgsFrom` binding at all.
-		assert!(!s.contains("nixpkgsFrom"));
+		// No locks requested ⇒ no `envLocks` binding at all.
+		assert!(!s.contains("envLocks"));
 
 		let s2 = render_composed_shell(&seeds, "rust claude", true, &[], &[]);
 		assert!(s2.contains("config = import ./nixpkgs-config.nix;"));
@@ -821,16 +821,16 @@ mod tests {
 	}
 
 	#[test]
-	fn render_composed_shell_carries_nixpkgs_from_for_the_seed_that_asked() {
-		// The regression this fixes: a copied `{ pkgs, nixpkgsFrom }:` fragment still demands
+	fn render_composed_shell_carries_env_locks_for_the_seed_that_asked() {
+		// The regression this fixes: a copied `{ pkgs, envLocks }:` fragment still demands
 		// the argument, so the generated import must supply it — and the named lock
 		// must be referenced as a BARE relative literal, since nix rejects a quoted
 		// relative path.
 		let seeds = vec![copy_of("claude-latest", true), copy_of("rust", false)];
 		let locks = [("unstable".to_string(), "./locks/unstable.lock".to_string())];
 		let s = render_composed_shell(&seeds, "claude-latest rust", false, &[], &locks);
-		assert!(s.contains("nixpkgsFrom = {\n    unstable = pkgsOf ./locks/unstable.lock;\n  };"));
-		assert!(s.contains("import ./seeds/claude-latest.nix { inherit pkgs nixpkgsFrom; }"));
+		assert!(s.contains("envLocks = {\n    unstable = inputsOf ./locks/unstable.lock;\n  };"));
+		assert!(s.contains("import ./seeds/claude-latest.nix { inherit pkgs envLocks; }"));
 		// The seed that did not ask keeps exactly its old argument.
 		assert!(s.contains("import ./seeds/rust.nix { inherit pkgs; }"));
 		// Still portable: no host path, and no quoted lock reference.

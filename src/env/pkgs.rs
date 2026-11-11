@@ -147,21 +147,19 @@ pub struct FlakeInit {
 
 /// `flake <path> init` / `flake --lock <name> init` — create a new lockfile holding
 /// only nixpkgs at `nixpkgs_ref` (network). The target is a **path that does not
-/// exist yet**, or a `[env.locks]` name whose declared file is missing — the one
-/// way a declared lock comes into being. Never overwrites.
+/// exist yet**, or a lock name: its declared `[env.locks]` path, else
+/// `<locks_dir>/<name>.lock` — which is then discovered by that name with no
+/// config entry. Never overwrites.
 fn flake_init(target: &LockArgs, nixpkgs_ref: &str, context: &Context) -> Result<()> {
 	let path = match (&target.lock, &target.name) {
 		(Some(name), _) => {
+			crate::env::env::validate_lock_name(name)?;
 			let settings = crate::env::config::Settings::load(&context.config.config_dir)?;
 			settings
 				.env
-				.lock_path(name, &context.config.config_dir)
-				.ok_or_else(|| {
-					ClinixError::Config(format!(
-						"no lock named `{name}` in [env.locks] — declare `{name} = \"<path>\"` \
-						 first, or pass the path directly"
-					))
-				})?
+				.lock_location(name, &context.config.config_dir)
+				.path()
+				.to_path_buf()
 		}
 		(None, Some(token)) => {
 			let path = std::path::PathBuf::from(token);
@@ -239,7 +237,8 @@ pub struct LockArgs {
 	/// Target env (name, path, or `.`), or a lockfile by path.
 	#[arg(required_unless_present = "lock", conflicts_with = "lock")]
 	pub name: Option<String>,
-	/// A named lock from `[env.locks]` (or `default`) instead of a target.
+	/// A named lock instead of a target: an `[env.locks]` entry, or
+	/// `<locks_dir>/<name>.lock` (`default` always resolves).
 	#[arg(long, value_name = "NAME")]
 	pub lock: Option<String>,
 }

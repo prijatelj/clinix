@@ -391,14 +391,15 @@ fn lock_flag_default_is_the_implicit_default_lock() {
 }
 
 #[test]
-fn lock_flag_unknown_name_lists_the_declared_ones() {
+fn lock_flag_unknown_name_lists_the_known_ones() {
 	let p = Project::new();
 	write_config(&p, "[env.locks]\nunstable = \"u.lock\"\n");
 	p.clinix(&["env", "update", "--lock", "nope"])
 		.assert()
 		.failure()
 		.stderr(predicate::str::contains("no lock named `nope`"))
-		.stderr(predicate::str::contains("declared: unstable"));
+		.stderr(predicate::str::contains("known: unstable"))
+		.stderr(predicate::str::contains("flake --lock nope init"));
 }
 
 #[test]
@@ -410,6 +411,46 @@ fn lock_flag_and_a_positional_target_conflict() {
 		.stderr(predicate::str::contains("cannot be used with"));
 	// Neither is also an error: one target is required.
 	p.clinix(&["env", "outdated"]).assert().failure();
+}
+
+#[test]
+fn a_lock_in_locks_dir_is_discovered_without_a_config_entry() {
+	let p = Project::new();
+	let lock = p.config_dir().join("locks/unstable.lock");
+	std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+	std::fs::write(&lock, common::MINIMAL_LOCK).unwrap();
+	// A stem that cannot be a nix attribute is skipped, with a warning.
+	std::fs::write(p.config_dir().join("locks/not.ok.lock"), common::MINIMAL_LOCK).unwrap();
+
+	// No config.toml at all: `unstable` is found by the locks_dir convention.
+	p.clinix(&["env", "flake", "--lock", "unstable", "freeze"])
+		.assert()
+		.success();
+	assert_eq!(nixpkgs_original(&lock)["rev"], "abc1234567890def");
+	p.clinix(&["config", "state"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("unstable"))
+		.stdout(predicate::str::contains("discovered in locks_dir"))
+		.stderr(predicate::str::contains("skipping"))
+		.stderr(predicate::str::contains("not.ok.lock"));
+}
+
+#[test]
+fn a_declared_lock_overrides_a_discovered_one_of_the_same_name() {
+	let p = Project::new();
+	std::fs::create_dir_all(p.config_dir().join("locks")).unwrap();
+	std::fs::write(p.config_dir().join("locks/unstable.lock"), common::MINIMAL_LOCK).unwrap();
+	let elsewhere = p.file("mine.lock");
+	std::fs::write(&elsewhere, common::MINIMAL_LOCK).unwrap();
+	write_config(
+		&p,
+		&format!("[env.locks]\nunstable = \"{}\"\n", elsewhere.display()),
+	);
+	p.clinix(&["env", "info", "--lock", "unstable"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("mine.lock"));
 }
 
 #[test]
@@ -463,11 +504,25 @@ fn flake_init_refuses_an_existing_file_and_a_directory_offline() {
 		.assert()
 		.failure()
 		.stderr(predicate::str::contains("is a directory"));
-	// An undeclared name has no path to create.
-	p.clinix(&["env", "flake", "--lock", "nope", "init"])
+	// A lock name becomes a file stem: no path traversal, checked before any network.
+	p.clinix(&["env", "flake", "--lock", "../x", "init"])
 		.assert()
 		.failure()
-		.stderr(predicate::str::contains("declare `nope"));
+		.stderr(predicate::str::contains("not a valid lock name"));
+}
+
+#[test]
+fn config_show_prints_effective_toml_with_provenance() {
+	let p = Project::new();
+	write_config(&p, "[env.gc]\nkeep_n_prior_roots = 3\n");
+	std::fs::create_dir_all(p.config_dir().join("locks")).unwrap();
+	std::fs::write(p.config_dir().join("locks/unstable.lock"), common::MINIMAL_LOCK).unwrap();
+	p.clinix(&["config", "show"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("config.toml\nkeep_n_prior_roots = 3\n# defaults\n"))
+		.stdout(predicate::str::contains("# discovered\nunstable = \"locks/unstable.lock\""))
+		.stdout(predicate::str::contains("[clinix]\n# defaults\nshorthand = true"));
 }
 
 #[test]

@@ -22,7 +22,7 @@ pub struct Info {
 	/// the cwd project. A lockfile reports its pinned inputs only.
 	#[arg(conflicts_with = "lock")]
 	pub name: Option<String>,
-	/// A named lock from `[env.locks]` (or `default`): report its inputs.
+	/// A named lock (an `[env.locks]` entry or `<locks_dir>/<name>.lock`): report its inputs.
 	#[arg(long, value_name = "NAME")]
 	pub lock: Option<String>,
 	/// Emit machine-readable JSON instead of a table.

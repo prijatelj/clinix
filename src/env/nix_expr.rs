@@ -33,19 +33,25 @@ pub fn nixpkgs_config_frag(config: Option<&Path>) -> String {
 
 /// The `let`-prelude shared by every clinix-generated nix file: the
 /// `{ system ? … }:` header plus the `flake.lock` reader (`fetch`/`sourcesOf`/
-/// `pkgsOf`), the `pkgs` binding, and — when any member asked for them — the
-/// named `[env.locks]` nixpkgs as `nixpkgsFrom`. It stops **before** `in`, so a caller appends
+/// `inputsOf`/`pkgsOf`), the `pkgs` binding, and — when any member asked for
+/// them — the named `[env.locks]` as `envLocks`. It stops **before** `in`, so a caller appends
 /// any extra `let` bindings (e.g. docker's `shell`/`envPackages`) and then its own
 /// `in <body>`. Substituted by [`lock_prelude`]:
 /// - `@LOCK@` — the lock reference placed after `readFile ` (a [`nix_str`] path, or
 ///   a bare relative literal like `./flake.lock`);
 /// - `@CONFIG@` — the optional nixpkgs `config` fragment ([`nixpkgs_config_frag`]),
 ///   empty when none;
-/// - `@NIXPKGS_FROM@` — the optional `nixpkgsFrom = { … };` block
-///   ([`nixpkgs_from_frag`]), empty when no member asked for it (so the generated
+/// - `@ENV_LOCKS@` — the optional `envLocks = { … };` block
+///   ([`env_locks_frag`]), empty when no member asked for it (so the generated
 ///   file is byte-identical to one without the feature).
 ///
-/// The reader is **lock-parameterized** (`sourcesOf`/`pkgsOf` take the lockfile)
+/// `inputsOf <lock>` is a lock's root inputs by name: the input named `nixpkgs` is
+/// **imported** as a package set (with `@CONFIG@`), every other input stays its
+/// fetched **source path**. `pkgsOf` is just its `nixpkgs`, so the import — and
+/// the nixpkgs config — is written once for the stack's `pkgs` and `envLocks`
+/// alike. Nix's laziness means only the inputs a shell reads are fetched.
+///
+/// The reader is **lock-parameterized** (`sourcesOf`/`inputsOf` take the lockfile)
 /// rather than closing over a single `lock` binding, because that is what lets one
 /// generated file instantiate nixpkgs from more than one lock — the stack's lock
 /// for `pkgs`, plus one per `[env.locks]` entry — from a single definition of the fetch
@@ -61,11 +67,14 @@ let
   sourcesOf = lockFile:
     let lock = builtins.fromJSON (builtins.readFile lockFile); in
     builtins.mapAttrs (_: node: fetch lock.nodes.${node}.locked) lock.nodes.root.inputs;
-  pkgsOf = lockFile: import (sourcesOf lockFile).nixpkgs { inherit system;@CONFIG@ };
+  inputsOf = lockFile: builtins.mapAttrs
+    (name: src: if name == "nixpkgs" then import src { inherit system;@CONFIG@ } else src)
+    (sourcesOf lockFile);
+  pkgsOf = lockFile: (inputsOf lockFile).nixpkgs;
   pkgs = pkgsOf @LOCK@;
-@NIXPKGS_FROM@"##;
+@ENV_LOCKS@"##;
 
-/// Fill [`LOCK_PRELUDE`] with no `nixpkgsFrom` — the shape every generated file
+/// Fill [`LOCK_PRELUDE`] with no `envLocks` — the shape every generated file
 /// has when no member asks for it. `lock_ref` is the exact text after `readFile `
 /// (already a [`nix_str`] result or a bare path); `config_frag` is the `@CONFIG@`
 /// fragment (`""` or a [`nixpkgs_config_frag`] string).
@@ -73,8 +82,8 @@ pub fn lock_prelude(lock_ref: &str, config_frag: &str) -> String {
 	lock_prelude_with_locks(lock_ref, config_frag, &[])
 }
 
-/// Fill [`LOCK_PRELUDE`], additionally binding `nixpkgsFrom` to one nixpkgs
-/// instance per entry of `locks` (see [`nixpkgs_from_frag`]). Empty `locks` ⇒
+/// Fill [`LOCK_PRELUDE`], additionally binding `envLocks` to one `inputsOf` set
+/// per entry of `locks` (see [`env_locks_frag`]). Empty `locks` ⇒
 /// identical to [`lock_prelude`].
 pub fn lock_prelude_with_locks(
 	lock_ref: &str,
@@ -84,11 +93,13 @@ pub fn lock_prelude_with_locks(
 	LOCK_PRELUDE
 		.replace("@LOCK@", lock_ref)
 		.replace("@CONFIG@", config_frag)
-		.replace("@NIXPKGS_FROM@", &nixpkgs_from_frag(locks))
+		.replace("@ENV_LOCKS@", &env_locks_frag(locks))
 }
 
-/// The `nixpkgsFrom = { <name> = pkgsOf <lock>; … };` block for the
-/// `[env.locks]` entries, or **empty** when there are none. Goes in `@NIXPKGS_FROM@`.
+/// The `envLocks = { <name> = inputsOf <lock>; … };` block for the named locks,
+/// or **empty** when there are none. A seed reads `envLocks.<lock>.<input>`:
+/// `envLocks.unstable.nixpkgs.claude-code` (a package set), or
+/// `envLocks.default.nixos-hardware` (a source path). Goes in `@ENV_LOCKS@`.
 ///
 /// Each `lock` is spliced **verbatim**, so the caller chooses the reference form:
 /// the live composition passes [`nix_str`] of an absolute path, while `new`'s
@@ -99,15 +110,15 @@ pub fn lock_prelude_with_locks(
 ///
 /// Within one composition the set is bound whole and nix attrsets are lazy, so an
 /// entry nothing references costs no fetch and no evaluation.
-pub fn nixpkgs_from_frag(locks: &[(String, String)]) -> String {
+pub fn env_locks_frag(locks: &[(String, String)]) -> String {
 	if locks.is_empty() {
 		return String::new();
 	}
 	let entries: String = locks
 		.iter()
-		.map(|(name, lock)| format!("    {name} = pkgsOf {lock};\n"))
+		.map(|(name, lock)| format!("    {name} = inputsOf {lock};\n"))
 		.collect();
-	format!("  nixpkgsFrom = {{\n{entries}  }};\n")
+	format!("  envLocks = {{\n{entries}  }};\n")
 }
 
 /// The `mkShell` tail shared by the seed-stack compose file and the `new` composed
@@ -170,11 +181,11 @@ pub struct ComposeSpec<'a> {
 	pub label: &'a str,
 	/// Ad-hoc package attribute names; empty ⇒ no `packages` line at all.
 	pub packages: &'a [String],
-	/// `[env.locks]` entries to bind as `nixpkgsFrom` ([`nixpkgs_from_frag`]); empty
-	/// ⇒ no `nixpkgsFrom` binding at all. `(name, already-rendered lock ref)` — rendered, like
+	/// `[env.locks]` entries to bind as `envLocks` ([`env_locks_frag`]); empty
+	/// ⇒ no `envLocks` binding at all. `(name, already-rendered lock ref)` — rendered, like
 	/// [`Self::lock_ref`] and for the same reason: the live compose path writes
 	/// quoted absolute paths while a materialized env writes bare relative literals.
-	pub nixpkgs_from: &'a [(String, String)],
+	pub env_locks: &'a [(String, String)],
 }
 
 impl ComposeSpec<'_> {
@@ -188,7 +199,7 @@ impl ComposeSpec<'_> {
 			.replace("@PACKAGES@", &packages_frag(self.packages));
 		format!(
 			"{}{tail}",
-			lock_prelude_with_locks(self.lock_ref, self.config_frag, self.nixpkgs_from)
+			lock_prelude_with_locks(self.lock_ref, self.config_frag, self.env_locks)
 		)
 	}
 }
@@ -218,26 +229,29 @@ mod tests {
 	fn lock_prelude_substitutes_lock_and_config() {
 		let p = lock_prelude("\"/cfg/flake.lock\"", " config = import \"/c.nix\";");
 		assert!(p.contains("pkgs = pkgsOf \"/cfg/flake.lock\";"));
+		// Only the input named `nixpkgs` is imported, with the config; the rest stay
+		// source paths. `pkgsOf` is that one input, so the import is written once.
 		assert!(p.contains(
-			"pkgsOf = lockFile: import (sourcesOf lockFile).nixpkgs \
-			 { inherit system; config = import \"/c.nix\"; };"
+			"if name == \"nixpkgs\" then import src \
+			 { inherit system; config = import \"/c.nix\"; } else src"
 		));
+		assert!(p.contains("pkgsOf = lockFile: (inputsOf lockFile).nixpkgs;"));
+		assert_eq!(p.matches("import src").count(), 1);
 		// A bare relative lock literal (composed env) is placed verbatim.
 		assert!(lock_prelude("./flake.lock", "").contains("pkgs = pkgsOf ./flake.lock;"));
 		// Empty config leaves a bare `{ inherit system; }`.
 		assert!(
-			lock_prelude("./flake.lock", "")
-				.contains("import (sourcesOf lockFile).nixpkgs { inherit system; };")
+			lock_prelude("./flake.lock", "").contains("import src { inherit system; } else src")
 		);
-		// No locks requested ⇒ no `nixpkgsFrom` binding at all, and the prelude still stops
+		// No locks requested ⇒ no `envLocks` binding at all, and the prelude still stops
 		// before `in` so callers can append their own bindings.
-		assert!(!lock_prelude("./flake.lock", "").contains("nixpkgsFrom"));
+		assert!(!lock_prelude("./flake.lock", "").contains("envLocks"));
 		assert!(lock_prelude("./flake.lock", "").ends_with(";\n"));
 	}
 
 	#[test]
-	fn nixpkgs_from_frag_is_empty_or_one_pkgs_of_per_declared_lock() {
-		assert_eq!(nixpkgs_from_frag(&[]), "");
+	fn env_locks_frag_is_empty_or_one_pkgs_of_per_declared_lock() {
+		assert_eq!(env_locks_frag(&[]), "");
 		// Quoted absolute refs — the live composition's form.
 		let locks = [
 			(
@@ -247,16 +261,16 @@ mod tests {
 			("old".to_string(), nix_str(Path::new("/c/locks/old.lock"))),
 		];
 		assert_eq!(
-			nixpkgs_from_frag(&locks),
-			"  nixpkgsFrom = {\n    unstable = pkgsOf \"/c/locks/unstable.lock\";\n    \
-			 old = pkgsOf \"/c/locks/old.lock\";\n  };\n"
+			env_locks_frag(&locks),
+			"  envLocks = {\n    unstable = inputsOf \"/c/locks/unstable.lock\";\n    \
+			 old = inputsOf \"/c/locks/old.lock\";\n  };\n"
 		);
 		// Bare relative refs — a materialized env's form, which must NOT be quoted
 		// (nix rejects a quoted relative path).
 		let rel = [("unstable".to_string(), "./locks/unstable.lock".to_string())];
 		assert_eq!(
-			nixpkgs_from_frag(&rel),
-			"  nixpkgsFrom = {\n    unstable = pkgsOf ./locks/unstable.lock;\n  };\n"
+			env_locks_frag(&rel),
+			"  envLocks = {\n    unstable = inputsOf ./locks/unstable.lock;\n  };\n"
 		);
 	}
 
@@ -267,11 +281,11 @@ mod tests {
 			nix_str(Path::new("/c/locks/unstable.lock")),
 		)];
 		let p = lock_prelude_with_locks("\"/cfg/flake.lock\"", "", &locks);
-		// The stack's lock and the named lock both go through `pkgsOf` — the fetch
+		// The stack's lock and the named lock both go through `inputsOf` — the fetch
 		// logic is defined exactly once no matter how many locks are in play.
 		assert_eq!(p.matches("fetchTarball").count(), 1);
 		assert!(p.contains("pkgs = pkgsOf \"/cfg/flake.lock\";"));
-		assert!(p.contains("    unstable = pkgsOf \"/c/locks/unstable.lock\";"));
+		assert!(p.contains("    unstable = inputsOf \"/c/locks/unstable.lock\";"));
 	}
 
 	#[test]

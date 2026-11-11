@@ -197,9 +197,9 @@ pub(crate) enum Node {
 		name: String,
 		path: PathBuf,
 		/// The fragment asked for the declared `[env.locks]` set — carried from the
-		/// catalog ([`crate::env::seeds::Seed::wants_nixpkgs_from`]) so composition does not
+		/// catalog ([`crate::env::seeds::Seed::wants_env_locks`]) so composition does not
 		/// re-parse the file.
-		wants_nixpkgs_from: bool,
+		wants_env_locks: bool,
 	},
 }
 
@@ -270,7 +270,7 @@ pub(crate) fn resolve_node(
 			Some(Resolved::One(seed)) => Ok(Node::Seed {
 				name: seed.name.clone(),
 				path: seed.path.clone(),
-				wants_nixpkgs_from: seed.wants_nixpkgs_from,
+				wants_env_locks: seed.wants_env_locks,
 			}),
 			Some(Resolved::Collision { chosen, others }) => {
 				// Prefer the `namespace:name` selector; a seed without a namespace
@@ -291,7 +291,7 @@ pub(crate) fn resolve_node(
 				Ok(Node::Seed {
 					name: chosen.name.clone(),
 					path: chosen.path.clone(),
-					wants_nixpkgs_from: chosen.wants_nixpkgs_from,
+					wants_env_locks: chosen.wants_env_locks,
 				})
 			}
 			None => Err(ClinixError::UnknownEnv(name.to_string())),
@@ -311,9 +311,10 @@ pub(crate) fn node_label(node: &Node) -> String {
 	}
 }
 
-/// The default lock's path — `[env.locks].default` if declared, else the implicit
-/// `<locks_dir>/default.lock`, which clinix **creates on first use** (network,
-/// once) tracking [`DEFAULT_NIXPKGS_REF`]. Never a channel (the design's §0).
+/// The default lock's path — `[env.locks].default` if declared, else the
+/// conventional `<locks_dir>/default.lock`, which clinix **creates on first use**
+/// (network, once) tracking [`DEFAULT_NIXPKGS_REF`]. Never a channel (the
+/// design's §0).
 ///
 /// A declared default must exist: clinix never writes a lock you declared. A
 /// lock left at the retired `<config>/flake.lock` location is an error naming the
@@ -324,10 +325,10 @@ pub(crate) fn default_lock(
 	cfg: &Config,
 	settings: &crate::env::config::Settings,
 ) -> Result<PathBuf> {
-	use crate::env::config::{DEFAULT_NIXPKGS_REF, DefaultLock};
+	use crate::env::config::{DEFAULT_LOCK, DEFAULT_NIXPKGS_REF, LockLocation};
 	match settings.env.default_lock(&cfg.config_dir) {
-		DefaultLock::Declared(path) => require_declared_lock("default", path),
-		DefaultLock::Implicit(path) => {
+		LockLocation::Declared(path) => require_declared_lock(DEFAULT_LOCK, path),
+		LockLocation::Conventional(path) => {
 			if path.is_file() {
 				return Ok(path);
 			}
@@ -358,10 +359,118 @@ pub(crate) fn require_declared_lock(name: &str, path: PathBuf) -> Result<PathBuf
 	} else {
 		Err(ClinixError::Config(format!(
 			"[env.locks].{name} not found: {} — a declared lock must exist; create it with \
-			 `clinix env flake {} init --nixpkgs <ref>`",
-			path.display(),
+			 `clinix env flake --lock {name} init --nixpkgs <ref>`",
 			path.display()
 		)))
+	}
+}
+
+/// How a named lock came to be known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockOrigin {
+	/// An `[env.locks]` entry.
+	Declared,
+	/// A `<locks_dir>/<name>.lock` file with no `[env.locks]` entry.
+	Discovered,
+}
+
+/// Every named lock: the `<locks_dir>/*.lock` files (discovered, named by file
+/// stem) overlaid by the `[env.locks]` entries (declared — a declared name wins).
+/// Declared paths are **unchecked**; discovered ones exist by construction.
+///
+/// A `*.lock` whose stem is not a nix identifier cannot be named
+/// (`envLocks.<name>`), so it is skipped with a warning rather than guessed at.
+pub(crate) fn all_locks(
+	cfg: &Config,
+	settings: &crate::env::config::Settings,
+) -> std::collections::BTreeMap<String, (PathBuf, LockOrigin)> {
+	let mut locks = std::collections::BTreeMap::new();
+	let dir = settings.env.locks_dir(&cfg.config_dir);
+	for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+		let path = entry.path();
+		if !path.is_file() || path.extension().is_none_or(|e| e != "lock") {
+			continue;
+		}
+		let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+			continue;
+		};
+		if crate::env::config::is_nix_ident(stem) {
+			locks.insert(stem.to_string(), (path, LockOrigin::Discovered));
+		} else {
+			eprintln!(
+				"clinix: warning: skipping {} — `{stem}` is not a nix identifier, so it \
+				 cannot be named as a lock",
+				path.display()
+			);
+		}
+	}
+	for (name, path) in &settings.env.locks {
+		locks.insert(
+			name.clone(),
+			(
+				crate::env::config::resolve_path(path, &cfg.config_dir),
+				LockOrigin::Declared,
+			),
+		);
+	}
+	locks
+}
+
+/// Every named lock as `(name, path)`, in name order — the `envLocks` set
+/// ([`all_locks`]). Unchecked: nix binds the set lazily, so a missing declared
+/// lock fails only if a seed actually references it; callers decide how strict
+/// to be ([`require_declared_lock`] for a lock they will copy).
+pub(crate) fn named_locks(
+	cfg: &Config,
+	settings: &crate::env::config::Settings,
+) -> Vec<(String, PathBuf)> {
+	all_locks(cfg, settings)
+		.into_iter()
+		.map(|(name, (path, _))| (name, path))
+		.collect()
+}
+
+/// Validate a lock name given on the command line: it becomes a file stem and an
+/// `envLocks` attribute, so it must be a nix identifier (which also rules out
+/// path traversal such as `../x`).
+pub(crate) fn validate_lock_name(name: &str) -> Result<()> {
+	if crate::env::config::is_nix_ident(name) {
+		Ok(())
+	} else {
+		Err(ClinixError::Config(format!(
+			"`{name}` is not a valid lock name — use a nix identifier \
+			 ([A-Za-z_][A-Za-z0-9_'-]*)"
+		)))
+	}
+}
+
+/// Resolve a `--lock <name>` selector to its lockfile, which must exist: a
+/// declared `[env.locks]` entry, or `<locks_dir>/<name>.lock`. `default` is the
+/// one exception — the conventional default is created on first use
+/// ([`default_lock`]).
+pub(crate) fn lock_by_name(cfg: &Config, name: &str) -> Result<PathBuf> {
+	use crate::env::config::LockLocation;
+	validate_lock_name(name)?;
+	let settings = crate::env::config::Settings::load(&cfg.config_dir)?;
+	if name == crate::env::config::DEFAULT_LOCK {
+		return default_lock(cfg, &settings);
+	}
+	match settings.env.lock_location(name, &cfg.config_dir) {
+		LockLocation::Declared(path) => require_declared_lock(name, path),
+		LockLocation::Conventional(path) if path.is_file() => Ok(path),
+		LockLocation::Conventional(path) => {
+			let known: Vec<String> = all_locks(cfg, &settings).into_keys().collect();
+			Err(ClinixError::Config(format!(
+				"no lock named `{name}` — not in [env.locks], and no {} (known: {}). \
+				 Create it with `clinix env flake --lock {name} init --nixpkgs <ref>`",
+				path.display(),
+				if known.is_empty() {
+					"none yet besides `default`".to_string()
+				} else {
+					known.join(", ")
+				}
+			)))
+		}
 	}
 }
 
@@ -373,9 +482,9 @@ pub(crate) fn default_lock_location(
 	cfg: &Config,
 	settings: &crate::env::config::Settings,
 ) -> (PathBuf, &'static str) {
-	use crate::env::config::DefaultLock;
+	use crate::env::config::LockLocation;
 	match settings.env.default_lock(&cfg.config_dir) {
-		DefaultLock::Declared(path) => {
+		LockLocation::Declared(path) => {
 			let how = if path.is_file() {
 				"[env.locks].default — yours; clinix never writes it"
 			} else {
@@ -383,58 +492,13 @@ pub(crate) fn default_lock_location(
 			};
 			(path, how)
 		}
-		DefaultLock::Implicit(path) => {
+		LockLocation::Conventional(path) => {
 			let how = if path.is_file() {
-				"implicit default, created by clinix"
+				"<locks_dir>/default.lock"
 			} else {
-				"implicit default — not created yet; clinix creates it on first use"
+				"<locks_dir>/default.lock — not created yet; clinix creates it on first use"
 			};
 			(path, how)
-		}
-	}
-}
-
-/// Every declared `[env.locks]` entry resolved to its lockfile path, in name
-/// order — the `nixpkgsFrom` set. **Unchecked**: nix binds the set lazily, so a
-/// missing entry fails only if a seed actually references it; callers decide how
-/// strict to be ([`require_declared_lock`] for a lock they will copy).
-pub(crate) fn named_locks(
-	cfg: &Config,
-	settings: &crate::env::config::Settings,
-) -> Vec<(String, PathBuf)> {
-	settings
-		.env
-		.locks
-		.iter()
-		.map(|(name, path)| {
-			(
-				name.clone(),
-				crate::env::config::resolve_path(path, &cfg.config_dir),
-			)
-		})
-		.collect()
-}
-
-/// Resolve a `--lock <name>` selector to its lockfile path: a declared
-/// `[env.locks]` entry (which must exist), or `default` (created on first use if
-/// implicit — see [`default_lock`]).
-pub(crate) fn lock_by_name(cfg: &Config, name: &str) -> Result<PathBuf> {
-	let settings = crate::env::config::Settings::load(&cfg.config_dir)?;
-	if name == crate::env::config::DEFAULT_LOCK {
-		return default_lock(cfg, &settings);
-	}
-	match settings.env.lock_path(name, &cfg.config_dir) {
-		Some(path) => require_declared_lock(name, path),
-		None => {
-			let declared: Vec<&str> = settings.env.locks.keys().map(String::as_str).collect();
-			Err(ClinixError::Config(format!(
-				"no lock named `{name}` in [env.locks] (declared: {})",
-				if declared.is_empty() {
-					"none besides the implicit `default`".to_string()
-				} else {
-					declared.join(", ")
-				}
-			)))
 		}
 	}
 }

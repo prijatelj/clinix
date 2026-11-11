@@ -25,10 +25,10 @@ pub struct Seed {
 	pub namespace: Option<String>,
 	pub path: PathBuf,
 	/// Whether this fragment's argument pattern accepts the declared `[env.locks]`
-	/// set (see [`accepts_nixpkgs_from`]). Clinix passes `nixpkgsFrom` **only** to seeds that asked,
+	/// set (see [`accepts_env_locks`]). Clinix passes `envLocks` **only** to seeds that asked,
 	/// because a strict attrset pattern (`{ pkgs }:`) errors on an unexpected
 	/// argument — so every existing seed keeps being called exactly as before.
-	pub wants_nixpkgs_from: bool,
+	pub wants_env_locks: bool,
 }
 
 /// How a candidate `*.nix` classifies under the shell-file gate.
@@ -176,7 +176,7 @@ impl Catalog {
 				name,
 				namespace: namespace.clone(),
 				path: file.to_path_buf(),
-				wants_nixpkgs_from: info.wants_nixpkgs_from,
+				wants_env_locks: info.wants_env_locks,
 			}),
 			SeedKind::Flake => self.warnings.push(format!(
 				"{}: looks like a flake.nix (flake seeds not supported yet) — skipped",
@@ -203,7 +203,7 @@ pub fn classify(src: &str) -> SeedKind {
 #[derive(Debug, PartialEq, Eq)]
 pub struct SeedInfo {
 	pub kind: SeedKind,
-	pub wants_nixpkgs_from: bool,
+	pub wants_env_locks: bool,
 }
 
 pub fn inspect(src: &str) -> SeedInfo {
@@ -211,19 +211,19 @@ pub fn inspect(src: &str) -> SeedInfo {
 	if parse.errors().first().is_some() {
 		return SeedInfo {
 			kind: SeedKind::Invalid,
-			wants_nixpkgs_from: false,
+			wants_env_locks: false,
 		};
 	}
 	let syntax = parse.syntax();
 	if looks_like_flake(&syntax) {
 		return SeedInfo {
 			kind: SeedKind::Flake,
-			wants_nixpkgs_from: false,
+			wants_env_locks: false,
 		};
 	}
 	SeedInfo {
 		kind: SeedKind::Shell,
-		wants_nixpkgs_from: accepts_nixpkgs_from(&syntax),
+		wants_env_locks: accepts_env_locks(&syntax),
 	}
 }
 
@@ -232,20 +232,20 @@ pub fn inspect(src: &str) -> SeedInfo {
 /// into the materialized env, instead of every declared lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockRefs {
-	/// Every use of `nixpkgsFrom` was a static `nixpkgsFrom.<name>` select, and these are the
+	/// Every use of `envLocks` was a static `envLocks.<name>` select, and these are the
 	/// names. A complete set — nothing else can be reached at eval time.
 	Named(std::collections::BTreeSet<String>),
-	/// `nixpkgsFrom` is used in a form this pass cannot resolve to a fixed set of names.
+	/// `envLocks` is used in a form this pass cannot resolve to a fixed set of names.
 	/// Callers must assume **any** declared lock may be read.
 	Unknown,
 }
 
 /// The `[env.locks]` names a fragment indexes ([`LockRefs`]).
 ///
-/// Deliberately conservative: a name is collected only from `nixpkgsFrom.<ident>`, and
-/// **any other** appearance of the `nixpkgsFrom` identifier yields [`LockRefs::Unknown`] —
-/// `with nixpkgsFrom;`, `nixpkgsFrom.${n}`, `let p = nixpkgsFrom;`, `builtins.getAttr n nixpkgsFrom`, or handing
-/// `nixpkgsFrom` to a function. Each of those can reach a name this pass never sees, and a
+/// Deliberately conservative: a name is collected only from `envLocks.<ident>`, and
+/// **any other** appearance of the `envLocks` identifier yields [`LockRefs::Unknown`] —
+/// `with envLocks;`, `envLocks.${n}`, `let p = envLocks;`, `builtins.getAttr n envLocks`, or handing
+/// `envLocks` to a function. Each of those can reach a name this pass never sees, and a
 /// missed name is not a cosmetic slip: it is a materialized env that fails to
 /// evaluate. Over-copying a lock costs a few hundred bytes, so the asymmetry in
 /// consequences decides the direction of the guess.
@@ -260,16 +260,16 @@ pub fn lock_refs(src: &str) -> LockRefs {
 	}
 	let mut named = std::collections::BTreeSet::new();
 	for node in parse.syntax().descendants() {
-		if node.kind() != SyntaxKind::NODE_IDENT || node.text().to_string().trim() != "nixpkgsFrom"
+		if node.kind() != SyntaxKind::NODE_IDENT || node.text().to_string().trim() != "envLocks"
 		{
 			continue;
 		}
-		// Two positions spell `nixpkgsFrom` without *referencing* our argument, and must not
+		// Two positions spell `envLocks` without *referencing* our argument, and must not
 		// be mistaken for a use of it:
 		match node.parent().map(|p| p.kind()) {
-			// the formal itself, `{ pkgs, nixpkgsFrom }:`
+			// the formal itself, `{ pkgs, envLocks }:`
 			Some(SyntaxKind::NODE_PAT_ENTRY) => continue,
-			// an attribute *name* — `pkgs.lib.nixpkgsFrom`, or `{ nixpkgsFrom = …; }`
+			// an attribute *name* — `pkgs.lib.envLocks`, or `{ envLocks = …; }`
 			Some(SyntaxKind::NODE_ATTRPATH) => continue,
 			_ => {}
 		}
@@ -284,13 +284,13 @@ pub fn lock_refs(src: &str) -> LockRefs {
 	LockRefs::Named(named)
 }
 
-/// For a `nixpkgsFrom` reference, the first attrpath component of the select it heads —
-/// `nixpkgsFrom.unstable.hello` → `unstable`. `None` whenever the name cannot be read off
-/// the syntax: the ident is not a select head at all (`with nixpkgsFrom;`, `inherit nixpkgsFrom;`,
-/// a bare `nixpkgsFrom`), or the component is dynamic (`nixpkgsFrom.${n}`) or a quoted string.
+/// For a `envLocks` reference, the first attrpath component of the select it heads —
+/// `envLocks.unstable.nixpkgs.hello` → `unstable`. `None` whenever the name cannot be read off
+/// the syntax: the ident is not a select head at all (`with envLocks;`, `inherit envLocks;`,
+/// a bare `envLocks`), or the component is dynamic (`envLocks.${n}`) or a quoted string.
 fn static_select_name(ident: &SyntaxNode) -> Option<String> {
 	let select = ident.parent().filter(|p| p.kind() == SyntaxKind::NODE_SELECT)?;
-	// Only the select's *head* is a reference; `foo.nixpkgsFrom` is an attribute name, and
+	// Only the select's *head* is a reference; `foo.envLocks` is an attribute name, and
 	// is already excluded above.
 	if select.first_child().as_ref() != Some(ident) {
 		return None;
@@ -302,15 +302,15 @@ fn static_select_name(ident: &SyntaxNode) -> Option<String> {
 	(first.kind() == SyntaxKind::NODE_IDENT).then(|| first.text().to_string().trim().to_string())
 }
 
-/// Whether a fragment's top-level argument pattern would accept a `nixpkgsFrom` argument:
-/// it names `nixpkgsFrom` (`{ pkgs, nixpkgsFrom }:`), or it ends in an ellipsis (`{ pkgs, ... }:`)
+/// Whether a fragment's top-level argument pattern would accept a `envLocks` argument:
+/// it names `envLocks` (`{ pkgs, envLocks }:`), or it ends in an ellipsis (`{ pkgs, ... }:`)
 /// and so accepts anything.
 ///
 /// This is the opt-in gate, and it has to be syntactic: nix attrset patterns are
-/// strict, so passing `nixpkgsFrom` to a `{ pkgs }:` fragment is an evaluation error rather
+/// strict, so passing `envLocks` to a `{ pkgs }:` fragment is an evaluation error rather
 /// than an ignored argument. Reading the formals is therefore the only way to stay
 /// backward compatible with every seed already on disk.
-fn accepts_nixpkgs_from(root: &SyntaxNode) -> bool {
+fn accepts_env_locks(root: &SyntaxNode) -> bool {
 	let Some(lambda) = root
 		.first_child()
 		.filter(|n| n.kind() == SyntaxKind::NODE_LAMBDA)
@@ -323,7 +323,7 @@ fn accepts_nixpkgs_from(root: &SyntaxNode) -> bool {
 	else {
 		return false; // a simple `pkgs: …` binder takes no named arguments
 	};
-	// `...` accepts any extra argument; otherwise look for an explicit `nixpkgsFrom` entry.
+	// `...` accepts any extra argument; otherwise look for an explicit `envLocks` entry.
 	if pattern
 		.children_with_tokens()
 		.any(|e| e.kind() == SyntaxKind::TOKEN_ELLIPSIS)
@@ -335,13 +335,13 @@ fn accepts_nixpkgs_from(root: &SyntaxNode) -> bool {
 		.filter(|n| n.kind() == SyntaxKind::NODE_PAT_ENTRY)
 		.filter_map(|entry| {
 			// The entry's **first** ident is the formal's name; a later one would be
-			// part of a default value (`{ foo ? nixpkgsFrom }` must not count as asking).
+			// part of a default value (`{ foo ? envLocks }` must not count as asking).
 			entry
 				.children()
 				.find(|n| n.kind() == SyntaxKind::NODE_IDENT)
 				.map(|n| n.text().to_string())
 		})
-		.any(|formal| formal.trim() == "nixpkgsFrom")
+		.any(|formal| formal.trim() == "envLocks")
 }
 
 /// A flake shape = the top-level expression is an attrset with an `outputs`
@@ -428,26 +428,26 @@ mod tests {
 	const FLAKE: &str = "{\n  inputs.nixpkgs.url = \"github:NixOS/nixpkgs\";\n  outputs = { self, nixpkgs }: { };\n}\n";
 
 	#[test]
-	fn accepts_nixpkgs_from_reads_the_fragments_formals() {
-		let wants = |src: &str| inspect(src).wants_nixpkgs_from;
+	fn accepts_env_locks_reads_the_fragments_formals() {
+		let wants = |src: &str| inspect(src).wants_env_locks;
 		// Opted in explicitly, in either order, and with a default value.
-		assert!(wants("{ pkgs, nixpkgsFrom }: pkgs.mkShell { }"));
-		assert!(wants("{ nixpkgsFrom, pkgs }: pkgs.mkShell { }"));
-		assert!(wants("{ pkgs, nixpkgsFrom ? { } }: pkgs.mkShell { }"));
-		// An ellipsis accepts anything, so it accepts `nixpkgsFrom`.
+		assert!(wants("{ pkgs, envLocks }: pkgs.mkShell { }"));
+		assert!(wants("{ envLocks, pkgs }: pkgs.mkShell { }"));
+		assert!(wants("{ pkgs, envLocks ? { } }: pkgs.mkShell { }"));
+		// An ellipsis accepts anything, so it accepts `envLocks`.
 		assert!(wants("{ pkgs, ... }: pkgs.mkShell { }"));
 		assert!(wants("{ ... }@args: args.pkgs.mkShell { }"));
-		// Not opted in: the strict pattern every existing seed uses. Passing `nixpkgsFrom`
+		// Not opted in: the strict pattern every existing seed uses. Passing `envLocks`
 		// to one of these would be an evaluation error, which is why this gate exists.
 		assert!(!wants("{ pkgs }: pkgs.mkShell { }"));
 		assert!(!wants("{ pkgs, system }: pkgs.mkShell { }"));
 		// A simple binder takes no named arguments at all.
 		assert!(!wants("pkgs: pkgs.mkShell { }"));
-		// `nixpkgsFrom` appearing as a default value — or anywhere in the body — is not a
+		// `envLocks` appearing as a default value — or anywhere in the body — is not a
 		// request for the argument; only a formal's own name counts.
-		assert!(!wants("{ pkgs, foo ? nixpkgsFrom }: pkgs.mkShell { }"));
+		assert!(!wants("{ pkgs, foo ? envLocks }: pkgs.mkShell { }"));
 		assert!(!wants(
-			"{ pkgs }: pkgs.mkShell { packages = [ nixpkgsFrom ]; }"
+			"{ pkgs }: pkgs.mkShell { packages = [ envLocks ]; }"
 		));
 		// A flake is classified before formals are considered.
 		assert!(!wants(FLAKE));
@@ -460,33 +460,33 @@ mod tests {
 			LockRefs::Unknown => panic!("expected Named for: {src}"),
 		};
 
-		// No nixpkgsFrom at all → an empty, complete set (nothing to copy).
+		// No envLocks at all → an empty, complete set (nothing to copy).
 		assert!(named("{ pkgs }: pkgs.mkShell { }").is_empty());
 		// The ordinary form, including a deeper attrpath: only the lock name counts.
 		assert_eq!(
 			named(
-				"{ pkgs, nixpkgsFrom }: pkgs.mkShell { packages = [ nixpkgsFrom.unstable.claude-code ]; }"
+				"{ pkgs, envLocks }: pkgs.mkShell { packages = [ envLocks.unstable.nixpkgs.claude-code ]; }"
 			),
 			vec!["unstable"]
 		);
-		// Several nixpkgsFrom, de-duplicated and sorted.
+		// Several envLocks, de-duplicated and sorted.
 		assert_eq!(
 			named(
-				"{ pkgs, nixpkgsFrom }: [ nixpkgsFrom.old.a nixpkgsFrom.unstable.b nixpkgsFrom.old.c ]"
+				"{ pkgs, envLocks }: [ envLocks.old.nixpkgs.a envLocks.unstable.nixpkgs.b envLocks.old.nixpkgs.c ]"
 			),
 			vec!["old", "unstable"]
 		);
-		// `nixpkgsFrom` as an attrpath component, not a head, is unrelated to our argument.
-		assert!(named("{ pkgs }: pkgs.lib.nixpkgsFrom").is_empty());
+		// `envLocks` as an attrpath component, not a head, is unrelated to our argument.
+		assert!(named("{ pkgs }: pkgs.lib.envLocks").is_empty());
 
 		// Everything that can reach a name this pass cannot see.
 		for src in [
-			"{ pkgs, nixpkgsFrom }: with nixpkgsFrom; [ unstable.hello ]",              // bare names
-			"{ pkgs, nixpkgsFrom }: nixpkgsFrom.${pkgs.system}.hello",                  // dynamic component
-			"{ pkgs, nixpkgsFrom }: let p = nixpkgsFrom; in p.unstable",                // aliased
-			"{ pkgs, nixpkgsFrom }: builtins.getAttr \"unstable\" nixpkgsFrom",         // indirect
-			"{ pkgs, nixpkgsFrom }: pkgs.callPackage ./x.nix { inherit nixpkgsFrom; }", // handed on
-			"{ pkgs, nixpkgsFrom }: nixpkgsFrom",                                       // returned whole
+			"{ pkgs, envLocks }: with envLocks; [ unstable.hello ]",              // bare names
+			"{ pkgs, envLocks }: envLocks.${pkgs.system}.hello",                  // dynamic component
+			"{ pkgs, envLocks }: let p = envLocks; in p.unstable",                // aliased
+			"{ pkgs, envLocks }: builtins.getAttr \"unstable\" envLocks",         // indirect
+			"{ pkgs, envLocks }: pkgs.callPackage ./x.nix { inherit envLocks; }", // handed on
+			"{ pkgs, envLocks }: envLocks",                                       // returned whole
 		] {
 			assert_eq!(
 				lock_refs(src),
@@ -499,12 +499,12 @@ mod tests {
 	}
 
 	#[test]
-	fn a_cataloged_seed_carries_its_nixpkgs_from_opt_in() {
+	fn a_cataloged_seed_carries_its_env_locks_opt_in() {
 		let dir = tempfile::tempdir().unwrap();
 		std::fs::write(dir.path().join("plain.nix"), FRAGMENT).unwrap();
 		std::fs::write(
 			dir.path().join("pinned.nix"),
-			"{ pkgs, nixpkgsFrom }: pkgs.mkShell { packages = [ nixpkgsFrom.unstable.hello ]; }\n",
+			"{ pkgs, envLocks }: pkgs.mkShell { packages = [ envLocks.unstable.nixpkgs.hello ]; }\n",
 		)
 		.unwrap();
 		let settings = SeedSettings {
@@ -518,7 +518,7 @@ mod tests {
 				.iter()
 				.find(|s| s.name == n)
 				.unwrap()
-				.wants_nixpkgs_from
+				.wants_env_locks
 		};
 		assert!(by("pinned"));
 		assert!(!by("plain"));

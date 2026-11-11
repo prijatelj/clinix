@@ -174,7 +174,7 @@ pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Compositi
 		.map(|i| Member {
 			path: i.shell.clone(),
 			pkgs: i.inject,
-			nixpkgs_from: i.wants_nixpkgs_from,
+			env_locks: i.wants_env_locks,
 		})
 		.collect();
 	adhoc_composition(cfg, &settings, &labels, &members, lock, packages)
@@ -202,9 +202,9 @@ fn adhoc_composition(
 		labels.join(" ")
 	};
 	let nixpkgs_config = nixpkgs_config_path(cfg, settings)?;
-	// `[env.locks]` is resolved **only** when a member asked for `nixpkgsFrom`, so a
+	// `[env.locks]` is resolved **only** when a member asked for `envLocks`, so a
 	// declared-but-unused entry costs nothing — not even the check that it exists.
-	let nixpkgs_from: Vec<(String, String)> = if members.iter().any(|m| m.nixpkgs_from) {
+	let env_locks: Vec<(String, String)> = if members.iter().any(|m| m.env_locks) {
 		// Absolute lock paths, quoted: this expression lives in `state/compose/` and
 		// must reach locks in the user's config dir.
 		let declared: Vec<(String, String)> = named_locks(cfg, settings)
@@ -214,7 +214,7 @@ fn adhoc_composition(
 				if !lock.is_file() {
 					eprintln!(
 						"clinix: warning: [env.locks].{name} not found: {} — \
-						 `nixpkgsFrom.{name}` will fail to evaluate if referenced",
+						 `envLocks.{name}` will fail to evaluate if referenced",
 						lock.display()
 					);
 				}
@@ -223,8 +223,8 @@ fn adhoc_composition(
 			.collect();
 		if declared.is_empty() {
 			eprintln!(
-				"clinix: warning: `{label}` asks for `nixpkgsFrom` but [env.locks] declares \
-				 none — `nixpkgsFrom.<name>` will fail to evaluate"
+				"clinix: warning: `{label}` asks for `envLocks` but no lock is declared in \
+				 [env.locks] or found in locks_dir — `envLocks.<name>` will fail to evaluate"
 			);
 		}
 		declared
@@ -238,7 +238,7 @@ fn adhoc_composition(
 		imports: &imports_frag(members),
 		label: &label,
 		packages,
-		nixpkgs_from: &nixpkgs_from,
+		env_locks: &env_locks,
 	}
 	.render();
 
@@ -294,7 +294,7 @@ struct UnionItem {
 	shell: PathBuf,
 	inject: bool,
 	/// The member asked for the declared `[env.locks]` set (seeds only).
-	wants_nixpkgs_from: bool,
+	wants_env_locks: bool,
 	lock: Option<PathBuf>,
 }
 
@@ -303,12 +303,12 @@ fn union_item(node: &Node) -> Result<UnionItem> {
 		Node::Seed {
 			name,
 			path,
-			wants_nixpkgs_from,
+			wants_env_locks,
 		} => UnionItem {
 			label: name.clone(),
 			shell: path.clone(),
 			inject: true,
-			wants_nixpkgs_from: *wants_nixpkgs_from,
+			wants_env_locks: *wants_env_locks,
 			lock: None,
 		},
 		Node::Env(env) => {
@@ -322,7 +322,7 @@ fn union_item(node: &Node) -> Result<UnionItem> {
 				label: env_label(env),
 				shell: env_shell_file(&env.root)?,
 				inject: false,
-				wants_nixpkgs_from: false,
+				wants_env_locks: false,
 				lock: Some(lock),
 			}
 		}
@@ -341,7 +341,7 @@ fn union_item(node: &Node) -> Result<UnionItem> {
 				label: file_label(path),
 				shell: path.clone(),
 				inject: false,
-				wants_nixpkgs_from: false,
+				wants_env_locks: false,
 				lock: Some(lock),
 			}
 		}
@@ -503,23 +503,23 @@ pub(crate) struct Member {
 	/// shared) `flake.lock` and takes `{ }`, which is what makes mixing a project
 	/// with seeds coherent under the shared-`flake.lock` union.
 	pub pkgs: bool,
-	/// Also pass the declared `[env.locks]` set as `nixpkgsFrom` — only for a seed
-	/// whose argument pattern accepts it ([`crate::env::seeds::Seed::wants_nixpkgs_from`]).
-	pub nixpkgs_from: bool,
+	/// Also pass the declared `[env.locks]` set as `envLocks` — only for a seed
+	/// whose argument pattern accepts it ([`crate::env::seeds::Seed::wants_env_locks`]).
+	pub env_locks: bool,
 }
 
 /// The newline-joined `(import <file> { … })` lines for `@IMPORTS@`, in composition
 /// order. Pure — the `*_frag` counterpart to [`crate::env::nix_expr::packages_frag`]
-/// and [`crate::env::nix_expr::nixpkgs_from_frag`], so each slot of the generated file has
+/// and [`crate::env::nix_expr::env_locks_frag`], so each slot of the generated file has
 /// exactly one builder.
 fn imports_frag(members: &[Member]) -> String {
 	members
 		.iter()
 		.map(|m| {
-			let args = match (m.pkgs, m.nixpkgs_from) {
-				(true, true) => "{ inherit pkgs nixpkgsFrom; }",
+			let args = match (m.pkgs, m.env_locks) {
+				(true, true) => "{ inherit pkgs envLocks; }",
 				(true, false) => "{ inherit pkgs; }",
-				(false, true) => "{ inherit nixpkgsFrom; }",
+				(false, true) => "{ inherit envLocks; }",
 				(false, false) => "{ }",
 			};
 			format!(
@@ -553,12 +553,12 @@ mod tests {
 			Member {
 				path: PathBuf::from("/s/rust.nix"),
 				pkgs: true,
-				nixpkgs_from: false,
+				env_locks: false,
 			},
 			Member {
 				path: PathBuf::from("/proj/shell.nix"),
 				pkgs: false,
-				nixpkgs_from: false,
+				env_locks: false,
 			},
 		]
 	}
@@ -572,7 +572,7 @@ mod tests {
 			imports: &imports_frag(members),
 			label,
 			packages,
-			nixpkgs_from: &[],
+			env_locks: &[],
 		}
 		.render()
 	}
@@ -610,29 +610,29 @@ mod tests {
 	}
 
 	#[test]
-	fn imports_frag_passes_nixpkgs_from_only_to_the_member_that_asked() {
-		// A seed that opted in (`{ pkgs, nixpkgsFrom }:`) beside one that did not: the
+	fn imports_frag_passes_env_locks_only_to_the_member_that_asked() {
+		// A seed that opted in (`{ pkgs, envLocks }:`) beside one that did not: the
 		// opt-out keeps the exact argument it got before `[env.locks]` existed, which
 		// is what makes the feature backward compatible with seeds on disk.
 		let members = vec![
 			Member {
 				path: PathBuf::from("/s/claude-latest.nix"),
 				pkgs: true,
-				nixpkgs_from: true,
+				env_locks: true,
 			},
 			Member {
 				path: PathBuf::from("/s/rust.nix"),
 				pkgs: true,
-				nixpkgs_from: false,
+				env_locks: false,
 			},
 		];
 		let frag = imports_frag(&members);
-		assert!(frag.contains("(import \"/s/claude-latest.nix\" { inherit pkgs nixpkgsFrom; })"));
+		assert!(frag.contains("(import \"/s/claude-latest.nix\" { inherit pkgs envLocks; })"));
 		assert!(frag.contains("(import \"/s/rust.nix\" { inherit pkgs; })"));
 	}
 
 	#[test]
-	fn a_composition_binds_nixpkgs_from_once_for_every_declared_lock() {
+	fn a_composition_binds_env_locks_once_for_every_declared_lock() {
 		let locks = [(
 			"unstable".to_string(),
 			crate::env::nix_expr::nix_str(Path::new("/c/locks/unstable.lock")),
@@ -643,17 +643,17 @@ mod tests {
 			imports: &imports_frag(&[Member {
 				path: PathBuf::from("/s/claude-latest.nix"),
 				pkgs: true,
-				nixpkgs_from: true,
+				env_locks: true,
 			}]),
 			label: "claude-latest",
-			nixpkgs_from: &locks,
+			env_locks: &locks,
 			..Default::default()
 		}
 		.render();
 		// Both locks go through the one `pkgsOf` reader, and the stack's lock is still
 		// the lock the shared-pin check settled on.
 		assert!(expr.contains("pkgs = pkgsOf \"/cfg/flake.lock\";"));
-		assert!(expr.contains("unstable = pkgsOf \"/c/locks/unstable.lock\";"));
+		assert!(expr.contains("unstable = inputsOf \"/c/locks/unstable.lock\";"));
 		assert_eq!(expr.matches("fetchTarball").count(), 1);
 	}
 }

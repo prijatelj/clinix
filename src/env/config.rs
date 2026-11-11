@@ -71,7 +71,7 @@ impl Config {
 				"XDG_CONFIG_HOME",
 				".config",
 			),
-			registry_dir: state_dir.join("envs"),
+			registry_dir: state_dir.join(DEFAULT_REGISTRY),
 			state_dir,
 		}
 	}
@@ -83,7 +83,7 @@ impl Config {
 	pub fn at(config_dir: PathBuf, state_dir: PathBuf) -> Self {
 		Config {
 			config_dir,
-			registry_dir: state_dir.join("envs"),
+			registry_dir: state_dir.join(DEFAULT_REGISTRY),
 			state_dir,
 		}
 	}
@@ -175,9 +175,9 @@ pub struct EnvSettings {
 	/// - `default` is reserved: the lock seeds, all-seed unions, `-p` outside a
 	///   project, and `env new --from <seeds>` build against ([`Self::default_lock`]).
 	/// - Every entry is offered to a seed that asks for it as
-	///   `nixpkgsFrom.<name>` (a `{ pkgs, nixpkgsFrom }:` fragment), so one package
+	///   `envLocks.<name>` (a `{ pkgs, envLocks }:` fragment), so one package
 	///   can come from a different nixpkgs than the rest of the stack. A seed that
-	///   does not name `nixpkgsFrom` is unaffected, and an entry nothing references
+	///   does not name `envLocks` is unaffected, and an entry nothing references
 	///   is never fetched.
 	#[serde(deserialize_with = "de_locks")]
 	pub locks: BTreeMap<String, PathBuf>,
@@ -192,26 +192,36 @@ pub struct EnvSettings {
 	retired_pins: Option<toml::Value>,
 }
 
+/// `[clinix].shorthand` when unset.
+pub const DEFAULT_SHORTHAND: bool = true;
+/// `[env].registry` when unset, relative to the state dir.
+pub const DEFAULT_REGISTRY: &str = "envs";
+/// `[env].locks_dir` when unset, relative to the config dir.
+pub const DEFAULT_LOCKS_DIR: &str = "locks";
+/// Every `[env.gc].keep_n_prior_*` when unset.
+pub const DEFAULT_KEEP_N_PRIOR: usize = 0;
+
 /// The reserved `[env.locks]` name of the default lock.
 pub const DEFAULT_LOCK: &str = "default";
 
 /// The branch the implicit default lock tracks when clinix creates it.
 pub const DEFAULT_NIXPKGS_REF: &str = "nixos-26.05";
 
-/// Where the default lock is, and whether it was declared.
+/// Where a named lock is, and how that was decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DefaultLock {
-	/// `[env.locks].default` — must exist; clinix never creates it.
+pub enum LockLocation {
+	/// `[env.locks].<name>` — must exist; clinix never creates a declared lock.
 	Declared(PathBuf),
-	/// `<locks_dir>/default.lock` — created on first use, tracking
-	/// [`DEFAULT_NIXPKGS_REF`].
-	Implicit(PathBuf),
+	/// `<locks_dir>/<name>.lock` — the convention for an undeclared name. A file
+	/// there is **discovered** without any config entry; the `default` one is
+	/// created on first use, tracking [`DEFAULT_NIXPKGS_REF`].
+	Conventional(PathBuf),
 }
 
-impl DefaultLock {
+impl LockLocation {
 	pub fn path(&self) -> &Path {
 		match self {
-			Self::Declared(p) | Self::Implicit(p) => p,
+			Self::Declared(p) | Self::Conventional(p) => p,
 		}
 	}
 }
@@ -225,29 +235,25 @@ impl EnvSettings {
 	pub fn locks_dir(&self, config_dir: &Path) -> PathBuf {
 		match &self.locks_dir {
 			Some(p) => resolve_path(p, config_dir),
-			None => config_dir.join("locks"),
+			None => config_dir.join(DEFAULT_LOCKS_DIR),
 		}
 	}
 
-	/// The default lock: `[env.locks].default` if declared, else the implicit
-	/// `<locks_dir>/default.lock`. Pure — whether it exists is the caller's concern.
-	pub fn default_lock(&self, config_dir: &Path) -> DefaultLock {
-		match self.locks.get(DEFAULT_LOCK) {
-			Some(p) => DefaultLock::Declared(resolve_path(p, config_dir)),
-			None => DefaultLock::Implicit(
-				self.locks_dir(config_dir)
-					.join(format!("{DEFAULT_LOCK}.lock")),
-			),
+	/// Where the lock named `name` is: its `[env.locks]` entry if declared, else
+	/// the conventional `<locks_dir>/<name>.lock`. Pure — whether it exists is the
+	/// caller's concern.
+	pub fn lock_location(&self, name: &str, config_dir: &Path) -> LockLocation {
+		match self.locks.get(name) {
+			Some(p) => LockLocation::Declared(resolve_path(p, config_dir)),
+			None => {
+				LockLocation::Conventional(self.locks_dir(config_dir).join(format!("{name}.lock")))
+			}
 		}
 	}
 
-	/// A named lock's path: a declared `[env.locks]` entry, or — for `default` —
-	/// the implicit default lock. `None` for an undeclared name. Pure.
-	pub fn lock_path(&self, name: &str, config_dir: &Path) -> Option<PathBuf> {
-		if name == DEFAULT_LOCK {
-			return Some(self.default_lock(config_dir).path().to_path_buf());
-		}
-		self.locks.get(name).map(|p| resolve_path(p, config_dir))
+	/// The default lock's location (see [`Self::lock_location`]).
+	pub fn default_lock(&self, config_dir: &Path) -> LockLocation {
+		self.lock_location(DEFAULT_LOCK, config_dir)
 	}
 
 	/// Reject the retired lock settings, naming what replaced each. Called per
@@ -265,7 +271,7 @@ impl EnvSettings {
 			return Err(
 				"`[env.pins]` was renamed `[env.locks]`, whose entries are lockfile \
 				 paths: `name = \"path/to/name.lock\"`. Seeds take them as \
-				 `{ pkgs, nixpkgsFrom }:` instead of `{ pkgs, pins }:`"
+				 `{ pkgs, envLocks }:` instead of `{ pkgs, pins }:`"
 					.to_string(),
 			);
 		}
@@ -282,26 +288,30 @@ impl EnvSettings {
 	pub fn registry_dir(&self, state_dir: &Path) -> PathBuf {
 		match &self.registry {
 			Some(p) => resolve_path(p, state_dir),
-			None => state_dir.join("envs"),
+			None => state_dir.join(DEFAULT_REGISTRY),
 		}
 	}
 
 	/// How many prior root versions to keep on replacement (default `0` = release
 	/// the outgoing version immediately). See [`GcSettings`].
 	pub fn keep_n_prior_roots(&self) -> usize {
-		self.gc.keep_n_prior_roots.unwrap_or(0)
+		self.gc.keep_n_prior_roots.unwrap_or(DEFAULT_KEEP_N_PRIOR)
 	}
 
 	/// Prior root versions to keep for **project** (`proj-*`) roots (default `0`;
 	/// negative = don't root projects at all). See [`GcSettings`].
 	pub fn keep_n_prior_project_roots(&self) -> i64 {
-		self.gc.keep_n_prior_project_roots.unwrap_or(0)
+		self.gc
+			.keep_n_prior_project_roots
+			.unwrap_or(DEFAULT_KEEP_N_PRIOR as i64)
 	}
 
 	/// Prior root versions to keep for **stack/union** (`stack-*`) roots (default `0`;
 	/// negative = don't root composed unions at all). See [`GcSettings`].
 	pub fn keep_n_prior_stack_roots(&self) -> i64 {
-		self.gc.keep_n_prior_stack_roots.unwrap_or(0)
+		self.gc
+			.keep_n_prior_stack_roots
+			.unwrap_or(DEFAULT_KEEP_N_PRIOR as i64)
 	}
 
 	/// The retention policy for a root **base key**: `None` = do not root it at all
@@ -434,7 +444,7 @@ impl<'de> Deserialize<'de> for SeedSource {
 
 /// Deserialize `[env.locks]`: a table of `name = "lockfile path"`. Each value must
 /// be a path string, and each name a nix identifier (it becomes the attribute
-/// `nixpkgsFrom.<name>` in generated nix). The retired shapes get a pointer to
+/// `envLocks.<name>` in generated nix). The retired shapes get a pointer to
 /// their replacement rather than serde's generic type error.
 fn de_locks<'de, D>(deserializer: D) -> std::result::Result<BTreeMap<String, PathBuf>, D::Error>
 where
@@ -462,7 +472,7 @@ where
 			if !is_nix_ident(&name) {
 				return Err(D::Error::custom(format!(
 					"`[env.locks].{name}`: a lock name must be a nix identifier \
-					 ([A-Za-z_][A-Za-z0-9_'-]*) — it becomes `nixpkgsFrom.{name}`"
+					 ([A-Za-z_][A-Za-z0-9_'-]*) — it becomes `envLocks.{name}`"
 				)));
 			}
 			match value {
@@ -478,7 +488,7 @@ where
 }
 
 /// Whether `name` is a plain nix identifier, safe to splice as an attribute name.
-fn is_nix_ident(name: &str) -> bool {
+pub(crate) fn is_nix_ident(name: &str) -> bool {
 	let mut chars = name.chars();
 	chars
 		.next()
@@ -530,13 +540,15 @@ shorthand = true
 # If unset, nixpkgs uses its default (~/.config/nixpkgs/config.nix).
 # nixpkgs_config = "~/dev_env/nixpkgs-config.nix"
 
-# Where the lock clinix creates itself lives: <locks_dir>/default.lock.
+# Named locks: each <locks_dir>/<name>.lock is the lock <name>, found with no
+# config entry (create one with `clinix env flake --lock <name> init --nixpkgs <ref>`).
 # Default: <config>/locks. A relative path resolves against the CONFIG dir, so the
 # whole config directory stays relocatable; an absolute path is used as given.
 # locks_dir = "locks"
 
-# Named lockfiles, `name = "path"` — always a path to an existing lockfile
-# (relative to the config dir, or absolute). clinix never writes one implicitly.
+# Locks kept ELSEWHERE, `name = "path"` — always a path to an existing lockfile
+# (relative to the config dir, or absolute); also overrides a same-named lock in
+# locks_dir. clinix never writes a declared lock implicitly.
 #
 # `default` is reserved: the lock seeds, all-seed unions, `-p` outside a project,
 # and `env new --from <seeds>` build against. Undeclared, it is
@@ -544,17 +556,18 @@ shorthand = true
 # A declared `default` that is missing is an error.
 #
 # [env.locks]
-# default  = "~/nixos/flake.lock"      # one lock for the system and the seeds
-# unstable = "locks/unstable.lock"     # create with: clinix env flake <path> init --nixpkgs nixos-unstable
+# default = "~/nixos/flake.lock"      # one lock for the system and the seeds
 #
-# Every entry is also handed to a seed that asks for it, so one package can come
-# from a different nixpkgs than everything else in the shell:
+# Every named lock is also handed to a seed that asks for it, as
+# envLocks.<lock>.<input>: the input named `nixpkgs` is a package set, any other
+# input its source path. So one package can come from a different nixpkgs than
+# everything else in the shell:
 #
-#   { pkgs, nixpkgsFrom }:
-#   pkgs.mkShell { packages = [ nixpkgsFrom.unstable.claude-code ]; }
+#   { pkgs, envLocks }:
+#   pkgs.mkShell { packages = [ envLocks.unstable.nixpkgs.claude-code ]; }
 #
-# A seed that does not name `nixpkgsFrom` is passed exactly what it was before, and
-# an entry nothing references is never fetched (nix attrsets are lazy).
+# A seed that does not name `envLocks` is passed exactly what it was before, and
+# a lock or input nothing references is never fetched (nix is lazy).
 # Advance one with `clinix env update --lock unstable`.
 
 [env.gc]
@@ -606,12 +619,21 @@ impl Settings {
 	/// Load `config.toml` from `config_dir`, resolving its `use` import chain. A
 	/// missing top-level file yields all defaults.
 	pub fn load(config_dir: &Path) -> Result<Settings> {
-		load_config_file(&config_dir.join("config.toml"), &mut Vec::new())
+		Ok(Self::fold(&load_layers(config_dir)?))
+	}
+
+	/// Merge [`Layer`]s given highest precedence first into the effective
+	/// settings. The merge is associative, so folding the flattened chain from the
+	/// lowest layer up equals merging each file over its own merged imports.
+	pub(crate) fn fold(layers: &[Layer]) -> Settings {
+		layers.iter().rev().fold(Settings::default(), |acc, layer| {
+			acc.merged_over(layer.settings.clone())
+		})
 	}
 
 	/// Whether the `clinix <name>` shorthand is enabled (default: yes).
 	pub fn shorthand(&self) -> bool {
-		self.clinix.shorthand.unwrap_or(true)
+		self.clinix.shorthand.unwrap_or(DEFAULT_SHORTHAND)
 	}
 
 	/// Merge `other` (higher precedence) over `self`: scalars — `other` wins when
@@ -672,14 +694,33 @@ fn concat_first<T>(high: Vec<T>, low: Vec<T>) -> Vec<T> {
 	v
 }
 
-/// Load one config file and its `use` chain, merged. `stack` holds the canonical
-/// paths being loaded, for cycle detection.
-fn load_config_file(path: &Path, stack: &mut Vec<PathBuf>) -> Result<Settings> {
-	if !path.exists() {
-		// A missing top-level config is fine (all defaults). A missing *imported*
-		// file is caught before recursion, with the importer named.
-		return Ok(Settings::default());
+/// One config file in the `use` chain: where it is, its raw table (what was
+/// written, for `config show`'s provenance), and its parsed settings.
+#[derive(Debug, Clone)]
+pub struct Layer {
+	pub path: PathBuf,
+	pub table: toml::Table,
+	pub settings: Settings,
+}
+
+/// Every config file in the `use` chain rooted at `<config_dir>/config.toml`,
+/// **highest precedence first**: a file, then its imports from last to first
+/// (later `use` wins), each followed by its own imports. Empty when there is no
+/// config file. The one walk of the chain — [`Settings::load`] folds it, and
+/// `config show` reads it for provenance.
+pub fn load_layers(config_dir: &Path) -> Result<Vec<Layer>> {
+	let mut layers = Vec::new();
+	let top = config_dir.join("config.toml");
+	// A missing top-level config is fine (all defaults).
+	if top.exists() {
+		collect_layers(&top, &mut Vec::new(), &mut layers)?;
 	}
+	Ok(layers)
+}
+
+/// Push `path`'s layer, then its imports' (see [`load_layers`]). `stack` holds the
+/// canonical paths being loaded, for cycle detection.
+fn collect_layers(path: &Path, stack: &mut Vec<PathBuf>, out: &mut Vec<Layer>) -> Result<()> {
 	let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 	if stack.contains(&canon) {
 		return Err(ClinixError::Config(format!(
@@ -687,38 +728,35 @@ fn load_config_file(path: &Path, stack: &mut Vec<PathBuf>) -> Result<Settings> {
 			path.display()
 		)));
 	}
-	let text = fs::read_to_string(path)
-		.map_err(|e| ClinixError::Config(format!("{}: {e}", path.display())))?;
-	let this: Settings = toml::from_str(&text)
-		.map_err(|e| ClinixError::Config(format!("{}: {e}", path.display())))?;
-	this.env
-		.reject_retired()
-		.map_err(|e| ClinixError::Config(format!("{}: {e}", path.display())))?;
+	let err = |e: &dyn std::fmt::Display| ClinixError::Config(format!("{}: {e}", path.display()));
+	let text = fs::read_to_string(path).map_err(|e| err(&e))?;
+	let table: toml::Table = toml::from_str(&text).map_err(|e| err(&e))?;
+	let settings: Settings = toml::from_str(&text).map_err(|e| err(&e))?;
+	settings.env.reject_retired().map_err(|e| err(&e))?;
+	let imports = settings.imports.clone();
+	out.push(Layer {
+		path: path.to_path_buf(),
+		table,
+		settings: Settings {
+			imports: Vec::new(),
+			..settings
+		},
+	});
 
 	stack.push(canon);
-	// Imports are the base, merged left→right (later `use` wins); the local file
-	// then overrides all of them.
-	let mut base = Settings::default();
-	for import in &this.imports {
+	for import in imports.iter().rev() {
 		let import_path = resolve_import(path, import);
 		if !import_path.exists() {
-			stack.pop();
 			return Err(ClinixError::Config(format!(
 				"{}: `use` target not found: {}",
 				path.display(),
 				import_path.display()
 			)));
 		}
-		let imported = load_config_file(&import_path, stack)?;
-		base = base.merged_over(imported); // later `use` wins over earlier
+		collect_layers(&import_path, stack, out)?;
 	}
-	let local = Settings {
-		imports: Vec::new(),
-		..this
-	};
-	let merged = base.merged_over(local);
 	stack.pop();
-	Ok(merged)
+	Ok(())
 }
 
 /// Resolve a `use` target: `~` → `$HOME`; a relative path is relative to the
@@ -897,7 +935,7 @@ ignore = ["_*.nix"]
 		let s = EnvSettings::default();
 		assert_eq!(
 			s.default_lock(cfg),
-			DefaultLock::Implicit(PathBuf::from("/cfg/locks/default.lock"))
+			LockLocation::Conventional(PathBuf::from("/cfg/locks/default.lock"))
 		);
 		let moved = EnvSettings {
 			locks_dir: Some(PathBuf::from("/srv/locks")),
@@ -905,7 +943,7 @@ ignore = ["_*.nix"]
 		};
 		assert_eq!(
 			moved.default_lock(cfg),
-			DefaultLock::Implicit(PathBuf::from("/srv/locks/default.lock"))
+			LockLocation::Conventional(PathBuf::from("/srv/locks/default.lock"))
 		);
 		// Declared ⇒ that path, resolved against the config dir.
 		let declared = EnvSettings {
@@ -914,26 +952,28 @@ ignore = ["_*.nix"]
 		};
 		assert_eq!(
 			declared.default_lock(cfg),
-			DefaultLock::Declared(PathBuf::from("/cfg/mine.lock"))
+			LockLocation::Declared(PathBuf::from("/cfg/mine.lock"))
 		);
 	}
 
 	#[test]
-	fn lock_path_resolves_declared_names_and_the_default() {
+	fn lock_location_is_declared_or_the_locks_dir_convention() {
 		let cfg = Path::new("/cfg");
 		let s = EnvSettings {
-			locks: BTreeMap::from([("unstable".into(), PathBuf::from("locks/u.lock"))]),
+			locks: BTreeMap::from([("unstable".into(), PathBuf::from("elsewhere/u.lock"))]),
 			..Default::default()
 		};
+		// Declared ⇒ its path, resolved against the config dir.
 		assert_eq!(
-			s.lock_path("unstable", cfg),
-			Some(PathBuf::from("/cfg/locks/u.lock"))
+			s.lock_location("unstable", cfg),
+			LockLocation::Declared(PathBuf::from("/cfg/elsewhere/u.lock"))
 		);
+		// Undeclared ⇒ `<locks_dir>/<name>.lock`, for any name — `default` included.
 		assert_eq!(
-			s.lock_path("default", cfg),
-			Some(PathBuf::from("/cfg/locks/default.lock"))
+			s.lock_location("old", cfg),
+			LockLocation::Conventional(PathBuf::from("/cfg/locks/old.lock"))
 		);
-		assert_eq!(s.lock_path("nope", cfg), None);
+		assert_eq!(s.default_lock(cfg), s.lock_location("default", cfg));
 	}
 
 	#[test]
@@ -1196,6 +1236,51 @@ sources = [ { path = "/local/b" } ]
 			Some("local"),
 			"a local string overrides base"
 		);
+	}
+
+	#[test]
+	fn layers_are_highest_precedence_first_through_nested_imports() {
+		// config uses [a, b]; b uses [c]. Later `use` wins, and an import's own
+		// imports sit just below it: config > b > c > a.
+		let dir = tempfile::tempdir().unwrap();
+		write(
+			dir.path(),
+			"a.toml",
+			"[env]\nregistry = \"a\"\n[env.seeds]\nsources = [\"/a\"]\n",
+		);
+		write(
+			dir.path(),
+			"c.toml",
+			"[env]\nregistry = \"c\"\n[env.seeds]\nsources = [\"/c\"]\n",
+		);
+		write(
+			dir.path(),
+			"b.toml",
+			"use = [\"c.toml\"]\n[env.seeds]\nsources = [\"/b\"]\n",
+		);
+		write(
+			dir.path(),
+			"config.toml",
+			"use = [\"a.toml\", \"b.toml\"]\n[env.seeds]\nsources = [\"/top\"]\n",
+		);
+		let names: Vec<String> = load_layers(dir.path())
+			.unwrap()
+			.iter()
+			.map(|l| l.path.file_name().unwrap().to_string_lossy().into_owned())
+			.collect();
+		assert_eq!(names, ["config.toml", "b.toml", "c.toml", "a.toml"]);
+		let s = Settings::load(dir.path()).unwrap();
+		// The scalar comes from the highest layer that sets it (c, via b, over a).
+		assert_eq!(s.env.registry.as_deref(), Some(Path::new("c")));
+		// Lists concatenate in that same order.
+		let sources: Vec<String> = s
+			.env
+			.seeds
+			.sources
+			.iter()
+			.map(|x| x.path.to_string_lossy().into_owned())
+			.collect();
+		assert_eq!(sources, ["/top", "/b", "/c", "/a"]);
 	}
 
 	#[test]
