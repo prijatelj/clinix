@@ -62,6 +62,11 @@ pub enum ClinixError {
 	#[error("command exited with status {code}")]
 	CommandFailed { code: i32 },
 
+	/// A target cannot serve the verb as given — e.g. a dir with no lock, or a file
+	/// that is not a flake lock. The message names the case and the fix.
+	#[error("{0}")]
+	Target(String),
+
 	/// A ref could not be resolved to a revision (command succeeded, no match).
 	#[error("could not resolve: {0}")]
 	Resolve(String),

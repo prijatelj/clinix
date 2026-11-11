@@ -377,9 +377,9 @@ clinix claude-latest .               # the project's own lock, plus claude from 
 clinix claude                        # the ordinary seed — unchanged
 ```
 
-**Advancing an alternate pin is manual today** — `update`/`outdated`/`verify` act
-on an env's `flake.lock`, and a bare lock under `<locks>/` is not an env. Either
-declare the pin as a ref and delete the lock to re-resolve it, or edit it by hand.
+**Advancing an alternate pin** works like any other lock: the lock verbs take a
+lockfile by path (§7), so `clinix env update ~/.config/clinix/locks/unstable.lock`
+advances it in place — through a symlink, if the lock is one.
 
 ---
 
@@ -648,6 +648,28 @@ something actually advanced.
 The re-lock engine lives once in `relock.rs` and is shared by `env update` and
 `sys update`, so both scopes advance a lock identically.
 
+**Any lockfile is a target.** Every lock verb — `update`, `outdated`, `verify`,
+`info`, and `flake add|rm|freeze|unfreeze` — also takes a **path to a lockfile**
+that no `shell.nix` owns, such as an `[env.pins]` lock under `<locks>/`. It is
+recognized by content, not by name (`flake.lock`, `unstable.lock`, `x.json` all
+work); a `*.nix` path is refused, since its directory is the env. A lockfile is
+not an environment, so `shell`/`run` and `flake wrap-shell` do not take one.
+
+```sh
+clinix env outdated ~/.config/clinix/locks/unstable.lock
+clinix env update   ~/.config/clinix/locks/unstable.lock
+clinix env info     ~/.config/clinix/locks/unstable.lock   # its inputs: NAME / TYPE / REV / TRACKING
+```
+
+**When a target has no writable lock**, the error names which case it is:
+
+| the target directory holds | result |
+|---|---|
+| `flake.lock` | used |
+| `shell.nix` with the lock embedded (`--shell-only`) | refused for writes — `flake <env> wrap-shell` expands it |
+| `shell.nix` with no lock at all (e.g. `import <nixpkgs>`) | error: it has no lock — rewrite it to the clinix-native form, or `wrap-shell` (locks `nix develop` only) |
+| neither | error: not a clinix env — and any lockfiles in that directory are named, so a lock directory points you at its files |
+
 Two present limits worth planning around:
 
 - **No per-input selector.** `update` advances *every* tracked input. To
@@ -672,8 +694,9 @@ it); `--at` records a **frozen** one. github uses the tarball fast path
 (`nix-prefetch-url --unpack`); `git` uses `nix-prefetch-git` and covers any forge
 (Codeberg, GitLab, self-hosted) by rev, which is already a content address.
 
-Because `flake … add` takes any **path** as its target, it also works on a bare
-lock directory that has no `shell.nix` — e.g. a `system.nix` config:
+Because `flake … add` takes any **path** as its target, it also works on a
+directory holding just a `flake.lock` — e.g. a `system.nix` config — or on a
+lockfile directly:
 
 ```sh
 clinix env flake ~/nixos add github NixOS/nixpkgs -b nixos-unstable --name nixpkgs-edge
@@ -880,8 +903,8 @@ never an unpinned tag.
 ## 10. The `sys` scope
 
 ```sh
-clinix sys info [dir]                  # the pinned inputs: NAME / TYPE / REV / TRACKING
-clinix sys update [dir] [--dry-run]    # advance every tracked input along its own branch
+clinix sys info [dir|lockfile]                  # the pinned inputs: NAME / TYPE / REV / TRACKING
+clinix sys update [dir|lockfile] [--dry-run]    # advance every tracked input along its own branch
 ```
 
 A `system.nix` config directory is just a directory holding the `flake.lock` its
@@ -917,7 +940,6 @@ Every one of these **errors clearly** rather than degrading silently:
 | `sys init` / `sys switch` / `sys rollback` | use `nixos-rebuild --file` |
 | a seed whose **whole** `pkgs` comes from its own pin, and flake seeds | deferred; for one package from another nixpkgs, use `[env.pins]` (§4) |
 | per-input `update`, per-input `freeze` | whole-env today; `flake rm` + `add` is the workaround |
-| `update` / `outdated` / `verify` on an `[env.pins]` lock | no CLI target for a bare lock yet; declare it as a ref and delete the lock, or edit it (§4) |
 
 Two that do **not** error — they silently do less than the syntax suggests:
 

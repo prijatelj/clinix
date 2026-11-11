@@ -195,14 +195,162 @@ fn update_per_package_is_deferred() {
 #[test]
 fn update_on_shell_only_env_is_guarded_and_writes_no_lock() {
 	let p = Project::new();
-	// A shell-only env: shell.nix present, no flake.lock.
-	std::fs::write(p.file("shell.nix"), "# lock embedded here").unwrap();
+	// A shell-only env: the lock embedded in shell.nix, no flake.lock.
+	std::fs::write(
+		p.file("shell.nix"),
+		format!(
+			"let lock = builtins.fromJSON (''{}''); in {{ }}\n",
+			common::MINIMAL_LOCK
+		),
+	)
+	.unwrap();
 	p.clinix(&["env", "update", "."])
 		.assert()
 		.failure()
 		.stderr(predicate::str::contains("shell-only"));
 	// The guard must not create a second, drifting flake.lock.
 	assert!(!p.file("flake.lock").exists());
+}
+
+#[test]
+fn update_on_a_shell_with_no_lock_says_so_not_shell_only() {
+	let p = Project::new();
+	// A conventional shell: no flake.lock and nothing embedded.
+	std::fs::write(
+		p.file("shell.nix"),
+		"{ pkgs ? import <nixpkgs> { } }: pkgs.mkShell { }\n",
+	)
+	.unwrap();
+	p.clinix(&["env", "update", "."])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("has no lock"))
+		.stderr(predicate::str::contains("shell-only").not());
+	assert!(!p.file("flake.lock").exists());
+}
+
+#[test]
+fn update_on_a_lock_dir_names_its_lockfiles() {
+	let p = Project::new();
+	// A `<locks>/`-style dir: lockfiles, but no shell.nix and no flake.lock.
+	std::fs::write(p.file("unstable.lock"), common::MINIMAL_LOCK).unwrap();
+	std::fs::write(p.file("notes.txt"), "not a lock").unwrap();
+	p.clinix(&["env", "update", "."])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("not a clinix env"))
+		.stderr(predicate::str::contains("unstable.lock"))
+		.stderr(predicate::str::contains("notes.txt").not())
+		.stderr(predicate::str::contains("shell-only").not());
+}
+
+// ---- lockfile targets (a lock no shell.nix owns) ----------------------------
+
+/// The `original` of the lock's `nixpkgs` node, re-read from disk.
+fn nixpkgs_original(lock: &Path) -> serde_json::Value {
+	let json: serde_json::Value =
+		serde_json::from_str(&std::fs::read_to_string(lock).unwrap()).unwrap();
+	json["nodes"]["nixpkgs"]["original"].clone()
+}
+
+#[test]
+fn flake_freeze_and_unfreeze_edit_a_bare_lockfile_offline() {
+	let p = Project::new();
+	let lock = p.file("unstable.lock");
+	std::fs::write(&lock, common::MINIMAL_LOCK).unwrap();
+	let target = lock.to_str().unwrap();
+
+	p.clinix(&["env", "flake", target, "freeze"])
+		.assert()
+		.success();
+	let original = nixpkgs_original(&lock);
+	assert_eq!(original["rev"], "abc1234567890def");
+	assert!(original.get("ref").is_none());
+	// A bare lockfile has no flake.nix to reconcile, and no flake.lock is created.
+	assert!(!p.file("flake.lock").exists());
+
+	p.clinix(&[
+		"env",
+		"flake",
+		target,
+		"unfreeze",
+		"--branch",
+		"nixos-unstable",
+	])
+	.assert()
+	.success();
+	assert_eq!(nixpkgs_original(&lock)["ref"], "nixos-unstable");
+}
+
+#[test]
+fn a_symlinked_lockfile_is_edited_through_the_link() {
+	let p = Project::new();
+	let real = p.file("real.lock");
+	std::fs::write(&real, common::MINIMAL_LOCK).unwrap();
+	let link = p.file("link.lock");
+	std::os::unix::fs::symlink(&real, &link).unwrap();
+
+	p.clinix(&["env", "flake", link.to_str().unwrap(), "freeze"])
+		.assert()
+		.success();
+	// The link survives and the shared target took the edit.
+	assert!(
+		std::fs::symlink_metadata(&link)
+			.unwrap()
+			.file_type()
+			.is_symlink()
+	);
+	assert_eq!(nixpkgs_original(&real)["rev"], "abc1234567890def");
+}
+
+#[test]
+fn lock_verbs_refuse_a_nix_file_and_a_non_lock_file() {
+	let p = Project::new();
+	std::fs::write(p.file("dev.nix"), "{ }\n").unwrap();
+	std::fs::write(p.file("notes.txt"), "not json").unwrap();
+	p.clinix(&["env", "update", "dev.nix"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("nix file, not a lock"));
+	p.clinix(&["env", "flake", "notes.txt", "freeze"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("is not a flake lock"));
+}
+
+#[test]
+fn wrap_shell_refuses_a_lockfile_target() {
+	let p = Project::new();
+	std::fs::write(p.file("unstable.lock"), common::MINIMAL_LOCK).unwrap();
+	p.clinix(&["env", "flake", "unstable.lock", "wrap-shell"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("target its directory"));
+}
+
+#[test]
+fn info_on_a_lockfile_reports_its_inputs() {
+	let p = Project::new();
+	std::fs::write(p.file("unstable.lock"), common::MINIMAL_LOCK).unwrap();
+	p.clinix(&["env", "info", "unstable.lock"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("unstable.lock"))
+		.stdout(predicate::str::contains("nixos-26.05"));
+	p.clinix(&["env", "info", "unstable.lock", "--json"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("\"tracking\": \"nixos-26.05\""));
+}
+
+#[test]
+fn sys_info_accepts_a_lockfile_path() {
+	let p = Project::new();
+	std::fs::write(p.file("unstable.lock"), common::MINIMAL_LOCK).unwrap();
+	p.clinix(&["sys", "info", "unstable.lock"])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("nixos-26.05"));
 }
 
 // ---- launcher & diagnostics: error paths ------------------------------------
@@ -1090,14 +1238,15 @@ fn check_without_a_lock_still_audits_path() {
 
 #[test]
 fn info_without_a_shell_nix_reports_a_clear_error_not_a_raw_io_error() {
-	// A cwd that is not a clinix env: `env info` explains there is no valid
-	// shell.nix and points at `--help`, instead of the bare "No such file" io error.
+	// A cwd that is not a clinix env: `env info` explains there is no shell.nix or
+	// flake.lock (the shared `LockSource::NoShell` error), instead of the bare
+	// "No such file" io error.
 	Project::new()
 		.clinix(&["env", "info"])
 		.assert()
 		.failure()
-		.stderr(predicate::str::contains("no valid shell.nix"))
-		.stderr(predicate::str::contains("clinix env info --help"))
+		.stderr(predicate::str::contains("no shell.nix or flake.lock"))
+		.stderr(predicate::str::contains("not a clinix env"))
 		.stderr(predicate::str::contains("No such file").not());
 }
 

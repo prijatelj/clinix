@@ -3,9 +3,9 @@
 
 use clap::Args;
 
-use crate::env::project::Project;
+use crate::env::project::{LockTarget, Project};
 use crate::env::{Context, RunCmd, resolve};
-use crate::error::{ClinixError, Result};
+use crate::error::Result;
 
 use super::{kind_str, nixpkgs_pin};
 
@@ -18,7 +18,8 @@ use super::{kind_str, nixpkgs_pin};
 	after_help = "See `clinix env list` for the environment registry (registered envs + seeds)."
 )]
 pub struct Info {
-	/// Env to summarize (name, path, or `.`); defaults to the cwd project.
+	/// Env to summarize (name, path, or `.`), or a lockfile by path; defaults to
+	/// the cwd project. A lockfile reports its pinned inputs only.
 	pub name: Option<String>,
 	/// Emit machine-readable JSON instead of a table.
 	#[arg(long)]
@@ -26,18 +27,14 @@ pub struct Info {
 }
 impl RunCmd for Info {
 	fn run(self, context: &Context) -> Result<()> {
-		let env = resolve(&context.config, self.name.as_deref())?;
-		// A resolved directory with neither a `shell.nix` nor a `flake.lock` is not
-		// a clinix environment — surface that plainly instead of the raw io error
-		// `Project::load` would otherwise raise reading the absent `shell.nix`.
-		if !env.root.join("shell.nix").is_file() && !env.root.join("flake.lock").is_file() {
-			return Err(ClinixError::Resolve(format!(
-				"no valid shell.nix in {} — this directory is not a clinix environment. \
-				 See `clinix env info --help` for more information.",
-				env.root.display()
-			)));
+		// A bare lockfile has no packages to resolve — report its inputs.
+		if let Some(name) = self.name.as_deref()
+			&& std::path::Path::new(name).is_file()
+		{
+			return print_lockfile(LockTarget::resolve(&context.config, name)?, self.json);
 		}
-		let project = Project::load(env)?;
+		// `Project::load` names the case when there is no lock (see `LockSource`).
+		let project = Project::load(resolve(&context.config, self.name.as_deref())?)?;
 		let packages = resolved_packages(&project)?;
 		if self.json {
 			print_json(&project, &packages)
@@ -100,6 +97,33 @@ fn print_json(project: &Project, packages: &[ResolvedPkg]) -> Result<()> {
 		"packages": versions,
 	});
 	println!("{}", serde_json::to_string_pretty(&out)?);
+	Ok(())
+}
+
+/// `info` on a bare lockfile: its path and every pinned input (the `sys info`
+/// table), or `{ lock, inputs }` JSON.
+fn print_lockfile(target: LockTarget, json: bool) -> Result<()> {
+	let LockTarget::File { path, lock } = target else {
+		unreachable!("an existing non-dir path resolves to a lockfile or errors");
+	};
+	if json {
+		let inputs: Vec<_> = crate::relock::root_input_names(&lock)
+			.into_iter()
+			.filter_map(|name| {
+				let node = lock.nodes.get(&name)?;
+				Some(serde_json::json!({
+					"name": name,
+					"rev": node.locked.as_ref().and_then(|l| l.rev()),
+					"tracking": node.original.as_ref().and_then(|o| o.git_ref()),
+				}))
+			})
+			.collect();
+		let out = serde_json::json!({ "lock": path.display().to_string(), "inputs": inputs });
+		println!("{}", serde_json::to_string_pretty(&out)?);
+	} else {
+		println!("lock: {}\n", path.display());
+		crate::relock::show_pins(&lock);
+	}
 	Ok(())
 }
 

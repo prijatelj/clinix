@@ -4,7 +4,7 @@
 
 use clap::Args;
 
-use crate::env::project::Project;
+use crate::env::project::LockTarget;
 use crate::env::wrap_shell::WrapShell;
 use crate::env::{Context, Env, RunCmd, Target, resolve};
 use crate::error::{ClinixError, Result, unimplemented};
@@ -111,7 +111,8 @@ pub struct Pkgs {
 /// than hand-edited.
 #[derive(Args, Debug)]
 pub struct Flake {
-	/// Target env name.
+	/// Target env (name, path, or `.`), or a lockfile by path (every action but
+	/// `wrap-shell`, which needs a `shell.nix`).
 	pub name: String,
 	#[command(subcommand)]
 	pub action: FlakeAction,
@@ -180,7 +181,7 @@ pub struct FlakeUnfreeze {
 
 #[derive(Args, Debug)]
 pub struct Update {
-	/// Target env name.
+	/// Target env (name, path, or `.`), or a lockfile by path.
 	pub name: String,
 	/// Packages to update — **not yet supported** (per-package version update is a
 	/// later phase; naming any package is rejected). Omit them to advance every
@@ -205,24 +206,17 @@ impl RunCmd for Update {
 			));
 		}
 
-		let env = resolve(&context.config, Some(&self.name))?;
-		// A shell-only env keeps its lock embedded in shell.nix; writing a
-		// flake.lock here would create a second, drifting source of truth. (A
-		// `--dry-run` writes nothing, but the intent to mutate still doesn't apply.)
-		if !env.root.join("flake.lock").exists() {
-			return Err(unimplemented(
-				"env update on a shell-only env",
-				"the lock is embedded in shell.nix; re-embedding on update is a later slice",
-			));
-		}
-		let mut project = Project::load(env)?;
+		let mut target = LockTarget::resolve(&context.config, &self.name)?;
+		// Refuse an unwritable lock before any network work. (A `--dry-run` writes
+		// nothing, but the intent to mutate still doesn't apply.)
+		target.require_writable("env update")?;
 
 		// The re-lock engine is shared with `sys update` (see [`crate::relock`]);
 		// it mutates the lock in place and returns how many inputs advanced, and we
 		// persist here — the engine itself never writes.
-		let changed = crate::relock::update_tracked(&mut project.lock, self.dry_run)?;
+		let changed = crate::relock::update_tracked(target.lock_mut(), self.dry_run)?;
 		if !self.dry_run && changed > 0 {
-			project.save_lock()?;
+			target.save()?;
 		}
 		Ok(())
 	}
@@ -232,9 +226,8 @@ impl RunCmd for Update {
 /// rev than the lock, **without writing** (like tack `look` / npins). Read-only, so it
 /// works on shell-only (embedded-lock) envs too. Advance them with `env update`.
 pub fn outdated(target: Target, context: &Context) -> Result<()> {
-	let env = resolve(&context.config, Some(&target.name))?;
-	let project = Project::load(env)?;
-	let targets = crate::relock::tracking_github_inputs(&project.lock)?;
+	let lock_target = LockTarget::resolve(&context.config, &target.name)?;
+	let targets = crate::relock::tracking_github_inputs(lock_target.lock())?;
 	if targets.is_empty() {
 		println!("clinix: no tracked github inputs to check");
 		return Ok(());
@@ -274,9 +267,8 @@ pub fn outdated(target: Target, context: &Context) -> Result<()> {
 /// recorded `narHash` (detects drift/tampering, like npins `verify`). Read-only;
 /// exits nonzero if any input fails.
 pub fn verify(target: Target, context: &Context) -> Result<()> {
-	let env = resolve(&context.config, Some(&target.name))?;
-	let project = Project::load(env)?;
-	let targets = crate::relock::locked_github_inputs(&project.lock);
+	let lock_target = LockTarget::resolve(&context.config, &target.name)?;
+	let targets = crate::relock::locked_github_inputs(lock_target.lock());
 	if targets.is_empty() {
 		println!("clinix: no locked github inputs to verify");
 		return Ok(());
@@ -466,6 +458,12 @@ pub fn flake(args: Flake, context: &Context) -> Result<()> {
 		FlakeAction::Rm(rm) => flake_rm(&args.name, &rm.input, context),
 		FlakeAction::Freeze => flake_freeze(&args.name, context),
 		FlakeAction::Unfreeze(u) => flake_unfreeze(&args.name, &u.branch, context),
+		FlakeAction::WrapShell(_) if std::path::Path::new(&args.name).is_file() => {
+			Err(ClinixError::Target(format!(
+				"wrap-shell wraps an env's shell.nix; {} is a file — target its directory",
+				args.name
+			)))
+		}
 		FlakeAction::WrapShell(ws) => crate::env::wrap_shell::wrap_shell(&args.name, ws, context),
 	}
 }
@@ -474,8 +472,8 @@ pub fn flake(args: Flake, context: &Context) -> Result<()> {
 /// (a machine-edited `flake.lock`; the user never hand-edits). github reuses the
 /// tested `resolve_github`; git uses `nix-prefetch-git`.
 fn flake_add(name: &str, add: FlakeAdd, context: &Context) -> Result<()> {
-	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
-	require_flake_lock(&project.env, "env flake add")?;
+	let mut target = LockTarget::resolve(&context.config, name)?;
+	target.require_writable("env flake add")?;
 
 	let (node, locked, original, summary) = match add.kind {
 		AddKind::Github {
@@ -527,8 +525,8 @@ fn flake_add(name: &str, add: FlakeAdd, context: &Context) -> Result<()> {
 		}
 	};
 
-	project.lock.add_input(&node, locked, original)?;
-	project.save_lock()?;
+	target.lock_mut().add_input(&node, locked, original)?;
+	target.save()?;
 	println!("added input `{node}` ({summary})");
 	Ok(())
 }
@@ -536,9 +534,9 @@ fn flake_add(name: &str, add: FlakeAdd, context: &Context) -> Result<()> {
 /// `flake <env> rm <input>` — drop a flake input's root edge (and its node when
 /// nothing else references it).
 fn flake_rm(name: &str, input: &str, context: &Context) -> Result<()> {
-	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
-	require_flake_lock(&project.env, "env flake rm")?;
-	if !project.lock.remove_input(input) {
+	let mut target = LockTarget::resolve(&context.config, name)?;
+	target.require_writable("env flake rm")?;
+	if !target.lock_mut().remove_input(input) {
 		return Err(ClinixError::Resolve(format!(
 			"no input `{input}` in this env"
 		)));
@@ -548,7 +546,7 @@ fn flake_rm(name: &str, input: &str, context: &Context) -> Result<()> {
 			"clinix: warning: removed `nixpkgs` — this env's shell.nix almost certainly needs it"
 		);
 	}
-	project.save_lock()?;
+	target.save()?;
 	println!("removed input `{input}`");
 	Ok(())
 }
@@ -568,20 +566,20 @@ fn git_basename(url: &str) -> String {
 /// `flake.lock` edit (`original`: drop `ref`, add `rev`) + the `flake.nix` URL swap
 /// for `--flake` envs. Offline (copies `locked.rev`; no resolve).
 fn flake_freeze(name: &str, context: &Context) -> Result<()> {
-	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
-	require_flake_lock(&project.env, "env flake freeze")?;
+	let mut target = LockTarget::resolve(&context.config, name)?;
+	target.require_writable("env flake freeze")?;
 
-	let changes = freeze(&mut project.lock);
+	let changes = freeze(target.lock_mut());
 	if changes.is_empty() {
 		println!("clinix: nothing to freeze (all inputs already pinned)");
 		return Ok(());
 	}
 	// For a `--flake` env, keep `flake.nix` consistent (else `nix flake` re-locks).
-	let kept = reconcile_flake_nix(&mut project.lock, &project.env, &changes, Freeze)?;
+	let kept = reconcile(&mut target, &changes, Freeze)?;
 	if kept.is_empty() {
 		return Ok(());
 	}
-	project.save_lock()?;
+	target.save()?;
 	println!("frozen:");
 	for c in &kept {
 		println!("\t{} @ {:.9}", c.name, c.to);
@@ -592,19 +590,19 @@ fn flake_freeze(name: &str, context: &Context) -> Result<()> {
 /// `flake <env> unfreeze --branch <ref>` — resume tracking `ref` for every frozen
 /// input. Requires `--branch` for now (no remembered ref yet).
 fn flake_unfreeze(name: &str, branch: &str, context: &Context) -> Result<()> {
-	let mut project = Project::load(resolve(&context.config, Some(name))?)?;
-	require_flake_lock(&project.env, "env flake unfreeze")?;
+	let mut target = LockTarget::resolve(&context.config, name)?;
+	target.require_writable("env flake unfreeze")?;
 
-	let changes = unfreeze(&mut project.lock, branch);
+	let changes = unfreeze(target.lock_mut(), branch);
 	if changes.is_empty() {
 		println!("clinix: nothing to unfreeze (no frozen inputs)");
 		return Ok(());
 	}
-	let kept = reconcile_flake_nix(&mut project.lock, &project.env, &changes, Unfreeze)?;
+	let kept = reconcile(&mut target, &changes, Unfreeze)?;
 	if kept.is_empty() {
 		return Ok(());
 	}
-	project.save_lock()?;
+	target.save()?;
 	println!("tracking {branch}:");
 	for c in &kept {
 		println!("\t{}", c.name);
@@ -612,17 +610,14 @@ fn flake_unfreeze(name: &str, branch: &str, context: &Context) -> Result<()> {
 	Ok(())
 }
 
-/// The env's `flake.lock` path, or a guarded error for a shell-only env (its
-/// lock is embedded in `shell.nix`; editing a `flake.lock` here would drift).
-fn require_flake_lock(env: &Env, verb: &str) -> Result<std::path::PathBuf> {
-	let path = env.root.join("flake.lock");
-	if path.exists() {
-		Ok(path)
-	} else {
-		Err(unimplemented(
-			verb,
-			"shell-only env: the lock is embedded in shell.nix; re-embedding is a later slice",
-		))
+/// Reconcile a lock target's `flake.nix` (if any) with `changes`. A bare lockfile
+/// has no `flake.nix`, so every change stands.
+fn reconcile(target: &mut LockTarget, changes: &[Change], op: FlakeOp) -> Result<Vec<Change>> {
+	match target {
+		LockTarget::Env(project) => {
+			reconcile_flake_nix(&mut project.lock, &project.env, changes, op)
+		}
+		LockTarget::File { .. } => Ok(changes.to_vec()),
 	}
 }
 

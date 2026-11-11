@@ -46,7 +46,8 @@ pub enum SysCmd {
 /// `clinix sys update [dir] [--dry-run]`.
 #[derive(Args, Debug)]
 pub struct SysUpdateArgs {
-	/// The system config directory holding `flake.lock` (default: cwd).
+	/// The system config directory holding `flake.lock`, or a lockfile by path
+	/// (default: cwd).
 	pub dir: Option<PathBuf>,
 	/// Resolve and report the pending advances without prefetching hashes or
 	/// writing the lock (a preview).
@@ -57,7 +58,8 @@ pub struct SysUpdateArgs {
 /// `clinix sys info [dir]`.
 #[derive(Args, Debug)]
 pub struct SysInfoArgs {
-	/// The system config directory holding `flake.lock` (default: cwd).
+	/// The system config directory holding `flake.lock`, or a lockfile by path
+	/// (default: cwd).
 	pub dir: Option<PathBuf>,
 }
 
@@ -74,13 +76,18 @@ pub fn dispatch(args: SysArgs) -> Result<()> {
 	}
 }
 
-/// Resolve the target `flake.lock` path from an optional dir (default: cwd) and
-/// load it, failing with a clear message when the directory has no lock.
+/// Resolve the target lock from an optional dir (default: cwd) holding
+/// `flake.lock`, or a lockfile given directly, and load it — failing with a clear
+/// message when a directory has no lock.
 fn load_lock(dir: Option<PathBuf>) -> Result<(PathBuf, FlakeLock)> {
 	let dir = match dir {
 		Some(d) => d,
 		None => std::env::current_dir()?,
 	};
+	if dir.is_file() {
+		let lock = FlakeLock::from_json(&std::fs::read_to_string(&dir)?)?;
+		return Ok((dir, lock));
+	}
 	let lock_path = dir.join("flake.lock");
 	if !lock_path.exists() {
 		return Err(ClinixError::Config(format!(

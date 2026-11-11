@@ -40,7 +40,7 @@ pub(crate) fn short_rev(rev: &Rev) -> String {
 /// The root's **direct** input node names (the `pin`/update set; `follows` edges
 /// have no node of their own). Shared by `update`, `outdated`, `verify`, and the
 /// `sys info` table.
-fn root_input_names(lock: &FlakeLock) -> Vec<String> {
+pub(crate) fn root_input_names(lock: &FlakeLock) -> Vec<String> {
 	match lock.nodes.get(&lock.root) {
 		Some(node) => node
 			.inputs
