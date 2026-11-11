@@ -18,13 +18,15 @@ pub struct List {
 
 /// List what `clinix env <name>` can enter: **registry** envs
 /// (`state/envs/<name>`, each enriched with its nixpkgs pin from `flake.lock`) and
-/// **seeds** (the in-place `*.nix` fragments discovered from `[env.seeds].sources`).
+/// **seeds** (the in-place `*.nix` fragments discovered from `[env.seeds].sources`
+/// and the seed directory `[env.seeds].dir`).
 /// The filesystem *is* the registry index; the catalog is rebuilt from config —
 /// nothing to keep in sync. Empty of both prints a hint.
 pub fn list(args: List, context: &Context) -> Result<()> {
 	let names = crate::env::registry::list_names(&context.config)?;
 	let settings = crate::env::config::Settings::load(&context.config.config_dir)?;
-	let catalog = crate::env::seeds::Catalog::build(&settings.env.seeds);
+	let catalog =
+		crate::env::seeds::Catalog::build(&settings.env.seeds, &context.config.config_dir);
 	for w in &catalog.warnings {
 		eprintln!("clinix: {w}");
 	}
@@ -58,7 +60,8 @@ pub fn list(args: List, context: &Context) -> Result<()> {
 		println!(
 			"clinix: no registered envs or seeds\n  \
 			 create a registry env: clinix env new <name> --from …\n  \
-			 or add seed sources: [env.seeds] in {}",
+			 or add seeds: *.nix files in {}, or [env.seeds].sources in {}",
+			settings.env.seeds.dir(&context.config.config_dir).display(),
 			context.config.config_dir.join("config.toml").display()
 		);
 		return Ok(());

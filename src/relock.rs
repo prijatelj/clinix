@@ -83,7 +83,11 @@ pub(crate) fn tracking_github_inputs(lock: &FlakeLock) -> Result<Vec<GhTracking>
 			owner: required(original.owner(), &name, "owner")?,
 			repo: required(original.repo(), &name, "repo")?,
 			git_ref,
-			locked_rev: node.locked.as_ref().and_then(|l| l.rev()).map(str::to_string),
+			locked_rev: node
+				.locked
+				.as_ref()
+				.and_then(|l| l.rev())
+				.map(str::to_string),
 			name,
 		});
 	}
@@ -147,7 +151,12 @@ pub fn update_tracked(lock: &mut FlakeLock, dry_run: bool) -> Result<usize> {
 			if old == Some(rev.as_str()) {
 				println!("{}: unchanged", tgt.name);
 			} else {
-				println!("{}: {} -> {} (dry run)", tgt.name, short_opt(old), short_rev(&rev));
+				println!(
+					"{}: {} -> {} (dry run)",
+					tgt.name,
+					short_opt(old),
+					short_rev(&rev)
+				);
 				changed += 1;
 			}
 			continue;
@@ -157,10 +166,7 @@ pub fn update_tracked(lock: &mut FlakeLock, dry_run: bool) -> Result<usize> {
 			println!("{}: unchanged", tgt.name);
 			continue;
 		}
-		lock.nodes
-			.get_mut(&tgt.name)
-			.expect("target exists")
-			.locked = Some(Source::github_locked(
+		lock.nodes.get_mut(&tgt.name).expect("target exists").locked = Some(Source::github_locked(
 			&tgt.owner,
 			&tgt.repo,
 			rev.as_str(),

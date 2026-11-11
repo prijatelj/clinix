@@ -498,7 +498,11 @@ mod tests {
 		prune_versions(&base, 5).unwrap();
 		assert!(!base.exists(), "superseded legacy root released");
 		assert!(rt_root(&base).symlink_metadata().is_err());
-		let seqs: Vec<u64> = list_versions(&base).unwrap().iter().map(|v| v.seq).collect();
+		let seqs: Vec<u64> = list_versions(&base)
+			.unwrap()
+			.iter()
+			.map(|v| v.seq)
+			.collect();
 		assert_eq!(seqs, vec![1], "the real version is untouched");
 	}
 

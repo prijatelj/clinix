@@ -359,6 +359,14 @@ impl Cli {
 						};
 						println!("  {name}: {}   {how}", path.display());
 					}
+					let seeds = settings.env.seeds.dir(&cfg.config_dir);
+					let missing = if seeds.is_dir() { "" } else { " (absent)" };
+					println!("seeds:    {}   [env.seeds].dir{missing}", seeds.display());
+					for source in &settings.env.seeds.sources {
+						let path = crate::env::config::resolve_path(&source.path, &cfg.config_dir);
+						let missing = if path.exists() { "" } else { " (MISSING)" };
+						println!("  source: {}   [env.seeds].sources{missing}", path.display());
+					}
 					Ok(())
 				}
 			},

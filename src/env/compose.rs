@@ -64,7 +64,7 @@ fn env_lock(env: &Env) -> Option<PathBuf> {
 pub(crate) fn compose_nodes(ctx: &Context, names: &[String]) -> Result<Composition> {
 	let cfg = &ctx.config;
 	let settings = crate::env::config::Settings::load(&cfg.config_dir)?;
-	let catalog = crate::env::seeds::Catalog::build(&settings.env.seeds);
+	let catalog = crate::env::seeds::Catalog::build(&settings.env.seeds, &cfg.config_dir);
 	for w in &catalog.warnings {
 		eprintln!("clinix: {w}");
 	}

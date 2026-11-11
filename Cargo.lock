@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "clinix"
-version = "0.0.0"
+version = "0.0.1-a"
 dependencies = [
  "anyhow",
  "assert_cmd",

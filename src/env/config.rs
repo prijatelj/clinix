@@ -198,6 +198,8 @@ pub const DEFAULT_SHORTHAND: bool = true;
 pub const DEFAULT_REGISTRY: &str = "envs";
 /// `[env].locks_dir` when unset, relative to the config dir.
 pub const DEFAULT_LOCKS_DIR: &str = "locks";
+/// `[env.seeds].dir` when unset, relative to the config dir.
+pub const DEFAULT_SEEDS_DIR: &str = "seeds";
 /// Every `[env.gc].keep_n_prior_*` when unset.
 pub const DEFAULT_KEEP_N_PRIOR: usize = 0;
 
@@ -359,7 +361,12 @@ pub struct GcSettings {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct SeedSettings {
-	/// Ordered sources: a directory (scanned for `*.nix`) or an exact file.
+	/// `[env.seeds].dir` — the seed directory scanned with no config entry, after
+	/// every [`Self::sources`] entry (which win bare-name collisions over it). Default
+	/// `<config>/seeds`; a missing directory is skipped silently. See [`Self::dir`].
+	pub dir: Option<PathBuf>,
+	/// Ordered sources: a directory (scanned for `*.nix`) or an exact file, each
+	/// [`resolve_path`]d against the config dir.
 	pub sources: Vec<SeedSource>,
 	/// gitignore-style globs suppressing "other files exist" warnings (also
 	/// honored via a `.clinix_ignore` per source dir).
@@ -370,6 +377,17 @@ pub struct SeedSettings {
 	/// `notes/clinix/design/target-resolution.md` §5.
 	#[serde(deserialize_with = "de_seed_namespace")]
 	pub namespace: Option<String>,
+}
+
+impl SeedSettings {
+	/// The seed directory: `[env.seeds].dir` ([`resolve_path`]) if set, else
+	/// `<config>/seeds`.
+	pub fn dir(&self, config_dir: &Path) -> PathBuf {
+		match &self.dir {
+			Some(p) => resolve_path(p, config_dir),
+			None => config_dir.join(DEFAULT_SEEDS_DIR),
+		}
+	}
 }
 
 /// Deserialize the seed default namespace when present: a validated string, or
@@ -502,8 +520,9 @@ pub const MINIMAL_TEMPLATE: &str = r#"# clinix config (TOML). Default location: 
 # Full annotated template with defaults: `clinix config example --full`
 
 [env.seeds]
-# Seed shells: a directory (scanned recursively for *.nix) or an exact *.nix file.
-# A bare path string is enough; use { path = "...", namespace = "..." } for a namespace.
+# Every *.nix under <config>/seeds is a seed with no entry here. Add more sources:
+# a directory (scanned recursively for *.nix) or an exact *.nix file. A bare path
+# string is enough; use { path = "...", namespace = "..." } for a namespace.
 sources = [
   # "~/dev_env/shells",
 ]
@@ -600,8 +619,15 @@ shorthand = true
 # unaffected either way.
 # namespace = "seeds"
 #
-# Each source is either a bare path string, or a { path = "...", namespace = "..." }
-# table when you want to override the default namespace for that source.
+# The seed directory, scanned with no `sources` entry: every *.nix in it (recursively)
+# is a seed. Relative to the config dir; a missing directory is skipped silently.
+# Scanned after every `sources` entry, so those win a bare-name collision.
+# dir = "seeds"
+#
+# Additional sources, highest precedence first. Relative paths resolve against the
+# config dir, never the cwd. Each is either a bare path string, or a
+# { path = "...", namespace = "..." } table when you want to override the default
+# namespace for that source.
 sources = [
   # "~/dev_env/shells",                                    # bare path — simplest
   # { path = "~/dots/clinix/seeds", namespace = "dots" },  # table form: set a namespace
@@ -661,6 +687,7 @@ impl Settings {
 				retired_nixpkgs: None,
 				retired_pins: None,
 				seeds: SeedSettings {
+					dir: other.env.seeds.dir.or(self.env.seeds.dir),
 					sources: concat_first(other.env.seeds.sources, self.env.seeds.sources),
 					ignore: concat_first(other.env.seeds.ignore, self.env.seeds.ignore),
 					namespace: other.env.seeds.namespace.or(self.env.seeds.namespace),
@@ -788,7 +815,8 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 ///
 /// One rule for every configured path, with `base` being the directory that
 /// setting's default lives in — the **config** dir for config-side paths
-/// (`locks_dir`, `[env.locks]` entries, `nixpkgs_config`), the **state** dir for state-side ones
+/// (`locks_dir`, `[env.locks]` entries, `nixpkgs_config`, `[env.seeds]` `dir` and
+/// `sources`), the **state** dir for state-side ones
 /// (`registry`).
 ///
 /// Resolving relative paths against the *process cwd* would make one config file
@@ -1013,6 +1041,31 @@ ignore = ["_*.nix"]
 			cfg.with_settings(&settings).registry_dir,
 			PathBuf::from("/data/envs")
 		);
+	}
+
+	#[test]
+	fn seed_dir_defaults_under_config_merges_and_honours_an_override() {
+		let cfg = Path::new("/cfg");
+		assert_eq!(
+			SeedSettings::default().dir(cfg),
+			PathBuf::from("/cfg/seeds")
+		);
+		let dir = tempfile::tempdir().unwrap();
+		write(
+			dir.path(),
+			"base.toml",
+			"[env.seeds]\ndir = \"base-seeds\"\n",
+		);
+		write(dir.path(), "config.toml", "use = [\"base.toml\"]\n");
+		let s = Settings::load(dir.path()).unwrap();
+		assert_eq!(s.env.seeds.dir(cfg), PathBuf::from("/cfg/base-seeds"));
+		write(
+			dir.path(),
+			"config.toml",
+			"use = [\"base.toml\"]\n[env.seeds]\ndir = \"/abs/seeds\"\n",
+		);
+		let s = Settings::load(dir.path()).unwrap();
+		assert_eq!(s.env.seeds.dir(cfg), PathBuf::from("/abs/seeds"));
 	}
 
 	#[test]

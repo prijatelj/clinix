@@ -617,7 +617,10 @@ fn run_is_exit_transparent_and_roots_the_env_on_entry() {
 		.unwrap()
 		.filter_map(Result::ok)
 		.count();
-	assert_eq!(remaining, 0, "clean must remove both the proj-* and .rt roots");
+	assert_eq!(
+		remaining, 0,
+		"clean must remove both the proj-* and .rt roots"
+	);
 
 	// Exit-transparency: a nonzero command propagates its *exact* code, not a
 	// blanket failure (false → 1; `exit 3` → 3).
@@ -670,22 +673,37 @@ fn prior_root_versions_are_kept_and_enterable() {
 	};
 
 	// v1.
-	p.clinix(&["env", "run", ".", "--", "true"]).assert().success();
+	p.clinix(&["env", "run", ".", "--", "true"])
+		.assert()
+		.success();
 	assert_eq!(count_versions(), 1, "first entry mints v1");
 
 	// Re-entering unchanged mints nothing (idempotent).
-	p.clinix(&["env", "run", ".", "--", "true"]).assert().success();
-	assert_eq!(count_versions(), 1, "unchanged re-entry mints no new version");
+	p.clinix(&["env", "run", ".", "--", "true"])
+		.assert()
+		.success();
+	assert_eq!(
+		count_versions(),
+		1,
+		"unchanged re-entry mints no new version"
+	);
 
 	// Change the derivation (add a package) → v2 minted, v1 kept as prior.
 	p.clinix(&["env", "add", ".", "jq"]).assert().success();
-	p.clinix(&["env", "run", ".", "--", "true"]).assert().success();
-	assert_eq!(count_versions(), 2, "a derivation change mints a prior + current");
+	p.clinix(&["env", "run", ".", "--", "true"])
+		.assert()
+		.success();
+	assert_eq!(
+		count_versions(),
+		2,
+		"a derivation change mints a prior + current"
+	);
 
 	// `env roots .` lists current + prior 1.
-	p.clinix(&["env", "roots", "."]).assert().success().stdout(
-		predicate::str::contains("current").and(predicate::str::contains("prior 1")),
-	);
+	p.clinix(&["env", "roots", "."])
+		.assert()
+		.success()
+		.stdout(predicate::str::contains("current").and(predicate::str::contains("prior 1")));
 
 	// Enter the prior directly from its stored drv (offline path: no eval, no mint).
 	p.clinix(&["env", "run", ".", "--prior", "1", "--", "true"])
@@ -725,7 +743,9 @@ fn new_adopts_an_entered_projects_build_and_clean_releases_source() {
 	};
 
 	// Enter the project → builds + roots proj-<slug>@1.
-	p.clinix(&["env", "run", ".", "--", "true"]).assert().success();
+	p.clinix(&["env", "run", ".", "--", "true"])
+		.assert()
+		.success();
 	assert_eq!(count("proj-"), 1);
 	assert_eq!(count("env-"), 0);
 
@@ -734,8 +754,16 @@ fn new_adopts_an_entered_projects_build_and_clean_releases_source() {
 		.assert()
 		.success()
 		.stdout(predicate::str::contains("adopted"));
-	assert_eq!(count("env-"), 1, "adopt rooted env-saved without `env shell`");
-	assert_eq!(count("proj-"), 1, "project roots left in place (no --clean)");
+	assert_eq!(
+		count("env-"),
+		1,
+		"adopt rooted env-saved without `env shell`"
+	);
+	assert_eq!(
+		count("proj-"),
+		1,
+		"project roots left in place (no --clean)"
+	);
 	// The adopted `.rt` is a real root resolving into the store (reused closure).
 	let rt = std::fs::read_dir(&roots)
 		.unwrap()

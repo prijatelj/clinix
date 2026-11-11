@@ -420,7 +420,11 @@ fn a_lock_in_locks_dir_is_discovered_without_a_config_entry() {
 	std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
 	std::fs::write(&lock, common::MINIMAL_LOCK).unwrap();
 	// A stem that cannot be a nix attribute is skipped, with a warning.
-	std::fs::write(p.config_dir().join("locks/not.ok.lock"), common::MINIMAL_LOCK).unwrap();
+	std::fs::write(
+		p.config_dir().join("locks/not.ok.lock"),
+		common::MINIMAL_LOCK,
+	)
+	.unwrap();
 
 	// No config.toml at all: `unstable` is found by the locks_dir convention.
 	p.clinix(&["env", "flake", "--lock", "unstable", "freeze"])
@@ -440,7 +444,11 @@ fn a_lock_in_locks_dir_is_discovered_without_a_config_entry() {
 fn a_declared_lock_overrides_a_discovered_one_of_the_same_name() {
 	let p = Project::new();
 	std::fs::create_dir_all(p.config_dir().join("locks")).unwrap();
-	std::fs::write(p.config_dir().join("locks/unstable.lock"), common::MINIMAL_LOCK).unwrap();
+	std::fs::write(
+		p.config_dir().join("locks/unstable.lock"),
+		common::MINIMAL_LOCK,
+	)
+	.unwrap();
 	let elsewhere = p.file("mine.lock");
 	std::fs::write(&elsewhere, common::MINIMAL_LOCK).unwrap();
 	write_config(
@@ -516,13 +524,23 @@ fn config_show_prints_effective_toml_with_provenance() {
 	let p = Project::new();
 	write_config(&p, "[env.gc]\nkeep_n_prior_roots = 3\n");
 	std::fs::create_dir_all(p.config_dir().join("locks")).unwrap();
-	std::fs::write(p.config_dir().join("locks/unstable.lock"), common::MINIMAL_LOCK).unwrap();
+	std::fs::write(
+		p.config_dir().join("locks/unstable.lock"),
+		common::MINIMAL_LOCK,
+	)
+	.unwrap();
 	p.clinix(&["config", "show"])
 		.assert()
 		.success()
-		.stdout(predicate::str::contains("config.toml\nkeep_n_prior_roots = 3\n# defaults\n"))
-		.stdout(predicate::str::contains("# discovered\nunstable = \"locks/unstable.lock\""))
-		.stdout(predicate::str::contains("[clinix]\n# defaults\nshorthand = true"));
+		.stdout(predicate::str::contains(
+			"config.toml\nkeep_n_prior_roots = 3\n# defaults\n",
+		))
+		.stdout(predicate::str::contains(
+			"# discovered\nunstable = \"locks/unstable.lock\"",
+		))
+		.stdout(predicate::str::contains(
+			"[clinix]\n# defaults\nshorthand = true",
+		));
 }
 
 #[test]
@@ -1055,7 +1073,10 @@ fn rename_moves_the_env_dir_and_its_gc_root() {
 	assert!(!rt_sibling(&old_v).exists(), "old rt version gone");
 	let new_v = p.env_root_version("new", 1);
 	assert!(new_v.exists(), "drv version re-keyed to new name");
-	assert!(rt_sibling(&new_v).exists(), "rt version re-keyed to new name");
+	assert!(
+		rt_sibling(&new_v).exists(),
+		"rt version re-keyed to new name"
+	);
 }
 
 #[test]
@@ -1107,7 +1128,10 @@ fn clean_removes_all_versions_and_is_idempotent() {
 		.stdout(predicate::str::contains("released GC root"));
 	for seq in [1, 2] {
 		let v = p.env_root_version("web", seq);
-		assert!(!v.exists() && !rt_sibling(&v).exists(), "version {seq} removed");
+		assert!(
+			!v.exists() && !rt_sibling(&v).exists(),
+			"version {seq} removed"
+		);
 	}
 
 	// A second clean is a no-op success, not an error.
@@ -1176,7 +1200,10 @@ fn clean_root_version_releases_only_that_version() {
 		.assert()
 		.success()
 		.stdout(predicate::str::contains("root version @2"));
-	assert!(!p.env_root_version("api", 2).exists(), "targeted version gone");
+	assert!(
+		!p.env_root_version("api", 2).exists(),
+		"targeted version gone"
+	);
 	assert!(
 		p.env_root_version("api", 1).exists() && p.env_root_version("api", 3).exists(),
 		"other versions untouched"
@@ -1238,7 +1265,10 @@ fn clean_projects_releases_all_project_roots_only() {
 	p.clinix(&["env", "clean", "--projects"])
 		.assert()
 		.success()
-		.stdout(predicate::str::contains("proj-home_u_a").and(predicate::str::contains("proj-home_u_b")));
+		.stdout(
+			predicate::str::contains("proj-home_u_a")
+				.and(predicate::str::contains("proj-home_u_b")),
+		);
 	let roots = p.state().join("roots");
 	assert!(!roots.join("proj-home_u_a@1").exists());
 	assert!(!roots.join("proj-home_u_b@1").exists());
@@ -1291,17 +1321,14 @@ fn roots_no_arg_lists_all_families_grouped() {
 	fake_root(&p, "proj-home_u_x", 1);
 	fake_root(&p, "stack-a-b", 1);
 
-	p.clinix(&["env", "roots"])
-		.assert()
-		.success()
-		.stdout(
-			predicate::str::contains("registry envs")
-				.and(predicate::str::contains("env-py"))
-				.and(predicate::str::contains("projects"))
-				.and(predicate::str::contains("proj-home_u_x"))
-				.and(predicate::str::contains("stacks"))
-				.and(predicate::str::contains("stack-a-b")),
-		);
+	p.clinix(&["env", "roots"]).assert().success().stdout(
+		predicate::str::contains("registry envs")
+			.and(predicate::str::contains("env-py"))
+			.and(predicate::str::contains("projects"))
+			.and(predicate::str::contains("proj-home_u_x"))
+			.and(predicate::str::contains("stacks"))
+			.and(predicate::str::contains("stack-a-b")),
+	);
 }
 
 #[test]

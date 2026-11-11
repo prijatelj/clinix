@@ -38,7 +38,7 @@ pub fn roots(args: Roots, context: &Context) -> Result<()> {
 	let settings = Settings::load(&cfg.config_dir)?;
 	match &args.name {
 		Some(name) => {
-			let catalog = Catalog::build(&settings.env.seeds);
+			let catalog = Catalog::build(&settings.env.seeds, &cfg.config_dir);
 			for w in &catalog.warnings {
 				eprintln!("clinix: {w}");
 			}

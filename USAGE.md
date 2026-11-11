@@ -93,7 +93,8 @@ first. A list merged from several files labels the items from each other file.
 
 **Paths in `config.toml`.** `~` expands; an absolute path is used as given; a
 **relative** path resolves against the directory that setting's default lives in —
-the **config** dir for `locks_dir`, `[env.locks]` entries, and `nixpkgs_config`, the **state**
+the **config** dir for `locks_dir`, `[env.locks]` entries, `nixpkgs_config`, and
+`[env.seeds]` `dir` and `sources`, the **state**
 dir for `registry`. Never the shell's cwd, so one config means the same thing
 wherever clinix runs, and a config directory moved with `--config` /
 `$CLINIX_CONFIG_DIR` keeps working without rewriting a path.
@@ -246,13 +247,22 @@ without baking them into any of them.
 # default = "~/nixos/flake.lock"                     # the lock seeds build against (below)
 
 [env.seeds]
-sources = [
-  "~/.config/clinix/seeds/",                          # a dir: each *.nix is a seed
+# dir = "seeds"                                       # scanned with no entry (default <config>/seeds)
+sources = [                                           # more sources, ahead of `dir`
   { path = "~/dots/clinix/seeds", namespace = "dots" },# table form sets a namespace
   "~/one-off/my-python.nix",                          # an exact file: one seed
 ]
 ignore = ["_*.nix", "lib/**"]                          # also honoured via a .clinix_ignore per dir
 ```
+
+**The seed directory** is the seed counterpart of `locks_dir`: every `*.nix` under
+`[env.seeds].dir` (default `<config>/seeds`, i.e. `~/.config/clinix/seeds/`) is a
+seed with no config entry, so a fresh install needs no `[env.seeds]` at all. It is
+scanned **after** every `sources` entry, so a declared source wins a bare-name
+collision against it, just as a declared lock wins over a discovered one. A
+missing seed directory is skipped silently; a missing `sources` entry warns. A
+`sources` entry naming the seed directory itself is scanned once, under that
+entry's namespace.
 
 A directory source is scanned **recursively**; each `*.nix` becomes a seed named
 by **basename** (`seeds/lang/rust.nix` → `rust`). Subdirectories organise but do
@@ -1004,7 +1014,8 @@ Two that do **not** error — they silently do less than the syntax suggests:
 | `<registry>/<name>/` | registry envs (`shell.nix`, `flake.lock`, `seeds/`, `locks/`, members). `<registry>` = `[env].registry`, default `~/.local/state/clinix/envs` |
 | `~/.local/state/clinix/roots/` | GC roots: `<key>@<seq>` + `<key>@<seq>.rt` |
 | `~/.local/state/clinix/compose/` | generated seed-stack compose expressions |
-| your seed sources | seeds, read in place (`[env.seeds].sources`) |
+| `<seeds dir>/` | seeds discovered without a config entry, read in place. `<seeds dir>` = `[env.seeds].dir`, default `~/.config/clinix/seeds` |
+| your seed sources | further seeds, read in place (`[env.seeds].sources`), ahead of `<seeds dir>` |
 | a project directory | `shell.nix` [+ `flake.lock`] [+ `flake.nix`] — yours to edit |
 
 `clinix config state` prints all of these resolved.

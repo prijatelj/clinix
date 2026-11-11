@@ -14,8 +14,8 @@
 use std::path::Path;
 
 use crate::env::config::{
-	Config, DEFAULT_KEEP_N_PRIOR, DEFAULT_LOCKS_DIR, DEFAULT_REGISTRY, DEFAULT_SHORTHAND, Layer,
-	Settings, load_layers,
+	Config, DEFAULT_KEEP_N_PRIOR, DEFAULT_LOCKS_DIR, DEFAULT_REGISTRY, DEFAULT_SEEDS_DIR,
+	DEFAULT_SHORTHAND, Layer, Settings, load_layers,
 };
 use crate::error::Result;
 
@@ -65,6 +65,7 @@ fn schema() -> Vec<Section> {
 		(
 			&["env", "seeds"],
 			vec![
+				("dir", Kind::Scalar(Some(quoted(DEFAULT_SEEDS_DIR)))),
 				("sources", Kind::List),
 				("ignore", Kind::List),
 				("namespace", Kind::Scalar(None)),
@@ -309,6 +310,7 @@ mod tests {
 		assert!(!out.contains("# /"), "no file provenance");
 		assert!(out.contains("[env.gc]\n# defaults\nkeep_n_prior_roots = 0\n"));
 		assert!(out.contains("sources = []"));
+		assert!(out.contains("[env.seeds]\n# defaults\ndir = \"seeds\"\n"));
 		let _: Settings = toml::from_str(&out).expect("valid config TOML");
 	}
 }

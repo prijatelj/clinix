@@ -176,7 +176,7 @@ pub(crate) fn warn_name_collision(cfg: &Config, name: &str) {
 		}
 	}
 	if let Ok(settings) = crate::env::config::Settings::load(&cfg.config_dir) {
-		let catalog = crate::env::seeds::Catalog::build(&settings.env.seeds);
+		let catalog = crate::env::seeds::Catalog::build(&settings.env.seeds, &cfg.config_dir);
 		for seed in &catalog.seeds {
 			if crate::env::naming::namespace_key(&seed.name) == key {
 				eprintln!(

@@ -50,7 +50,7 @@ pub struct Clean {
 pub fn clean(args: Clean, context: &Context) -> Result<()> {
 	let cfg = &context.config;
 	let settings = Settings::load(&cfg.config_dir)?;
-	let catalog = Catalog::build(&settings.env.seeds);
+	let catalog = Catalog::build(&settings.env.seeds, &cfg.config_dir);
 	for w in &catalog.warnings {
 		eprintln!("clinix: {w}");
 	}

@@ -1,9 +1,10 @@
 //! The **seed catalog**: the user's live `*.nix` shell fragments, read **in
 //! place** from the directories/files declared in `config.toml`
-//! (`[env.seeds].sources`). See `notes/clinix/design/seed-catalog-and-config.md`.
+//! (`[env.seeds].sources`), then the seed directory (`[env.seeds].dir`, default
+//! `<config>/seeds`). See `notes/clinix/design/seed-catalog-and-config.md`.
 //!
-//! A directory source contributes each top-level `*.nix` as a seed (named by
-//! basename); a file source contributes one. Files are classified with a cheap
+//! A directory source contributes each `*.nix` under it, recursively, as a seed
+//! (named by basename); a file source contributes one. Files are classified with a cheap
 //! `rnix` syntactic parse: a valid shell fragment is cataloged, a `flake.nix`
 //! shape or a parse error is skipped with a warning. Ignore globs
 //! (`[env.seeds].ignore` + a per-dir `.clinix_ignore`) suppress the warnings.
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use rnix::{SyntaxKind, SyntaxNode};
 
-use crate::env::config::{SeedSettings, SeedSource, expand_tilde};
+use crate::env::config::{SeedSettings, resolve_path};
 
 /// One cataloged seed: its bare `name` (file stem), the source's `namespace` if
 /// one was **explicitly** set in config (`Some` → usable as the `namespace:name`
@@ -66,13 +67,27 @@ pub struct Catalog {
 }
 
 impl Catalog {
-	/// Build the catalog from the configured seed sources. A source without its own
-	/// `namespace` inherits the `[env.seeds]` default (`settings.namespace`,
-	/// `"seeds"` unless overridden or set to none).
-	pub fn build(settings: &SeedSettings) -> Catalog {
+	/// Build the catalog: each `sources` entry in order, then the seed directory
+	/// ([`SeedSettings::dir`]), so a declared source wins a bare-name collision over
+	/// it. Relative paths resolve against `config_dir`. A source without its own
+	/// `namespace` inherits the `[env.seeds]` default (`settings.namespace`; `None`
+	/// when unset or `false`).
+	///
+	/// The seed directory is skipped silently when missing (it is a default, not
+	/// something the user named), and when a `sources` entry already names it, so
+	/// it is not scanned twice into self-collisions.
+	pub fn build(settings: &SeedSettings, config_dir: &Path) -> Catalog {
 		let mut cat = Catalog::default();
+		let ns = settings.namespace.as_deref();
+		let mut declared = Vec::with_capacity(settings.sources.len());
 		for source in &settings.sources {
-			cat.add_source(source, &settings.ignore, settings.namespace.as_deref());
+			let path = resolve_path(&source.path, config_dir);
+			cat.add_source(&path, source.namespace.as_deref(), &settings.ignore, ns);
+			declared.push(same_file_key(&path));
+		}
+		let dir = settings.dir(config_dir);
+		if dir.is_dir() && !declared.contains(&same_file_key(&dir)) {
+			cat.add_source(&dir, None, &settings.ignore, ns);
 		}
 		cat
 	}
@@ -107,26 +122,23 @@ impl Catalog {
 		}
 	}
 
+	/// Catalog one resolved source `path`, whose own `namespace` (if any) wins over
+	/// the config default `default_ns`.
 	fn add_source(
 		&mut self,
-		source: &SeedSource,
+		path: &Path,
+		namespace: Option<&str>,
 		config_ignore: &[String],
 		default_ns: Option<&str>,
 	) {
-		let path = expand_tilde(&source.path);
+		let namespace = namespace.or(default_ns).map(String::from);
 		if path.is_dir() {
-			// A source's own namespace wins; otherwise inherit the config default
-			// (`"seeds"` unless overridden or set to none).
-			let namespace = source
-				.namespace
-				.clone()
-				.or_else(|| default_ns.map(String::from));
 			let mut ignore = config_ignore.to_vec();
-			ignore.extend(read_clinix_ignore(&path));
+			ignore.extend(read_clinix_ignore(path));
 			// Recursively collect `*.nix` under the source, deterministically. A
 			// seed is still named by basename (subdirs organize, not qualify);
 			// same-basename files across subdirs collide (warned; use `namespace:name`).
-			let mut files: Vec<PathBuf> = walkdir::WalkDir::new(&path)
+			let mut files: Vec<PathBuf> = walkdir::WalkDir::new(path)
 				.into_iter()
 				.filter_map(std::result::Result::ok)
 				.filter(|e| {
@@ -138,7 +150,7 @@ impl Catalog {
 			for file in &files {
 				let base = file.file_name().unwrap().to_string_lossy().into_owned();
 				let rel = file
-					.strip_prefix(&path)
+					.strip_prefix(path)
 					.unwrap_or(file)
 					.to_string_lossy()
 					.into_owned();
@@ -150,11 +162,7 @@ impl Catalog {
 		} else if path.is_file() {
 			// An explicitly named file is not subject to ignore globs (the user
 			// pointed at it directly).
-			let namespace = source
-				.namespace
-				.clone()
-				.or_else(|| default_ns.map(String::from));
-			self.add_file(&path, &namespace);
+			self.add_file(path, &namespace);
 		} else {
 			self.warnings
 				.push(format!("seed source not found: {}", path.display()));
@@ -364,6 +372,12 @@ fn looks_like_flake(root: &SyntaxNode) -> bool {
 		.any(|p| p.text().to_string().trim() == "outputs")
 }
 
+/// A key under which two spellings of one path compare equal: canonical when it
+/// exists (resolving symlinks and `..`), else the path as given.
+fn same_file_key(path: &Path) -> PathBuf {
+	path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// The globs in a directory's `.clinix_ignore` (gitignore-lite: one glob per line,
 /// blanks and `#` comments skipped). Missing file → none.
 fn read_clinix_ignore(dir: &Path) -> Vec<String> {
@@ -416,6 +430,12 @@ fn glob_match(pat: &[u8], s: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::env::config::SeedSource;
+
+	/// A config dir with no `seeds/` in it, so only the declared sources count.
+	fn no_seed_dir() -> PathBuf {
+		PathBuf::from("/nonexistent-clinix-config")
+	}
 
 	fn source(path: &Path, namespace: Option<&str>) -> SeedSource {
 		SeedSource {
@@ -508,11 +528,12 @@ mod tests {
 		)
 		.unwrap();
 		let settings = SeedSettings {
+			dir: None,
 			sources: vec![source(dir.path(), None)],
 			ignore: vec![],
 			namespace: None,
 		};
-		let cat = Catalog::build(&settings);
+		let cat = Catalog::build(&settings, &no_seed_dir());
 		let by = |n: &str| {
 			cat.seeds
 				.iter()
@@ -541,20 +562,25 @@ mod tests {
 		std::fs::write(dir.path().join("rust.nix"), FRAGMENT).unwrap();
 		// A source without its own namespace inherits the configured default.
 		let with_default = SeedSettings {
+			dir: None,
 			sources: vec![source(dir.path(), None)],
 			ignore: vec![],
 			namespace: Some("seeds".to_string()),
 		};
-		let cat = Catalog::build(&with_default);
+		let cat = Catalog::build(&with_default, &no_seed_dir());
 		assert_eq!(cat.seeds.len(), 1);
 		assert_eq!(cat.seeds[0].namespace.as_deref(), Some("seeds"));
 		// No default (None = unset/none) leaves the seed without a namespace.
 		let none_default = SeedSettings {
+			dir: None,
 			sources: vec![source(dir.path(), None)],
 			ignore: vec![],
 			namespace: None,
 		};
-		assert_eq!(Catalog::build(&none_default).seeds[0].namespace, None);
+		assert_eq!(
+			Catalog::build(&none_default, &no_seed_dir()).seeds[0].namespace,
+			None
+		);
 	}
 
 	#[test]
@@ -587,11 +613,12 @@ mod tests {
 		std::fs::write(dir.path().join("lib/helper.nix"), FRAGMENT).unwrap(); // ignored (path)
 
 		let settings = SeedSettings {
+			dir: None,
 			sources: vec![source(dir.path(), Some("dev"))],
 			ignore: vec!["_*.nix".to_string(), "lib/**".to_string()],
 			namespace: None,
 		};
-		let cat = Catalog::build(&settings);
+		let cat = Catalog::build(&settings, &no_seed_dir());
 
 		let mut names: Vec<&str> = cat.seeds.iter().map(|s| s.name.as_str()).collect();
 		names.sort();
@@ -617,6 +644,7 @@ mod tests {
 
 		// Source `a` (namespace "a-ns") is higher precedence than `b` ("two").
 		let settings = SeedSettings {
+			dir: None,
 			sources: vec![
 				source(a.path(), Some("a-ns")),
 				source(b.path(), Some("two")),
@@ -624,7 +652,7 @@ mod tests {
 			ignore: vec![],
 			namespace: None,
 		};
-		let cat = Catalog::build(&settings);
+		let cat = Catalog::build(&settings, &no_seed_dir());
 
 		// Unique bare name.
 		assert!(matches!(cat.find("rust"), Some(Resolved::One(s)) if s.name == "rust"));
@@ -647,5 +675,101 @@ mod tests {
 		}
 		// Unknown name.
 		assert!(cat.find("nope").is_none());
+	}
+
+	fn settings(sources: Vec<SeedSource>, dir: Option<&str>) -> SeedSettings {
+		SeedSettings {
+			dir: dir.map(PathBuf::from),
+			sources,
+			ignore: vec![],
+			namespace: None,
+		}
+	}
+
+	#[test]
+	fn seed_dir_defaults_under_config_and_is_scanned_after_sources() {
+		let cfg = tempfile::tempdir().unwrap();
+		let extra = tempfile::tempdir().unwrap();
+		std::fs::create_dir_all(cfg.path().join("seeds/lang")).unwrap();
+		std::fs::write(cfg.path().join("seeds/lang/rust.nix"), FRAGMENT).unwrap();
+		std::fs::write(cfg.path().join("seeds/claude.nix"), FRAGMENT).unwrap();
+		std::fs::write(extra.path().join("claude.nix"), FRAGMENT).unwrap();
+
+		// No config at all: `<config>/seeds` alone.
+		let cat = Catalog::build(&SeedSettings::default(), cfg.path());
+		let mut names: Vec<&str> = cat.seeds.iter().map(|s| s.name.as_str()).collect();
+		names.sort();
+		assert_eq!(names, vec!["claude", "rust"]);
+		assert!(cat.warnings.is_empty(), "{:?}", cat.warnings);
+
+		// A declared source wins the bare-name collision over the seed dir.
+		let cat = Catalog::build(
+			&settings(vec![source(extra.path(), None)], None),
+			cfg.path(),
+		);
+		match cat.find("claude") {
+			Some(Resolved::Collision { chosen, others }) => {
+				assert!(chosen.path.starts_with(extra.path()));
+				assert!(others[0].path.starts_with(cfg.path()));
+			}
+			other => panic!("expected a collision, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn seed_dir_missing_is_silent_and_relocatable() {
+		let cfg = tempfile::tempdir().unwrap();
+		// Missing default dir: no seeds, no warning.
+		let cat = Catalog::build(&SeedSettings::default(), cfg.path());
+		assert!(cat.seeds.is_empty() && cat.warnings.is_empty());
+		// A relative `dir` resolves against the config dir.
+		std::fs::create_dir_all(cfg.path().join("shells")).unwrap();
+		std::fs::write(cfg.path().join("shells/go.nix"), FRAGMENT).unwrap();
+		let cat = Catalog::build(&settings(vec![], Some("shells")), cfg.path());
+		assert_eq!(cat.seeds.len(), 1);
+		assert_eq!(cat.seeds[0].path, cfg.path().join("shells/go.nix"));
+	}
+
+	#[test]
+	fn seed_dir_named_in_sources_is_scanned_once() {
+		let cfg = tempfile::tempdir().unwrap();
+		std::fs::create_dir_all(cfg.path().join("seeds")).unwrap();
+		std::fs::write(cfg.path().join("seeds/rust.nix"), FRAGMENT).unwrap();
+		// Listed relatively (with its own namespace) — that entry is the one kept.
+		let cat = Catalog::build(
+			&settings(vec![source(Path::new("seeds"), Some("mine"))], None),
+			cfg.path(),
+		);
+		assert_eq!(cat.seeds.len(), 1);
+		assert_eq!(cat.seeds[0].namespace.as_deref(), Some("mine"));
+	}
+
+	#[test]
+	fn relative_sources_resolve_against_the_config_dir_not_the_cwd() {
+		let cfg = tempfile::tempdir().unwrap();
+		std::fs::create_dir_all(cfg.path().join("more")).unwrap();
+		std::fs::write(cfg.path().join("more/rust.nix"), FRAGMENT).unwrap();
+		std::fs::write(cfg.path().join("one.nix"), FRAGMENT).unwrap();
+		let cat = Catalog::build(
+			&settings(
+				vec![
+					source(Path::new("more"), None),
+					source(Path::new("one.nix"), None),
+				],
+				None,
+			),
+			cfg.path(),
+		);
+		let paths: Vec<&Path> = cat.seeds.iter().map(|s| s.path.as_path()).collect();
+		assert_eq!(
+			paths,
+			vec![cfg.path().join("more/rust.nix"), cfg.path().join("one.nix")]
+		);
+		// A missing relative source is reported at its resolved path.
+		let cat = Catalog::build(
+			&settings(vec![source(Path::new("gone"), None)], None),
+			cfg.path(),
+		);
+		assert!(cat.warnings[0].contains(&cfg.path().join("gone").display().to_string()));
 	}
 }

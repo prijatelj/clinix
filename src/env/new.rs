@@ -105,7 +105,7 @@ impl New {
 		}
 
 		let settings = Settings::load(&cfg.config_dir)?;
-		let catalog = Catalog::build(&settings.env.seeds);
+		let catalog = Catalog::build(&settings.env.seeds, &cfg.config_dir);
 		let mut seeds: Vec<SeedCopy> = Vec::with_capacity(self.from.len());
 		for name in &self.from {
 			match catalog.find(name) {
@@ -263,7 +263,7 @@ impl New {
 		let src_versions = registry::list_versions(&src_base)?;
 
 		let settings = Settings::load(&cfg.config_dir)?;
-		let catalog = Catalog::build(&settings.env.seeds);
+		let catalog = Catalog::build(&settings.env.seeds, &cfg.config_dir);
 		let reg_shell = Dest::parse(cfg, &self.name)?.dir.join("shell.nix");
 
 		let adopted = if src_versions.is_empty() {

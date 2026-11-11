@@ -1,6 +1,6 @@
 [package]
 name = "clinix"
-version = "0.0.1a"
+version = "0.0.1-a"
 edition = "2024"
 license = "MIT"
 description = "CLI tool to manage Nix environments (env) and a NixOS system (sys) using default nix. Clinx pins package versions with a `flake.lock` used by `shell.nix` or `flake.nix`."
